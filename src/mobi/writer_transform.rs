@@ -498,10 +498,9 @@ fn strip_unsupported_css_at_rules(css: &[u8]) -> Vec<u8> {
     while i < css.len() {
         if css[i] == b'@' {
             let rest = &css[i..];
-            let matches_charset = rest.len() >= 8
-                && rest[..8].eq_ignore_ascii_case(b"@charset");
-            let matches_namespace = rest.len() >= 10
-                && rest[..10].eq_ignore_ascii_case(b"@namespace");
+            let matches_charset = rest.len() >= 8 && rest[..8].eq_ignore_ascii_case(b"@charset");
+            let matches_namespace =
+                rest.len() >= 10 && rest[..10].eq_ignore_ascii_case(b"@namespace");
 
             if matches_charset || matches_namespace {
                 // Drop the rule up to and including the next `;`. (Both
@@ -569,7 +568,10 @@ pub fn strip_xml_namespaces(html: &[u8]) -> Vec<u8> {
         // to load external DTDs (e.g. XHTML 1.1's
         // `http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd`) and calibre's KF8
         // writer never emits a DOCTYPE for the same reason.
-        if matches!(html.get(tag_start + 1), Some(&b'/') | Some(&b'!') | Some(&b'?')) {
+        if matches!(
+            html.get(tag_start + 1),
+            Some(&b'/') | Some(&b'!') | Some(&b'?')
+        ) {
             let Some(end_rel) = memchr::memchr(b'>', &html[tag_start..]) else {
                 out.extend_from_slice(&html[tag_start..]);
                 break;
@@ -626,9 +628,7 @@ pub fn strip_xml_namespaces(html: &[u8]) -> Vec<u8> {
         while p < tag_end - 1 {
             // Copy whitespace.
             let ws_start = p;
-            while p < tag_end - 1
-                && matches!(html[p], b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
-            {
+            while p < tag_end - 1 && matches!(html[p], b' ' | b'\t' | b'\n' | b'\r' | b'\x0c') {
                 p += 1;
             }
             if p >= tag_end - 1 {
@@ -654,13 +654,10 @@ pub fn strip_xml_namespaces(html: &[u8]) -> Vec<u8> {
             let name = &html[name_start..p];
 
             // Parse optional value.
-            let value_end;
-            if p < tag_end - 1 && html[p] == b'=' {
+            let value_end = if p < tag_end - 1 && html[p] == b'=' {
                 p += 1;
                 // Skip whitespace before value.
-                while p < tag_end - 1
-                    && matches!(html[p], b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
-                {
+                while p < tag_end - 1 && matches!(html[p], b' ' | b'\t' | b'\n' | b'\r' | b'\x0c') {
                     p += 1;
                 }
                 if p < tag_end - 1 && (html[p] == b'"' || html[p] == b'\'') {
@@ -683,10 +680,10 @@ pub fn strip_xml_namespaces(html: &[u8]) -> Vec<u8> {
                         p += 1;
                     }
                 }
-                value_end = p;
+                p
             } else {
-                value_end = p;
-            }
+                p
+            };
 
             // Decide whether to drop this attribute.
             let drop = should_drop_attr(name);
@@ -711,7 +708,12 @@ fn should_drop_attr(name: &[u8]) -> bool {
     }
     // Drop attributes with these prefixes.
     const DROP_PREFIXES: &[&[u8]] = &[
-        b"epub:", b"opf:", b"dc:", b"dcterms:", b"xsi:", b"xml:",
+        b"epub:",
+        b"opf:",
+        b"dc:",
+        b"dcterms:",
+        b"xsi:",
+        b"xml:",
         // ARIA — Kindle's KF8 parser doesn't implement WAI-ARIA, and
         // ARIA-DPUB role values (`doc-noteref`, `doc-chapter`, etc.) come
         // from the same EPUB3 vocabulary family as `epub:type`. Standard

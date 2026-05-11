@@ -25,10 +25,7 @@ fn export_epub_to_azw3_bytes(epub_path: &str) -> Vec<u8> {
 }
 
 fn count_toc(entries: &[TocEntry]) -> usize {
-    entries
-        .iter()
-        .map(|e| 1 + count_toc(&e.children))
-        .sum()
+    entries.iter().map(|e| 1 + count_toc(&e.children)).sum()
 }
 
 fn max_depth(entries: &[TocEntry], current: usize) -> usize {
@@ -148,7 +145,10 @@ fn azw3_roundtrip_resource_records_are_recognisable() {
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase());
-        matches!(ext.as_deref(), Some("jpg") | Some("jpeg") | Some("png") | Some("gif"))
+        matches!(
+            ext.as_deref(),
+            Some("jpg") | Some("jpeg") | Some("png") | Some("gif")
+        )
     });
     assert!(
         has_real_image,

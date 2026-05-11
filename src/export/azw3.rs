@@ -991,13 +991,7 @@ impl Kf8Builder {
         // hyphenation, and won't render correctly without it for non-default
         // languages. Strip any region suffix ("en-GB" → "en").
         if !self.ctx.metadata.language.is_empty() {
-            let primary = self
-                .ctx
-                .metadata
-                .language
-                .split('-')
-                .next()
-                .unwrap_or("en");
+            let primary = self.ctx.metadata.language.split('-').next().unwrap_or("en");
             records.push((524, primary.as_bytes().to_vec()));
         }
 
@@ -1376,9 +1370,7 @@ fn collect_guide_entries(
     // Synthesize a "start" entry pointing to the first spine file if none was
     // declared — Kindle uses this to decide where to open the book.
     if !seen_types.contains("start")
-        && let Some((_, (seq, off, _))) = aid_offset_map
-            .iter()
-            .min_by_key(|(_, (_, _, abs))| *abs)
+        && let Some((_, (seq, off, _))) = aid_offset_map.iter().min_by_key(|(_, (_, _, abs))| *abs)
     {
         entries.push(GuideBuildEntry {
             guide_type: "start".to_string(),

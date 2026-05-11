@@ -327,9 +327,7 @@ impl Chunker {
                         // If the aid is past every chunk, point to the last
                         // chunk's end.
                         resolved.unwrap_or_else(|| {
-                            let last = chunk_table
-                                .last()
-                                .expect("chunk_table non-empty here");
+                            let last = chunk_table.last().expect("chunk_table non-empty here");
                             (last.sequence_number, last.length.saturating_sub(1))
                         })
                     };
@@ -658,10 +656,15 @@ mod chunker_tests {
     #[test]
     fn chunker_preserves_all_bytes() {
         // Pathological-ish HTML similar to a real chapter.
-        let body = b"<section><h1>Title</h1><p>One.</p><p>Two.</p><div><p>A</p><p>B</p></div></section>".repeat(200);
+        let body =
+            b"<section><h1>Title</h1><p>One.</p><p>Two.</p><div><p>A</p><p>B</p></div></section>"
+                .repeat(200);
         let chunks = split_body_into_chunks(&body, 8192);
         let recon: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
-        assert_eq!(recon, body, "chunks must concatenate back to the original body");
+        assert_eq!(
+            recon, body,
+            "chunks must concatenate back to the original body"
+        );
     }
 
     #[test]
