@@ -394,6 +394,13 @@ impl Chunker {
         // no chunk needs to be valid HTML on its own.
         let body_chunks = split_body_into_chunks(body_content, CHUNK_SIZE);
 
+        // Build the chunk selector from this file's body aid. Kindle's
+        // renderer uses chunk selectors to map a chunk's content back to
+        // its enclosing DOM element; without per-file uniqueness it
+        // conflates positions across files when laying out and locks up.
+        let body_aid = extract_body_aid(skel_prefix).unwrap_or_else(|| "0000".to_string());
+        let selector = format!("P-//*[@aid='{body_aid}']");
+
         // Each chunk's `insert_pos` is the absolute rawML position where its
         // bytes go in the reassembled file. The first chunk starts just
         // after the prefix scaffold; subsequent chunks follow contiguously.
@@ -407,7 +414,7 @@ impl Chunker {
                 insert_pos: base + cumulative,
                 starts_tags: Vec::new(),
                 ends_tags: Vec::new(),
-                selector: "P-//*[@aid='0000']".to_string(),
+                selector: selector.clone(),
                 file_number,
                 sequence_number: 0, // assigned by Chunker::process
                 start_pos: cumulative,
@@ -425,6 +432,25 @@ impl Chunker {
 }
 
 const CHUNK_SIZE: usize = 8192;
+
+/// Extract the `aid="…"` value from the `<body…>` tag inside the scaffold
+/// prefix. Calibre's chunker tracks this naturally via DOM walk; in our
+/// byte-level chunker we recover it by scanning the prefix bytes for the
+/// already-inserted aid attribute on the body opening tag.
+fn extract_body_aid(skel_prefix: &[u8]) -> Option<String> {
+    use memchr::memmem;
+    let body_pos = memmem::find(skel_prefix, b"<body")?;
+    let tag_end_rel = memchr::memchr(b'>', &skel_prefix[body_pos..])?;
+    let body_open = &skel_prefix[body_pos..body_pos + tag_end_rel];
+    let aid_pos = memmem::find(body_open, b" aid=\"")?;
+    let val_start = aid_pos + 6;
+    let val_end = memchr::memchr(b'"', &body_open[val_start..])?;
+    Some(
+        std::str::from_utf8(&body_open[val_start..val_start + val_end])
+            .ok()?
+            .to_string(),
+    )
+}
 
 /// Split body-content bytes into chunks of at most ~`max_size` bytes each,
 /// always cutting at HTML element boundaries (after a closing tag).
@@ -651,5 +677,52 @@ mod chunker_tests {
         let chunks = split_body_into_chunks(b"", 8192);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].is_empty());
+    }
+
+    #[test]
+    fn chunk_selectors_are_per_file_unique() {
+        // Regression test for issue #10: every spine file's chunks must
+        // reference *that file's* body aid in their selector, not a single
+        // shared aid. With shared selectors Kindle conflates positions
+        // across files during layout and locks up.
+        let html = |n| {
+            format!(
+                "<html><head><title>F{n}</title></head><body>\
+                 <section><p>hello from file {n}</p></section>\
+                 </body></html>"
+            )
+            .into_bytes()
+        };
+        let files = vec![
+            ("a.xhtml".to_string(), html(0)),
+            ("b.xhtml".to_string(), html(1)),
+            ("c.xhtml".to_string(), html(2)),
+        ];
+        let result = Chunker::new().process(&files);
+
+        let selectors_per_file: std::collections::HashMap<usize, std::collections::HashSet<&str>> =
+            result
+                .chunk_table
+                .iter()
+                .fold(std::collections::HashMap::new(), |mut acc, c| {
+                    acc.entry(c.file_number)
+                        .or_default()
+                        .insert(c.selector.as_str());
+                    acc
+                });
+
+        let all_selectors: std::collections::HashSet<&str> = result
+            .chunk_table
+            .iter()
+            .map(|c| c.selector.as_str())
+            .collect();
+
+        assert_eq!(
+            all_selectors.len(),
+            selectors_per_file.len(),
+            "each spine file must have a distinct chunk selector; \
+             got {:?}",
+            all_selectors,
+        );
     }
 }
