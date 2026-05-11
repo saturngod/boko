@@ -28,7 +28,7 @@ A fast Rust library and CLI for converting between ebook formats.
 
 ## Installation
 
-Requires Rust nightly (edition 2024).
+Requires Rust 1.85+ (for edition 2024).
 
 ```bash
 cargo install boko
@@ -82,7 +82,8 @@ boko dump --styles-only book.epub
 ## Library Usage
 
 ```rust
-use boko::Book;
+use boko::{Book, Format};
+use std::fs::File;
 
 // Open a book (format auto-detected from extension)
 let mut book = Book::open("input.epub")?;
@@ -95,11 +96,12 @@ println!("Authors: {:?}", book.metadata().authors);
 let spine: Vec<_> = book.spine().to_vec();
 for entry in spine {
     let chapter = book.load_chapter(entry.id)?;
-    println!("Chapter has {} nodes", chapter.nodes.len());
+    println!("Chapter has {} nodes", chapter.node_count());
 }
 
 // Export to another format
-book.export("output.kfx")?;
+let mut out = File::create("output.kfx")?;
+book.export(Format::Kfx, &mut out)?;
 ```
 
 ### Working with the IR
@@ -107,19 +109,18 @@ book.export("output.kfx")?;
 Boko compiles ebook content to an intermediate representation (IR) that captures semantic structure:
 
 ```rust
-use boko::{Book, compile_html, Stylesheet};
+use boko::{compile_html, Origin, Stylesheet};
 
 // Compile HTML to IR
 let html = r#"<p class="intro">Hello <em>world</em></p>"#;
 let css = Stylesheet::parse("p.intro { font-size: 1.2em; }");
-let chapter = compile_html(html, &css)?;
+let chapter = compile_html(html, &[(css, Origin::Author)]);
 
-// Traverse the node tree
-for node in &chapter.nodes {
-    match &node.content {
-        boko::ir::Content::Text(text) => println!("Text: {}", text),
-        boko::ir::Content::Element { tag, .. } => println!("Element: {}", tag),
-        _ => {}
+// Walk the node tree
+for node_id in chapter.iter_dfs() {
+    if let Some(node) = chapter.node(node_id) {
+        let text = chapter.text(node.text);
+        println!("{:?}: {:?}", node.role, text);
     }
 }
 ```
@@ -172,4 +173,4 @@ A browser-based converter is available at [zacharydenton.github.io/boko](https:/
 
 ## License
 
-MIT
+GPL-3.0-or-later. See [LICENSE](LICENSE).

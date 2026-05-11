@@ -1,9 +1,9 @@
 [package]
 name = "boko"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Fast ebook conversion library for EPUB and Kindle formats"
-license = "MIT"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/zacharydenton/boko"
 homepage = "https://github.com/zacharydenton/boko"
 documentation = "https://docs.rs/boko"
