@@ -10,8 +10,8 @@ use flate2::Compression;
 use flate2::write::ZlibEncoder;
 
 use crate::mobi::index::{
-    NcxBuildEntry, build_chunk_indx, build_cncx, build_ncx_indx, build_skel_indx,
-    calculate_cncx_offsets,
+    GuideBuildEntry, NcxBuildEntry, build_chunk_indx, build_cncx, build_guide_indx, build_ncx_indx,
+    build_skel_indx, calculate_cncx_offsets,
 };
 use crate::mobi::skeleton::{Chunker, ChunkerResult};
 use crate::mobi::writer_transform::{
@@ -79,6 +79,14 @@ struct BookContext {
     toc: Vec<TocEntry>,
     /// Metadata
     metadata: crate::model::Metadata,
+    /// Landmarks (used to build the K8 guide index).
+    landmarks: Vec<crate::model::Landmark>,
+}
+
+impl BookContext {
+    fn landmarks(&self) -> &[crate::model::Landmark] {
+        &self.landmarks
+    }
 }
 
 struct SpineItem {
@@ -145,6 +153,7 @@ impl BookContext {
             spine,
             toc,
             metadata,
+            landmarks: book.landmarks().to_vec(),
         })
     }
 
@@ -202,6 +211,7 @@ impl BookContext {
             spine,
             toc,
             metadata,
+            landmarks: book.landmarks().to_vec(),
         })
     }
 }
@@ -211,10 +221,12 @@ struct Kf8Builder {
     records: Vec<Vec<u8>>,
     text_length: usize,
     last_text_record: u16,
+    first_non_text_record: u16,
     first_resource_record: u32,
     skel_index: u32,
     frag_index: u32,
     ncx_index: u32,
+    guide_index: u32,
     chunker_result: Option<ChunkerResult>,
     /// Maps resource href to 1-indexed resource record number
     resource_map: HashMap<String, usize>,
@@ -230,6 +242,8 @@ struct Kf8Builder {
     link_counter: usize,
     /// Maps placeholder -> (target_file_href, target_fragment)
     link_map: HashMap<String, (String, String)>,
+    /// NCX entries with hierarchy-aware lengths, retained for TBS calculation.
+    ncx_entries: Vec<NcxBuildEntry>,
 }
 
 impl Kf8Builder {
@@ -241,10 +255,12 @@ impl Kf8Builder {
             records: vec![Vec::new()], // Placeholder for record 0
             text_length: 0,
             last_text_record: 0,
+            first_non_text_record: 0,
             first_resource_record: NULL_INDEX,
             skel_index: NULL_INDEX,
             frag_index: NULL_INDEX,
             ncx_index: NULL_INDEX,
+            guide_index: NULL_INDEX,
             chunker_result: None,
             resource_map: HashMap::new(),
             css_flows: Vec::new(),
@@ -253,12 +269,14 @@ impl Kf8Builder {
             font_hrefs: Vec::new(),
             link_counter: 0,
             link_map: HashMap::new(),
+            ncx_entries: Vec::new(),
         };
 
         builder.collect_resources()?;
         builder.build_text_records()?;
-        builder.write_resource_records()?;
         builder.build_kf8_indices()?;
+        builder.apply_trailing_byte_sequences();
+        builder.write_resource_records()?;
         builder.build_fdst_record()?;
         builder.build_flis_fcis_eof()?;
         builder.build_record0()?;
@@ -305,7 +323,6 @@ impl Kf8Builder {
             .collect();
         css_hrefs.sort();
 
-        // Store CSS flows
         for href in &css_hrefs {
             if let Some(resource) = self.ctx.resources.get(href) {
                 let css = String::from_utf8_lossy(&resource.data).to_string();
@@ -411,21 +428,33 @@ impl Kf8Builder {
         }
         self.flows_length = all_flows.len();
 
-        // Split into records and compress
+        // Split into records and PalmDoc-compress.
         let mut pos = 0;
         while pos < all_flows.len() {
             let end = (pos + RECORD_SIZE).min(all_flows.len());
             let chunk = &all_flows[pos..end];
-
-            let compressed = crate::mobi::palmdoc::compress(chunk);
-            let mut record = compressed;
-            record.push(0); // Trailing byte
-
+            let mut record = crate::mobi::palmdoc::compress(chunk);
+            record.push(0); // multibyte indicator (0 = no UTF-8 overlap)
             self.records.push(record);
             pos = end;
         }
 
         self.last_text_record = (self.records.len() - 1) as u16;
+        // Insert a zero-padding record after text so the next (non-text)
+        // record starts at a 4-byte boundary in the rawml stream. Calibre
+        // does this in writer8/main.py:361-363 and bumps
+        // `first_non_text_record_idx` past the pad.
+        let total_text_bytes: usize = self.records[1..=self.last_text_record as usize]
+            .iter()
+            .map(|r| r.len())
+            .sum();
+        let remainder = total_text_bytes % 4;
+        if remainder != 0 {
+            self.records.push(vec![0u8; 4 - remainder]);
+            self.first_non_text_record = self.last_text_record + 2;
+        } else {
+            self.first_non_text_record = self.last_text_record + 1;
+        }
         self.chunker_result = Some(chunker_result);
 
         self.css_flows = rewritten_css
@@ -575,7 +604,7 @@ impl Kf8Builder {
             }
         }
 
-        // Build NCX index
+        // Build NCX index.
         if !self.ctx.toc.is_empty()
             && let Some(ref chunker_result) = self.chunker_result
         {
@@ -596,10 +625,82 @@ impl Kf8Builder {
                 if !ncx_cncx.is_empty() {
                     self.records.push(ncx_cncx);
                 }
+                self.ncx_entries = ncx_entries;
+            }
+        }
+
+        // Build K8 guide index from landmarks. Kindle reads this to discover
+        // cover / start-of-content / endnotes / etc.
+        if let Some(ref chunker_result) = self.chunker_result {
+            let guide_entries = collect_guide_entries(
+                self.ctx.landmarks(),
+                self.ctx.metadata.cover_image.as_deref(),
+                &chunker_result.id_map,
+                &chunker_result.aid_offset_map,
+            );
+            if !guide_entries.is_empty() {
+                self.guide_index = self.records.len() as u32;
+                let (guide_records, guide_cncx) = build_guide_indx(&guide_entries);
+                for record in guide_records {
+                    self.records.push(record);
+                }
+                if !guide_cncx.is_empty() {
+                    self.records.push(guide_cncx);
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Append per-record Trailing Byte Sequences to every text record.
+    ///
+    /// Kindle uses TBS to map text positions to NCX entries; firmware versions
+    /// since at least Paperwhite 3 refuse to open books that declare TBS-style
+    /// `extra_data_flags` (0x02) but omit the actual trailers, or that declare
+    /// no TBS at all on multi-chapter books.
+    fn apply_trailing_byte_sequences(&mut self) {
+        if self.ncx_entries.is_empty() || self.last_text_record == 0 {
+            return;
+        }
+
+        // Text records are records[1..=last_text_record]. Each is RECORD_SIZE
+        // bytes of uncompressed text/css except possibly the last, which is
+        // the remainder of `flows_length`.
+        let last_idx = self.last_text_record as usize;
+        let total = self.flows_length;
+        let mut lengths: Vec<u64> = Vec::with_capacity(last_idx);
+        for i in 1..=last_idx {
+            let start = (i - 1) * RECORD_SIZE;
+            let end = (start + RECORD_SIZE).min(total);
+            lengths.push((end - start) as u64);
+        }
+
+        let tbs_entries: Vec<crate::mobi::tbs::TbsEntry> = self
+            .ncx_entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| crate::mobi::tbs::TbsEntry {
+                index: i as u32,
+                start: e.pos as u64,
+                length: e.length as u64,
+                depth: e.depth,
+                parent: e.parent,
+            })
+            .collect();
+
+        let tbs_data = crate::mobi::tbs::build_tbs_for_records(&tbs_entries, &lengths);
+
+        // Each record currently looks like `[compressed_text..., 0x00]` where
+        // the trailing `0x00` is the multibyte indicator (no UTF-8 overlap).
+        // The on-disk order Kindle expects is `[compressed][multibyte][tbs]`
+        // — readers strip TBS from the end first, then strip multibyte (see
+        // calibre `getRawML` and our own `strip_trailing_data`). So append
+        // TBS *after* the multibyte byte, not before.
+        for (i, tbs) in tbs_data.into_iter().enumerate() {
+            let rec_idx = i + 1;
+            self.records[rec_idx].extend_from_slice(&tbs);
+        }
     }
 
     fn build_fdst_record(&mut self) -> io::Result<()> {
@@ -658,7 +759,9 @@ impl Kf8Builder {
 
         let mobi_header_len: u32 = 264;
         let title_offset = 16 + mobi_header_len + exth_len as u32;
-        let full_record_len = title_offset as usize + title_bytes.len() + 2;
+        // No `+ 2` separator between title and trailing padding — calibre
+        // writes `exth + full_title + zeroes(8192)` with nothing in between.
+        let full_record_len = title_offset as usize + title_bytes.len();
 
         let mut record0 = Vec::with_capacity(full_record_len + 8192);
 
@@ -684,9 +787,9 @@ impl Kf8Builder {
             record0.extend_from_slice(&NULL_INDEX.to_be_bytes());
         }
 
-        // First non-text record
-        let first_non_text = (self.last_text_record as u32) + 1;
-        record0.extend_from_slice(&first_non_text.to_be_bytes());
+        // First non-text record — set by build_text_records, accounts for
+        // any 4-byte alignment padding record we inserted after the text.
+        record0.extend_from_slice(&(self.first_non_text_record as u32).to_be_bytes());
 
         // Title offset and length
         record0.extend_from_slice(&title_offset.to_be_bytes());
@@ -754,15 +857,18 @@ impl Kf8Builder {
         // Unknown
         record0.extend_from_slice(&[0xFF; 8]);
 
-        // Extra data flags
-        record0.extend_from_slice(&1u32.to_be_bytes());
+        // Extra data flags: 0x01 (multibyte trailing byte) | 0x02 (TBS trailer).
+        // Must match what apply_trailing_byte_sequences actually appends.
+        let extra_data_flags: u32 = if self.ncx_entries.is_empty() { 1 } else { 3 };
+        record0.extend_from_slice(&extra_data_flags.to_be_bytes());
 
-        // KF8 indices
+        // KF8 indices (at MOBI offsets 0xF4–0x108):
+        //   0xF4 ncx, 0xF8 frag, 0xFC skel, 0x100 datp, 0x104 guide
         record0.extend_from_slice(&self.ncx_index.to_be_bytes());
         record0.extend_from_slice(&self.frag_index.to_be_bytes());
         record0.extend_from_slice(&self.skel_index.to_be_bytes());
-        record0.extend_from_slice(&NULL_INDEX.to_be_bytes());
-        record0.extend_from_slice(&NULL_INDEX.to_be_bytes());
+        record0.extend_from_slice(&NULL_INDEX.to_be_bytes()); // DATP
+        record0.extend_from_slice(&self.guide_index.to_be_bytes());
 
         // Unknown
         record0.extend_from_slice(&[0xFF; 4]);
@@ -775,10 +881,13 @@ impl Kf8Builder {
 
         // Title
         record0.extend_from_slice(title_bytes);
-        record0.extend_from_slice(&[0, 0]);
 
-        // Padding
-        while record0.len() < full_record_len + 4096 {
+        // Padding — calibre's MOBIHeader DSL ends with `padding = zeroes(8192)`
+        // (writer8/mobi.py:191). 8KB of trailing zeros is what Amazon's DTP
+        // service expects to find for in-place metadata edits; firmwares
+        // also scan this region during a sanity-check pass.
+        let target_len = full_record_len + 8192;
+        while record0.len() < target_len {
             record0.push(0);
         }
 
@@ -814,29 +923,104 @@ impl Kf8Builder {
             records.push((106, date.as_bytes().to_vec()));
         }
 
+        // Contributors (108).
+        for contributor in &self.ctx.metadata.contributors {
+            records.push((108, contributor.name.as_bytes().to_vec()));
+        }
+
         // Rights
         if let Some(ref rights) = self.ctx.metadata.rights {
             records.push((109, rights.as_bytes().to_vec()));
         }
 
-        // Cover offset - find the index of the cover image in sorted image_hrefs
+        // Source identifier (112). Kindle expects a calibre-style URN-ish
+        // string here; if the book has an identifier use it, otherwise fall
+        // back to a synthesized one. Calibre's own files always emit this.
+        let source_id = if self.ctx.metadata.identifier.is_empty() {
+            format!("boko:{}", self.ctx.metadata.title)
+        } else {
+            format!("calibre:{}", self.ctx.metadata.identifier)
+        };
+        records.push((112, source_id.into_bytes()));
+
+        // Cover offset (201) — record-relative position of cover image.
+        let mut cover_record_offset: Option<u32> = None;
         if let Some(ref cover_path) = self.ctx.metadata.cover_image
             && let Some(cover_idx) = self.image_hrefs.iter().position(|h| h == cover_path)
         {
+            cover_record_offset = Some(cover_idx as u32);
             records.push((201, (cover_idx as u32).to_be_bytes().to_vec()));
+            // hasfakecover = 0 (we have a real cover image)
+            records.push((203, 0u32.to_be_bytes().to_vec()));
         }
 
-        // Title
+        // Thumbnail offset (202) — Kindle uses the same image for thumbs if
+        // no separate thumb is provided. Also emit the matching kindle:embed
+        // URI (129) so the home-screen thumbnail works.
+        if let Some(off) = cover_record_offset {
+            records.push((202, off.to_be_bytes().to_vec()));
+            // EXTH 129 wants the resource record index as a base32 string
+            // The thumbnail URI in EXTH 129 must base32-encode the *same*
+            // value as EXTH 202 (thumbnail_offset). Calibre:
+            //   `kindle:embed:{to_base(thumbnail_offset, base=32, min_num_digits=4)}`
+            // Earlier we had `off + 1` here, off-by-one against EXTH 202;
+            // Kindle then spins trying to resolve a nonexistent resource for
+            // the home-screen thumbnail.
+            let mut buf = [0u8; 4];
+            write_base32_4(off as usize, &mut buf);
+            let uri = format!(
+                "kindle:embed:{}",
+                std::str::from_utf8(&buf).unwrap_or("0000")
+            );
+            records.push((129, uri.into_bytes()));
+        }
+
+        // Title (503)
         records.push((503, self.ctx.metadata.title.as_bytes().to_vec()));
 
-        // ASIN placeholder
+        // ASIN placeholder (113)
         records.push((113, b"EBOK000000".to_vec()));
 
-        // Document type
+        // Document type (501)
         records.push((501, b"EBOK".to_vec()));
 
-        // CDE Type
-        records.push((504, b"EBOK".to_vec()));
+        // (EXTH 504 intentionally omitted — calibre does not emit it and
+        // it confused some Kindle firmware versions in our testing.)
+
+        // Language (524) — ISO 639-1 code. Kindle uses this to pick fonts and
+        // hyphenation, and won't render correctly without it for non-default
+        // languages. Strip any region suffix ("en-GB" → "en").
+        if !self.ctx.metadata.language.is_empty() {
+            let primary = self
+                .ctx
+                .metadata
+                .language
+                .split('-')
+                .next()
+                .unwrap_or("en");
+            records.push((524, primary.as_bytes().to_vec()));
+        }
+
+        // KF8 housekeeping fields (calibre emits all of these on every book;
+        // omitting them is correlated with Kindle refusing to open the file).
+        //   125 = num_of_resources
+        //   131 = kf8_unknown_count (always 0 in calibre)
+        let num_resources = (self.image_hrefs.len() + self.font_hrefs.len()) as u32;
+        records.push((125, num_resources.to_be_bytes().to_vec()));
+        records.push((131, 0u32.to_be_bytes().to_vec()));
+
+        // Creator software stamp (204–207) and kindlegen revision (535).
+        // Pretend to be kindlegen 2 — matches what working KF8 files in the
+        // wild advertise, and Kindle firmware uses these to route the file
+        // through the KF8 reader rather than legacy MOBI.
+        for (code, val) in [(204u32, 201u32), (205, 2), (206, 9), (207, 0)] {
+            records.push((code, val.to_be_bytes().to_vec()));
+        }
+        records.push((535, b"0730-890adc2".to_vec()));
+
+        // Override Kindle fonts (528) — KF8 flag telling Kindle to honour
+        // embedded font @font-face rules.
+        records.push((528, b"true".to_vec()));
 
         // Build EXTH
         let mut exth = Vec::new();
@@ -1000,6 +1184,7 @@ fn flatten_toc(
         depth: u32,
         parent: i32,
         children: Vec<usize>,
+        pos_fid: (u32, u32),
     }
 
     let mut result: Vec<TempEntry> = Vec::new();
@@ -1027,19 +1212,22 @@ fn flatten_toc(
                 (entry.href.clone(), String::new())
             };
 
-            // Try to find position for this TOC entry
-            let pos = if fragment.starts_with("filepos") {
-                // MOBI filepos anchor: parse position and find nearest aid
-                resolve_filepos(&file, &fragment, filepos_map, aid_offset_map)
+            // Look up the aid's (chunk_seq, offset_in_chunk, offset_in_text) for this TOC entry
+            let aid_entry = if fragment.starts_with("filepos") {
+                resolve_filepos_entry(&file, &fragment, filepos_map, aid_offset_map)
             } else {
-                // Standard HTML anchor: lookup by element id
                 id_map
                     .get(&(file.clone(), fragment.clone()))
                     .or_else(|| id_map.get(&(file.clone(), String::new())))
                     .and_then(|aid| aid_offset_map.get(aid))
-                    .map(|&(_, _, off_text)| off_text as u32)
-            }
-            .unwrap_or(0);
+                    .copied()
+            };
+
+            let (fid, off_in_chunk, pos) = aid_entry
+                .map(|(seq, off_in_chunk, off_text)| {
+                    (seq as u32, off_in_chunk as u32, off_text as u32)
+                })
+                .unwrap_or((0, 0, 0));
 
             result.push(TempEntry {
                 pos,
@@ -1048,6 +1236,7 @@ fn flatten_toc(
                 depth,
                 parent: parent_idx,
                 children: Vec::new(),
+                pos_fid: (fid, off_in_chunk),
             });
 
             if parent_idx >= 0 {
@@ -1078,6 +1267,27 @@ fn flatten_toc(
         &mut result,
     );
 
+    // Recompute lengths from the hierarchy: each entry covers up to the next
+    // entry at the same or shallower depth (matches calibre's writer8/main.py).
+    // The old default of `text_length - pos` made every entry span the whole
+    // book, which breaks TBS strand classification and Kindle navigation.
+    let n = result.len();
+    let mut new_lengths = vec![0u32; n];
+    for i in 0..n {
+        let pos_i = result[i].pos;
+        let depth_i = result[i].depth;
+        let next_start = result
+            .iter()
+            .filter(|e| e.depth <= depth_i && e.pos > pos_i)
+            .map(|e| e.pos)
+            .min()
+            .unwrap_or(text_length);
+        new_lengths[i] = next_start.saturating_sub(pos_i);
+    }
+    for (i, len) in new_lengths.into_iter().enumerate() {
+        result[i].length = len;
+    }
+
     result
         .into_iter()
         .map(|e| NcxBuildEntry {
@@ -1088,45 +1298,129 @@ fn flatten_toc(
             parent: e.parent,
             first_child: e.children.first().map(|&i| i as i32).unwrap_or(-1),
             last_child: e.children.last().map(|&i| i as i32).unwrap_or(-1),
+            pos_fid: Some(e.pos_fid),
         })
         .collect()
 }
 
-/// Resolve MOBI filepos anchor to text position.
+/// Map a boko `LandmarkType` to the KF8 guide reference type string Kindle
+/// expects ("cover", "start", "toc", "notes", etc.). Returning `None` means
+/// the landmark won't be emitted as a guide entry.
+fn landmark_to_guide_type(lt: crate::model::LandmarkType) -> Option<&'static str> {
+    use crate::model::LandmarkType::*;
+    Some(match lt {
+        Cover => "cover",
+        TitlePage => "title-page",
+        Toc => "toc",
+        StartReading => "start",
+        BodyMatter => "text",
+        FrontMatter => "preface",
+        BackMatter => "backmatter",
+        Acknowledgements => "acknowledgements",
+        Bibliography => "bibliography",
+        Glossary => "glossary",
+        Index => "index",
+        Preface => "preface",
+        Endnotes => "notes",
+        Loi => "loi",
+        Lot => "lot",
+    })
+}
+
+/// Build K8 guide entries from book landmarks. Each landmark resolves to a
+/// `(fid, offset)` pair via the chunker's `id_map`/`aid_offset_map`.
+fn collect_guide_entries(
+    landmarks: &[crate::model::Landmark],
+    cover_image: Option<&str>,
+    id_map: &HashMap<(String, String), String>,
+    aid_offset_map: &HashMap<String, (usize, usize, usize)>,
+) -> Vec<GuideBuildEntry> {
+    let mut entries: Vec<GuideBuildEntry> = Vec::new();
+    let mut seen_types: HashSet<String> = HashSet::new();
+
+    for landmark in landmarks {
+        let Some(guide_type) = landmark_to_guide_type(landmark.landmark_type) else {
+            continue;
+        };
+        if !seen_types.insert(guide_type.to_string()) {
+            continue;
+        }
+
+        let (file, fragment) = match landmark.href.find('#') {
+            Some(i) => (
+                landmark.href[..i].to_string(),
+                landmark.href[i + 1..].to_string(),
+            ),
+            None => (landmark.href.clone(), String::new()),
+        };
+
+        let pos_fid = id_map
+            .get(&(file.clone(), fragment.clone()))
+            .or_else(|| id_map.get(&(file.clone(), String::new())))
+            .and_then(|aid| aid_offset_map.get(aid))
+            .map(|&(seq, off_in_chunk, _)| (seq as u32, off_in_chunk as u32));
+
+        if let Some(pf) = pos_fid {
+            entries.push(GuideBuildEntry {
+                guide_type: guide_type.to_string(),
+                title: if landmark.label.is_empty() {
+                    guide_type.to_string()
+                } else {
+                    landmark.label.clone()
+                },
+                pos_fid: pf,
+            });
+        }
+    }
+
+    // Synthesize a "start" entry pointing to the first spine file if none was
+    // declared — Kindle uses this to decide where to open the book.
+    if !seen_types.contains("start")
+        && let Some((_, (seq, off, _))) = aid_offset_map
+            .iter()
+            .min_by_key(|(_, (_, _, abs))| *abs)
+    {
+        entries.push(GuideBuildEntry {
+            guide_type: "start".to_string(),
+            title: "Beginning".to_string(),
+            pos_fid: (*seq as u32, *off as u32),
+        });
+    }
+
+    // Guide entries should be sorted by type — Kindle's binary search of the
+    // index depends on it (calibre comments: "Needed by the Kindle").
+    entries.sort_by(|a, b| a.guide_type.cmp(&b.guide_type));
+    let _ = cover_image; // currently unused; reserved for future cover-page synthesis
+    entries
+}
+
+/// Resolve MOBI filepos anchor to the full (seq_num, offset_in_chunk, offset_in_text)
+/// entry from the aid_offset_map.
 ///
 /// MOBI files use `#fileposNNN` anchors where NNN is a byte position in the
 /// original HTML content. We use the filepos_map to find the aid that was
-/// closest to that position, then look up the aid's position in the
-/// transformed text.
-fn resolve_filepos(
+/// closest to that position, then return its full entry.
+fn resolve_filepos_entry(
     file: &str,
     fragment: &str,
     filepos_map: &HashMap<String, Vec<(usize, String)>>,
     aid_offset_map: &HashMap<String, (usize, usize, usize)>,
-) -> Option<u32> {
-    // Parse the filepos number
+) -> Option<(usize, usize, usize)> {
     let filepos_str = fragment.strip_prefix("filepos")?;
     let target_pos: usize = filepos_str.parse().ok()?;
 
-    // Get the position map for this file
     let positions = filepos_map.get(file)?;
     if positions.is_empty() {
         return None;
     }
 
-    // Find the aid at or before target_pos using binary search
-    // positions is sorted by original position (ascending)
     let idx = match positions.binary_search_by_key(&target_pos, |(pos, _)| *pos) {
-        Ok(i) => i,                    // Exact match
-        Err(i) => i.saturating_sub(1), // Use previous entry (largest <= target)
+        Ok(i) => i,
+        Err(i) => i.saturating_sub(1),
     };
 
     let (_, aid) = &positions[idx];
-
-    // Look up the aid's position in the transformed text
-    aid_offset_map
-        .get(aid)
-        .map(|&(_, _, off_text)| off_text as u32)
+    aid_offset_map.get(aid).copied()
 }
 
 /// Resolve MOBI filepos anchor to (fid, offset) for link resolution.
@@ -1197,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_filepos_exact_match() {
+    fn test_resolve_filepos_entry_exact_match() {
         let mut filepos_map = HashMap::new();
         filepos_map.insert(
             "content.html".to_string(),
@@ -1213,45 +1507,41 @@ mod tests {
         aid_offset_map.insert("0002".to_string(), (0, 150, 200));
         aid_offset_map.insert("0003".to_string(), (0, 250, 300));
 
-        // Exact match at position 200
-        let result = resolve_filepos("content.html", "filepos200", &filepos_map, &aid_offset_map);
-        assert_eq!(result, Some(200));
+        let result =
+            resolve_filepos_entry("content.html", "filepos200", &filepos_map, &aid_offset_map);
+        assert_eq!(result, Some((0, 150, 200)));
     }
 
     #[test]
-    fn test_resolve_filepos_nearest_before() {
+    fn test_resolve_filepos_entry_nearest_before() {
         let mut filepos_map = HashMap::new();
         filepos_map.insert(
             "content.html".to_string(),
-            vec![
-                (100, "0001".to_string()),
-                (200, "0002".to_string()),
-                (300, "0003".to_string()),
-            ],
+            vec![(100, "0001".to_string()), (200, "0002".to_string())],
         );
 
         let mut aid_offset_map = HashMap::new();
         aid_offset_map.insert("0001".to_string(), (0, 50, 100));
-        aid_offset_map.insert("0002".to_string(), (0, 150, 200));
-        aid_offset_map.insert("0003".to_string(), (0, 250, 300));
+        aid_offset_map.insert("0002".to_string(), (1, 25, 200));
 
-        // Position 250 should resolve to aid at 200 (nearest before)
-        let result = resolve_filepos("content.html", "filepos250", &filepos_map, &aid_offset_map);
-        assert_eq!(result, Some(200));
+        let result =
+            resolve_filepos_entry("content.html", "filepos250", &filepos_map, &aid_offset_map);
+        assert_eq!(result, Some((1, 25, 200)));
     }
 
     #[test]
-    fn test_resolve_filepos_invalid_fragment() {
+    fn test_resolve_filepos_entry_invalid_fragment() {
         let filepos_map = HashMap::new();
         let aid_offset_map = HashMap::new();
 
-        // Invalid fragment (not starting with "filepos")
-        let result = resolve_filepos("content.html", "anchor123", &filepos_map, &aid_offset_map);
-        assert_eq!(result, None);
-
-        // Invalid fragment (non-numeric after filepos)
-        let result = resolve_filepos("content.html", "fileposXYZ", &filepos_map, &aid_offset_map);
-        assert_eq!(result, None);
+        assert_eq!(
+            resolve_filepos_entry("content.html", "anchor123", &filepos_map, &aid_offset_map),
+            None
+        );
+        assert_eq!(
+            resolve_filepos_entry("content.html", "fileposXYZ", &filepos_map, &aid_offset_map),
+            None
+        );
     }
 
     #[test]

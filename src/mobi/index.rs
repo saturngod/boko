@@ -561,6 +561,16 @@ pub fn parse_ncx_index(entries: &[IndexEntry], cncx: &Cncx) -> Vec<NcxEntry> {
 // INDX Record Generation (for writing KF8 files)
 // ============================================================================
 
+/// Pad a byte vector to the next 4-byte boundary with zeros. Matches calibre's
+/// `align_block` helper, used inside INDX records for the TAGX, geometry, and
+/// IDXT sub-blocks.
+fn align_to_4(mut block: Vec<u8>) -> Vec<u8> {
+    while !block.len().is_multiple_of(4) {
+        block.push(0);
+    }
+    block
+}
+
 /// Encode a variable-width integer (forward encoding, high bit set on last byte)
 pub fn encint(val: u32) -> Vec<u8> {
     if val == 0 {
@@ -619,173 +629,128 @@ impl IndxBuilder {
         self.entries.push((name, tag_data));
     }
 
-    /// Build the INDX record(s)
+    /// Build the INDX record(s).
+    ///
+    /// Returns `[header_record, data_record_1, data_record_2, ...]`. Layout
+    /// matches calibre's `mobi/writer8/index.py:Index.__call__` byte-for-byte
+    /// — the header record carries TAGX + a geometry block summarising each
+    /// data record (last entry name + count) + a trailing IDXT, and data
+    /// records use a completely different INDX header layout (8 bytes of
+    /// 0xFF at offset 28).
     pub fn build(&self) -> Vec<Vec<u8>> {
         if self.entries.is_empty() {
-            return vec![self.build_header_record(0, 0)];
+            return vec![self.build_header_record(0, &[], &[])];
         }
 
-        // For simplicity, put all entries in one record (works for small indices)
         let (entry_data, idxt_offsets) = self.build_entries();
         let idxt = self.build_idxt(&idxt_offsets, entry_data.len());
 
-        // Build the single data record
         let data_record = self.build_data_record(&entry_data, &idxt);
 
-        // Build header record
-        let header_record = self.build_header_record(self.entries.len() as u32, 1);
+        // Geometry summary for the header record: one entry per data record
+        // giving the last entry's name and its count. Boko emits a single
+        // data record, so a single summary entry.
+        let last_name = self
+            .entries
+            .last()
+            .map(|(n, _)| n.clone())
+            .unwrap_or_default();
+        let header_record = self.build_header_record(
+            self.entries.len() as u32,
+            &[(last_name, self.entries.len() as u16)],
+            &[1],
+        );
 
         vec![header_record, data_record]
     }
 
-    fn build_header_record(&self, total_entries: u32, num_records: u32) -> Vec<u8> {
-        let mut record = Vec::new();
+    fn build_header_record(
+        &self,
+        total_entries: u32,
+        last_indices: &[(String, u16)],
+        _record_counts: &[u32],
+    ) -> Vec<u8> {
+        let tagx = self.build_tagx();
+        let tagx_aligned = align_to_4(tagx);
 
-        // INDX signature (offset 0)
-        record.extend_from_slice(b"INDX");
+        // Geometry block: per data record, `[len(name)][name bytes][count u16]`.
+        // Used by Kindle to know how many entries each data record contains
+        // and where the alphabetical boundary lies. Calibre also packs this
+        // into the header record.
+        let mut geometry = Vec::new();
+        let geom_start = 192 + tagx_aligned.len();
+        let mut idxt_entries: Vec<u16> = Vec::with_capacity(last_indices.len());
+        for (name, count) in last_indices {
+            idxt_entries.push((geom_start + geometry.len()) as u16);
+            let name_bytes = name.as_bytes();
+            geometry.push(name_bytes.len() as u8);
+            geometry.extend_from_slice(name_bytes);
+            geometry.extend_from_slice(&count.to_be_bytes());
+        }
+        let geometry_aligned = align_to_4(geometry);
 
-        // len: Header length (offset 4)
-        record.extend_from_slice(&192u32.to_be_bytes());
+        // Inner IDXT block: 'IDXT' + 2 bytes per entry, then padded.
+        let mut idxt_inner: Vec<u8> = Vec::with_capacity(4 + idxt_entries.len() * 2);
+        idxt_inner.extend_from_slice(b"IDXT");
+        for off in &idxt_entries {
+            idxt_inner.extend_from_slice(&off.to_be_bytes());
+        }
+        let idxt_inner_aligned = align_to_4(idxt_inner);
 
-        // nul1: Unknown/zero (offset 8)
-        record.extend_from_slice(&0u32.to_be_bytes());
+        let idxt_block_offset = 192 + tagx_aligned.len() + geometry_aligned.len();
+        let num_records = last_indices.len() as u32;
 
-        // type: Index type (offset 12) - 2 = inflection/KF8
-        record.extend_from_slice(&2u32.to_be_bytes());
+        let mut record = Vec::with_capacity(
+            192 + tagx_aligned.len() + geometry_aligned.len() + idxt_inner_aligned.len(),
+        );
 
-        // gen: Generation/unknown (offset 16)
-        record.extend_from_slice(&0u32.to_be_bytes());
+        // === INDX header (192 bytes) — see calibre IndexHeader DEFINITION ===
+        record.extend_from_slice(b"INDX"); // 0..4
+        record.extend_from_slice(&192u32.to_be_bytes()); // 4..8 header_length
+        record.extend_from_slice(&[0u8; 8]); // 8..16 unknown1 (zeros) — also identifies this as a header record
+        record.extend_from_slice(&2u32.to_be_bytes()); // 16..20 index type (2 = inflection)
+        record.extend_from_slice(&(idxt_block_offset as u32).to_be_bytes()); // 20..24 idxt_offset
+        record.extend_from_slice(&num_records.to_be_bytes()); // 24..28 num_of_records
+        record.extend_from_slice(&65001u32.to_be_bytes()); // 28..32 encoding
+        record.extend_from_slice(&0xFFFFFFFFu32.to_be_bytes()); // 32..36 unknown2 = NULL
+        record.extend_from_slice(&total_entries.to_be_bytes()); // 36..40 num_of_entries
+        record.extend_from_slice(&0u32.to_be_bytes()); // 40..44 ordt_offset
+        record.extend_from_slice(&0u32.to_be_bytes()); // 44..48 ligt_offset
+        record.extend_from_slice(&0u32.to_be_bytes()); // 48..52 num_of_ordt_entries
+        record.extend_from_slice(&self.num_cncx.to_be_bytes()); // 52..56 num_of_cncx
+        record.extend_from_slice(&[0u8; 124]); // 56..180 unknown3 (zeros)
+        record.extend_from_slice(&192u32.to_be_bytes()); // 180..184 tagx_offset
+        record.extend_from_slice(&[0u8; 8]); // 184..192 unknown4 (zeros)
 
-        // start: IDXT offset (offset 20) - 0 for header record
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // count: Number of data records (offset 24)
-        record.extend_from_slice(&num_records.to_be_bytes());
-
-        // code: Encoding (offset 28) - 65001 = UTF-8
-        record.extend_from_slice(&65001u32.to_be_bytes());
-
-        // lng: Language (offset 32)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // total: Total entries across all records (offset 36)
-        record.extend_from_slice(&total_entries.to_be_bytes());
-
-        // ordt: ORDT offset (offset 40)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // ligt: LIGT offset (offset 44)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // nligt: Number of LIGT entries (offset 48)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // ncncx: Number of CNCX records (offset 52)
-        record.extend_from_slice(&self.num_cncx.to_be_bytes());
-
-        // Unknown fields (27 u32s = 108 bytes) (offset 56-163)
-        record.extend_from_slice(&[0u8; 108]);
-
-        // ocnt (offset 164)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // oentries (offset 168)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // ordt1 (offset 172)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // ordt2 (offset 176)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // tagx: TAGX offset (offset 180) - points to TAGX after header
-        record.extend_from_slice(&192u32.to_be_bytes());
-
-        // Padding to reach 192 bytes (offsets 184-191)
-        record.extend_from_slice(&[0u8; 8]);
-
-        // TAGX section (after 192-byte header)
-        record.extend_from_slice(&self.build_tagx());
+        // === Trailing blocks: TAGX, geometry, IDXT ===
+        record.extend_from_slice(&tagx_aligned);
+        record.extend_from_slice(&geometry_aligned);
+        record.extend_from_slice(&idxt_inner_aligned);
 
         record
     }
 
     fn build_data_record(&self, entry_data: &[u8], idxt: &[u8]) -> Vec<u8> {
-        let mut record = Vec::new();
-
-        // Calculate IDXT offset
+        // Calibre's data-record INDX layout differs from the header layout:
+        // there are 8 bytes of 0xFF at offset 28 and zeros from 36..192.
+        // See calibre/mobi/writer8/index.py:Index.__call__.
         let idxt_offset = 192 + entry_data.len();
+        let record_count = self.entries.len() as u32;
 
-        // INDX signature (offset 0)
-        record.extend_from_slice(b"INDX");
+        let mut record = Vec::with_capacity(192 + entry_data.len() + idxt.len());
+        record.extend_from_slice(b"INDX"); // 0..4
+        record.extend_from_slice(&192u32.to_be_bytes()); // 4..8 header_length
+        record.extend_from_slice(&0u32.to_be_bytes()); // 8..12 unknown
+        record.extend_from_slice(&1u32.to_be_bytes()); // 12..16 header type = 1 (data record)
+        record.extend_from_slice(&0u32.to_be_bytes()); // 16..20 unknown
+        record.extend_from_slice(&(idxt_offset as u32).to_be_bytes()); // 20..24 idxt_offset
+        record.extend_from_slice(&record_count.to_be_bytes()); // 24..28 entries in this record
+        record.extend_from_slice(&[0xFFu8; 8]); // 28..36 calibre writes 8 bytes of 0xFF
+        record.extend_from_slice(&[0u8; 156]); // 36..192 zeros
 
-        // len: Header length (offset 4)
-        record.extend_from_slice(&192u32.to_be_bytes());
-
-        // nul1: Unknown/zero (offset 8)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // type: Index type (offset 12)
-        record.extend_from_slice(&2u32.to_be_bytes());
-
-        // gen: Generation/unknown (offset 16)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // start: IDXT offset (offset 20)
-        record.extend_from_slice(&(idxt_offset as u32).to_be_bytes());
-
-        // count: Number of entries in this record (offset 24)
-        record.extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
-
-        // code: Encoding (offset 28) - 65001 = UTF-8
-        record.extend_from_slice(&65001u32.to_be_bytes());
-
-        // lng: Language (offset 32)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // total: Total entries (offset 36)
-        record.extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
-
-        // ordt: ORDT offset (offset 40)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // ligt: LIGT offset (offset 44)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // nligt: Number of LIGT entries (offset 48)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // ncncx: Number of CNCX records (offset 52)
-        record.extend_from_slice(&self.num_cncx.to_be_bytes());
-
-        // Unknown fields (27 u32s = 108 bytes) (offset 56-163)
-        record.extend_from_slice(&[0u8; 108]);
-
-        // ocnt (offset 164)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // oentries (offset 168)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // ordt1 (offset 172)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // ordt2 (offset 176)
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // tagx: TAGX offset (offset 180) - 0 for data records
-        record.extend_from_slice(&0u32.to_be_bytes());
-
-        // Padding to reach 192 bytes (offsets 184-191)
-        record.extend_from_slice(&[0u8; 8]);
-
-        // Entry data
         record.extend_from_slice(entry_data);
-
-        // IDXT
         record.extend_from_slice(idxt);
 
-        // Pad to 4-byte boundary
         while !record.len().is_multiple_of(4) {
             record.push(0);
         }
@@ -947,6 +912,14 @@ pub fn build_cncx(selectors: &[String]) -> Vec<u8> {
         cncx.extend_from_slice(bytes);
     }
 
+    // CNCX records must be 4-byte aligned. Calibre's `CNCX` class calls
+    // `align_block(buf.getvalue())` (utils.py:612, 621) on every flushed
+    // record. Without this Kindle's CNCX scanner can read a misaligned
+    // trailing varint and either return the wrong string or hang.
+    while !cncx.len().is_multiple_of(4) {
+        cncx.push(0);
+    }
+
     cncx
 }
 
@@ -1052,12 +1025,83 @@ const NCX_TAG_LAST_CHILD: TagDef = TagDef {
     bitmask: 0x40,
     eof: 0,
 };
+const NCX_TAG_POS_FID: TagDef = TagDef {
+    tag: 6,
+    values_per_entry: 2,
+    bitmask: 0x80,
+    eof: 0,
+};
 const NCX_TAG_EOF: TagDef = TagDef {
     tag: 0,
     values_per_entry: 0,
     bitmask: 0x00,
     eof: 1,
 };
+
+// Guide index tags (KF8 guide reference index)
+const GUIDE_TAG_TITLE: TagDef = TagDef {
+    tag: 1,
+    values_per_entry: 1,
+    bitmask: 0x01,
+    eof: 0,
+};
+const GUIDE_TAG_POS_FID: TagDef = TagDef {
+    tag: 6,
+    values_per_entry: 2,
+    bitmask: 0x02,
+    eof: 0,
+};
+const GUIDE_TAG_EOF: TagDef = TagDef {
+    tag: 0,
+    values_per_entry: 0,
+    bitmask: 0x00,
+    eof: 1,
+};
+
+/// A guide entry — maps an EPUB landmark to a Kindle navigation point.
+#[derive(Debug, Clone)]
+pub struct GuideBuildEntry {
+    /// Guide type ("cover", "title-page", "toc", "start", "text", "notes", etc.).
+    /// Used as the index entry's name; Kindle treats it as the lookup key.
+    pub guide_type: String,
+    /// Display label (CNCX).
+    pub title: String,
+    /// (fid, offset) — chunk index and offset within the chunk.
+    pub pos_fid: (u32, u32),
+}
+
+/// Build the K8 guide index records (one or more INDX records + a CNCX).
+pub fn build_guide_indx(entries: &[GuideBuildEntry]) -> (Vec<Vec<u8>>, Vec<u8>) {
+    let tagx = vec![GUIDE_TAG_TITLE, GUIDE_TAG_POS_FID, GUIDE_TAG_EOF];
+    let mut builder = IndxBuilder::new(tagx, 1);
+
+    let titles: Vec<String> = entries.iter().map(|e| e.title.clone()).collect();
+    let title_offsets = calculate_cncx_offsets(&titles);
+    let cncx = build_cncx(&titles);
+
+    if !entries.is_empty() {
+        builder.set_cncx_count(1);
+    }
+
+    for (i, entry) in entries.iter().enumerate() {
+        // Both tags are mandatory for guide entries.
+        let ctrl: u8 = 0x03;
+        let mut tag_data = vec![ctrl];
+
+        // Title (tag 1) — CNCX offset.
+        let title_offset = title_offsets.get(i).copied().unwrap_or(0);
+        tag_data.extend(encint(title_offset));
+
+        // pos_fid (tag 6) — fid + offset.
+        let (fid, off) = entry.pos_fid;
+        tag_data.extend(encint(fid));
+        tag_data.extend(encint(off));
+
+        builder.add_entry(entry.guide_type.clone(), tag_data);
+    }
+
+    (builder.build(), cncx)
+}
 
 /// NCX entry for building table of contents
 #[derive(Debug, Clone)]
@@ -1076,6 +1120,8 @@ pub struct NcxBuildEntry {
     pub first_child: i32,
     /// Index of last child (-1 if no children)
     pub last_child: i32,
+    /// (fid, offset) — chunk index and offset within chunk for KF8 link navigation
+    pub pos_fid: Option<(u32, u32)>,
 }
 
 /// Build NCX index for table of contents
@@ -1088,9 +1134,15 @@ pub fn build_ncx_indx(entries: &[NcxBuildEntry]) -> (Vec<Vec<u8>>, Vec<u8>) {
         NCX_TAG_PARENT,
         NCX_TAG_FIRST_CHILD,
         NCX_TAG_LAST_CHILD,
+        NCX_TAG_POS_FID,
         NCX_TAG_EOF,
     ];
-    let mut builder = IndxBuilder::new(tagx, 2); // 2 control bytes for NCX
+    // libmobi / Kindle compute control_byte_count from the TAGX itself by
+    // counting EOF-terminator entries. NCX TAGX has exactly one EOF, so the
+    // entry uses one control byte. Using 2 here previously produced a
+    // "Wrong count of control bytes: 2 != 1" parse failure and Kindle
+    // refused to open the file as corrupt.
+    let mut builder = IndxBuilder::new(tagx, 1);
 
     // Build CNCX with labels
     let labels: Vec<String> = entries.iter().map(|e| e.label.clone()).collect();
@@ -1118,9 +1170,12 @@ pub fn build_ncx_indx(entries: &[NcxBuildEntry]) -> (Vec<Vec<u8>>, Vec<u8>) {
         if has_last_child {
             ctrl |= 0x40;
         }
+        let has_pos_fid = entry.pos_fid.is_some();
+        if has_pos_fid {
+            ctrl |= 0x80;
+        }
 
-        // Control byte 1 is unused
-        let mut tag_data = vec![ctrl, 0x00];
+        let mut tag_data = vec![ctrl];
 
         // Offset (tag 1)
         tag_data.extend(encint(entry.pos));
@@ -1148,6 +1203,12 @@ pub fn build_ncx_indx(entries: &[NcxBuildEntry]) -> (Vec<Vec<u8>>, Vec<u8>) {
         // Last child (tag 23)
         if has_last_child {
             tag_data.extend(encint(entry.last_child as u32));
+        }
+
+        // pos_fid (tag 6): two values — fid (chunk index), then offset in chunk
+        if let Some((fid, off)) = entry.pos_fid {
+            tag_data.extend(encint(fid));
+            tag_data.extend(encint(off));
         }
 
         let name = format!("{i:04}");
@@ -1230,6 +1291,7 @@ mod tests {
                 parent: -1,
                 first_child: -1,
                 last_child: -1,
+                pos_fid: None,
             },
             NcxBuildEntry {
                 pos: 1000,
@@ -1239,6 +1301,7 @@ mod tests {
                 parent: -1,
                 first_child: -1,
                 last_child: -1,
+                pos_fid: None,
             },
         ];
 

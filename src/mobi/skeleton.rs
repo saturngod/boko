@@ -118,12 +118,39 @@ impl Skeleton {
         self.skeleton.len() + self.chunks.iter().map(|c| c.raw.len()).sum::<usize>()
     }
 
-    /// Get the raw text (skeleton + chunks concatenated)
+    /// Get the raw text (skeleton + chunks concatenated). This is the
+    /// on-disk layout that ends up in rawML records.
     pub fn raw_text(&self) -> Vec<u8> {
         let mut result = self.skeleton.clone();
         for chunk in &self.chunks {
             result.extend_from_slice(&chunk.raw);
         }
+        result
+    }
+
+    /// Get the reassembled file content (chunks inserted into the skeleton
+    /// at their `insert_pos`). This is what Kindle materialises when
+    /// rendering a part; `chunk_table.insert_pos` and `pos_fid` offsets are
+    /// in *this* coordinate space, not in the rawML layout.
+    pub fn rebuild(&self) -> Vec<u8> {
+        // Sort chunks by their position-within-skel so multiple chunks per
+        // skel insert in order. (In the current writer there's always one
+        // chunk per skel, but the math is the same.)
+        let mut chunks: Vec<&Chunk> = self.chunks.iter().collect();
+        chunks.sort_by_key(|c| c.insert_pos);
+
+        let mut result = Vec::with_capacity(
+            self.skeleton.len() + chunks.iter().map(|c| c.raw.len()).sum::<usize>(),
+        );
+        let mut skel_cursor = 0;
+        for chunk in chunks {
+            let rel_pos = chunk.insert_pos.saturating_sub(self.start_pos);
+            let rel_pos = rel_pos.min(self.skeleton.len());
+            result.extend_from_slice(&self.skeleton[skel_cursor..rel_pos]);
+            result.extend_from_slice(&chunk.raw);
+            skel_cursor = rel_pos;
+        }
+        result.extend_from_slice(&self.skeleton[skel_cursor..]);
         result
     }
 }
@@ -194,7 +221,27 @@ impl Chunker {
             skeletons.push(skeleton);
         }
 
-        // Create tables
+        // Build SKEL and Chunk tables directly from the per-file chunks
+        // produced by process_file. SKEL.length is the skeleton's bytes (0
+        // in this writer); chunks' insert_pos and length describe the
+        // content slice that lives in the rawML right after the skeleton.
+        let mut chunk_table: Vec<ChunkEntry> = Vec::new();
+        let mut seq_num = 0usize;
+        for skel in &mut skeletons {
+            for chunk in &mut skel.chunks {
+                chunk.sequence_number = seq_num;
+                chunk_table.push(ChunkEntry {
+                    insert_pos: chunk.insert_pos,
+                    selector: chunk.selector.clone(),
+                    file_number: chunk.file_number,
+                    sequence_number: seq_num,
+                    start_pos: chunk.start_pos,
+                    length: chunk.raw.len(),
+                });
+                seq_num += 1;
+            }
+        }
+
         let skel_table: Vec<SkelEntry> = skeletons
             .iter()
             .map(|s| SkelEntry {
@@ -206,34 +253,17 @@ impl Chunker {
             })
             .collect();
 
-        // Create virtual chunk entries to cover the entire text
-        // Each chunk covers CHUNK_SIZE bytes for link resolution
-        let mut chunk_table = Vec::new();
-        let mut text_offset = 0usize;
-        let mut seq_num = 0usize;
-
-        for skel in &skeletons {
-            // Create one chunk entry per skeleton file covering its content
-            let skel_len = skel.skeleton.len();
-            if skel_len > 0 {
-                chunk_table.push(ChunkEntry {
-                    insert_pos: text_offset,
-                    selector: "P-//*[@aid='0000']".to_string(),
-                    file_number: skel.file_number,
-                    sequence_number: seq_num,
-                    start_pos: 0,
-                    length: skel_len,
-                });
-                seq_num += 1;
-            }
-            text_offset += skel_len;
-        }
-
-        // Combine all text
+        // `text` is the on-disk rawML layout: per skel, the skeleton bytes
+        // followed by its chunk bytes.
         let text: Vec<u8> = skeletons.iter().flat_map(|s| s.raw_text()).collect();
 
-        // Build aid_offset_map by finding all aid attributes in the text
-        let aid_offset_map = self.build_aid_offset_map(&text, &chunk_table);
+        // Build aid_offset_map by scanning the *reassembled* book — chunks
+        // inserted into their skeletons — because `chunk_table.insert_pos`
+        // is in reassembled coordinates. Calibre does the same in
+        // `Skeleton.set_internal_links` (it iterates `rebuilt_text`, not
+        // the rawML).
+        let rebuilt: Vec<u8> = skeletons.iter().flat_map(|s| s.rebuild()).collect();
+        let aid_offset_map = self.build_aid_offset_map(&rebuilt, &chunk_table);
 
         ChunkerResult {
             skeletons,
@@ -271,26 +301,37 @@ impl Chunker {
                 if quote == b'"' {
                     let aid = String::from_utf8_lossy(aid_bytes).to_string();
 
-                    // Find which chunk this offset is in
-                    // Since we don't do real chunking yet, use a simple approach:
-                    // sequence_number = 0 for first skeleton, offset_in_chunk = offset
+                    // `offset` is in reassembled coordinates. Find the chunk
+                    // whose [insert_pos, insert_pos+length) range contains
+                    // it. Calibre falls back to "the chunk immediately
+                    // after" when the aid is in the skeleton (e.g. on
+                    // `<body aid="0000">`), with an in-chunk offset of 0.
                     let (seq_num, offset_in_chunk) = if chunk_table.is_empty() {
-                        // No chunks, treat whole text as one chunk
                         (0usize, offset)
                     } else {
-                        // Find the chunk containing this offset
-                        let mut found_seq = 0usize;
-                        let mut found_offset = offset;
+                        let mut resolved: Option<(usize, usize)> = None;
                         for chunk in chunk_table {
                             let chunk_start = chunk.insert_pos;
                             let chunk_end = chunk_start + chunk.length;
                             if offset >= chunk_start && offset < chunk_end {
-                                found_seq = chunk.sequence_number;
-                                found_offset = offset - chunk_start;
+                                resolved = Some((chunk.sequence_number, offset - chunk_start));
+                                break;
+                            }
+                            if chunk_start > offset {
+                                // Aid is in a skeleton before this chunk —
+                                // use this chunk with in-chunk offset 0.
+                                resolved = Some((chunk.sequence_number, 0));
                                 break;
                             }
                         }
-                        (found_seq, found_offset)
+                        // If the aid is past every chunk, point to the last
+                        // chunk's end.
+                        resolved.unwrap_or_else(|| {
+                            let last = chunk_table
+                                .last()
+                                .expect("chunk_table non-empty here");
+                            (last.sequence_number, last.length.saturating_sub(1))
+                        })
                     };
 
                     aid_offset_map.insert(aid, (seq_num, offset_in_chunk, offset));
@@ -302,7 +343,18 @@ impl Chunker {
         aid_offset_map
     }
 
-    /// Process a single HTML file
+    /// Process a single HTML file into a skeleton + chunk.
+    ///
+    /// Layout mirrors calibre's approach: the skeleton holds the HTML
+    /// scaffolding (everything up to and including the `<body...>` opening
+    /// tag, plus `</body></html>` at the end), while the chunk holds the
+    /// body content. When Kindle reassembles, it reads `skel.length` bytes
+    /// of scaffold from the rawML, then inserts each chunk at its
+    /// `insert_pos` into that scaffold.
+    ///
+    /// Earlier versions packed the whole file into a single chunk and used
+    /// an empty skeleton, which freezes the device's renderer: Kindle's
+    /// layout engine seems to require real HTML scaffolding bytes per skel.
     fn process_file(
         &mut self,
         file_number: usize,
@@ -310,30 +362,221 @@ impl Chunker {
         html: &[u8],
         start_pos: usize,
     ) -> Skeleton {
-        // Simple implementation: add aids, no actual chunking
-        // Full HTML goes to skeleton, chunks are empty (content stays in skeleton)
-
-        // Use fast path from writer_transform
+        // Kindle's HTML5 parser chokes on EPUB3 namespace decorations
+        // (`xmlns:epub`, `epub:type`, `epub:prefix`, `xml:lang`, etc.) so
+        // strip them before aid annotation.
+        let cleaned = super::writer_transform::strip_xml_namespaces(html);
         let result = super::writer_transform::add_aid_attributes_fast(
-            html,
+            &cleaned,
             file_href,
             &mut self.aid_counter,
             &mut self.id_map,
         );
 
-        // Store position map for filepos resolution
         if !result.position_map.is_empty() {
             self.filepos_map
                 .insert(file_href.to_string(), result.position_map);
         }
 
+        // Split the (aid-annotated) HTML into [head + body-open][body
+        // content][body-close + html-close]. The chunk holds the body
+        // content; the skeleton is the surrounding scaffold.
+        let (skel_prefix, body_content, skel_suffix) = split_body(&result.html);
+
+        let mut skeleton_bytes = Vec::with_capacity(skel_prefix.len() + skel_suffix.len());
+        skeleton_bytes.extend_from_slice(skel_prefix);
+        skeleton_bytes.extend_from_slice(skel_suffix);
+
+        // Split body content into ~CHUNK_SIZE pieces at `<` tag boundaries.
+        // Kindle's renderer freezes on chunks larger than this — calibre's
+        // writer enforces the same limit. Splitting at `<` is safe because
+        // chunks are simply concatenated when Kindle reassembles the file;
+        // no chunk needs to be valid HTML on its own.
+        let body_chunks = split_body_into_chunks(body_content, CHUNK_SIZE);
+
+        // Each chunk's `insert_pos` is the absolute rawML position where its
+        // bytes go in the reassembled file. The first chunk starts just
+        // after the prefix scaffold; subsequent chunks follow contiguously.
+        let mut chunks = Vec::with_capacity(body_chunks.len());
+        let mut cumulative = 0usize;
+        let base = start_pos + skel_prefix.len();
+        for raw in body_chunks {
+            let len = raw.len();
+            chunks.push(Chunk {
+                raw,
+                insert_pos: base + cumulative,
+                starts_tags: Vec::new(),
+                ends_tags: Vec::new(),
+                selector: "P-//*[@aid='0000']".to_string(),
+                file_number,
+                sequence_number: 0, // assigned by Chunker::process
+                start_pos: cumulative,
+            });
+            cumulative += len;
+        }
+
         Skeleton {
             file_number,
-            skeleton: result.html,
-            chunks: Vec::new(), // No chunking - content stays in skeleton
+            skeleton: skeleton_bytes,
+            chunks,
             start_pos,
         }
     }
+}
+
+const CHUNK_SIZE: usize = 8192;
+
+/// Split body-content bytes into chunks of at most ~`max_size` bytes each,
+/// always cutting at HTML element boundaries (after a closing tag).
+///
+/// We walk the bytes tracking tag nesting depth. After each closing tag or
+/// self-closing tag we're at a safe boundary between sibling elements. Cut
+/// there once the in-progress chunk has reached `max_size`, preferring the
+/// *shallowest* such boundary so each chunk ends with a complete (possibly
+/// nested) element rather than mid-way through some deeply-nested run.
+///
+/// In practice this gives chunks that always contain whole `<p>` /
+/// `<li>` / `<section>` etc. units. Comments, processing instructions,
+/// CDATA, and doctypes don't affect depth. A single element larger than
+/// `max_size` becomes one oversized chunk (rare; would need to recurse
+/// inside it to split further, which we don't here).
+fn split_body_into_chunks(body: &[u8], max_size: usize) -> Vec<Vec<u8>> {
+    if body.is_empty() {
+        return vec![Vec::new()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut chunk_start = 0;
+    let mut depth: i32 = 0;
+    let mut i = 0;
+
+    while i < body.len() {
+        if body[i] != b'<' {
+            i += 1;
+            continue;
+        }
+
+        let tag_start = i;
+        let next = body.get(i + 1).copied();
+
+        if matches!(next, Some(b'!') | Some(b'?')) {
+            let close = memchr::memchr(b'>', &body[tag_start..])
+                .map(|r| tag_start + r + 1)
+                .unwrap_or(body.len());
+            i = close;
+            continue;
+        }
+
+        let is_close = next == Some(b'/');
+
+        let mut j = tag_start + 1;
+        let mut in_quote: Option<u8> = None;
+        while j < body.len() {
+            let c = body[j];
+            match in_quote {
+                Some(q) if c == q => in_quote = None,
+                None => match c {
+                    b'"' | b'\'' => in_quote = Some(c),
+                    b'>' => break,
+                    _ => {}
+                },
+                _ => {}
+            }
+            j += 1;
+        }
+        if j >= body.len() {
+            break;
+        }
+        let tag_end = j + 1;
+
+        let self_closing = j > 0 && body[j - 1] == b'/';
+
+        if is_close {
+            depth = depth.saturating_sub(1);
+        } else if !self_closing {
+            depth += 1;
+        }
+
+        i = tag_end;
+
+        // Cut at the first element-closing boundary once we've reached the
+        // target size — first-fit rather than "prefer shallowest". A deep
+        // run that doesn't surface within target shouldn't be allowed to
+        // grow past the limit, which is exactly what Kindle's renderer
+        // can't handle.
+        if (is_close || self_closing) && (i - chunk_start) >= max_size {
+            chunks.push(body[chunk_start..i].to_vec());
+            chunk_start = i;
+        }
+    }
+
+    // Flush trailing bytes. If they're tiny, fold them into the previous
+    // chunk rather than emitting a sliver — Kindle accepts very small
+    // trailing fragments but they're a footgun for fragment indexing.
+    if chunk_start < body.len() {
+        let tail = &body[chunk_start..];
+        if let Some(last) = chunks.last_mut()
+            && tail.len() < max_size / 16
+        {
+            last.extend_from_slice(tail);
+        } else {
+            chunks.push(tail.to_vec());
+        }
+    } else if chunks.is_empty() {
+        chunks.push(Vec::new());
+    }
+
+    chunks
+}
+
+/// Split an HTML document into `(scaffold_before_body_content, body_content,
+/// scaffold_after_body_content)`. The split point is just past the `<body…>`
+/// opening tag and just before the matching `</body>`. If either tag isn't
+/// found, returns the whole document as scaffold with empty body content (so
+/// minimal files don't break the writer).
+fn split_body(html: &[u8]) -> (&[u8], &[u8], &[u8]) {
+    use memchr::memmem;
+
+    // Find `<body` case-insensitively. memmem is case-sensitive, but body
+    // tags in serialised XHTML are reliably lowercase, so a direct search
+    // is fine; fall back to a manual scan if needed.
+    let body_open_start = match memmem::find(html, b"<body") {
+        Some(i) => i,
+        None => return (html, &[], &[]),
+    };
+
+    // Find the `>` that closes the opening tag, respecting quoted attribute
+    // values.
+    let mut p = body_open_start + 5;
+    let mut in_quote: Option<u8> = None;
+    while p < html.len() {
+        let c = html[p];
+        match in_quote {
+            Some(q) if c == q => in_quote = None,
+            None => match c {
+                b'"' | b'\'' => in_quote = Some(c),
+                b'>' => break,
+                _ => {}
+            },
+            _ => {}
+        }
+        p += 1;
+    }
+    if p >= html.len() {
+        return (html, &[], &[]);
+    }
+    let body_open_end = p + 1;
+
+    let body_close_start = match memmem::rfind(html, b"</body>") {
+        Some(i) if i >= body_open_end => i,
+        _ => return (html, &[], &[]),
+    };
+
+    (
+        &html[..body_open_end],
+        &html[body_open_end..body_close_start],
+        &html[body_close_start..],
+    )
 }
 
 #[cfg(test)]
@@ -379,5 +622,34 @@ mod tests {
         let result_str = String::from_utf8_lossy(&result.html);
         assert!(result_str.contains("aid=\"0000\""));
         assert!(result_str.contains("aid=\"0001\""));
+    }
+}
+
+#[cfg(test)]
+mod chunker_tests {
+    use super::*;
+
+    #[test]
+    fn chunker_preserves_all_bytes() {
+        // Pathological-ish HTML similar to a real chapter.
+        let body = b"<section><h1>Title</h1><p>One.</p><p>Two.</p><div><p>A</p><p>B</p></div></section>".repeat(200);
+        let chunks = split_body_into_chunks(&body, 8192);
+        let recon: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        assert_eq!(recon, body, "chunks must concatenate back to the original body");
+    }
+
+    #[test]
+    fn chunker_under_target_yields_single_chunk() {
+        let body = b"<p>tiny</p>".repeat(10);
+        let chunks = split_body_into_chunks(&body, 8192);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].as_slice(), body.as_slice());
+    }
+
+    #[test]
+    fn chunker_empty_body() {
+        let chunks = split_body_into_chunks(b"", 8192);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].is_empty());
     }
 }
