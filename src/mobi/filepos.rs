@@ -15,47 +15,41 @@ use std::collections::{BTreeMap, HashSet};
 /// Matches KindleUnpack's link_pattern: `<[^<>]+filepos=['"{0,1}(\d+)[^<>]*>`
 pub fn collect_filepos_targets(html: &[u8]) -> HashSet<usize> {
     let mut targets = HashSet::new();
-    let mut pos = 0;
 
-    while pos < html.len() {
-        // Look for filepos= pattern (may or may not have quotes)
-        if pos + 8 < html.len() && html[pos..].starts_with(b"filepos=") {
-            let val_start = pos + 8;
-            let mut start = val_start;
+    // SIMD-scan for each `filepos=` occurrence rather than testing every byte
+    // position over the whole decompressed text stream.
+    for pos in memchr::memmem::find_iter(html, b"filepos=") {
+        let val_start = pos + 8;
+        let mut start = val_start;
 
-            // Skip optional quote
-            if start < html.len() && (html[start] == b'"' || html[start] == b'\'') {
-                start += 1;
+        // Skip optional quote
+        if start < html.len() && (html[start] == b'"' || html[start] == b'\'') {
+            start += 1;
+        }
+
+        // Skip leading zeros
+        while start < html.len() && html[start] == b'0' {
+            start += 1;
+        }
+
+        // Parse digits
+        let mut val_end = start;
+        while val_end < html.len() && html[val_end].is_ascii_digit() {
+            val_end += 1;
+        }
+
+        // If we only had zeros, back up to include at least one
+        if val_end == start && start > val_start && html[start - 1] == b'0' {
+            start -= 1;
+        }
+
+        if val_end > start {
+            if let Ok(filepos) = String::from_utf8_lossy(&html[start..val_end]).parse::<usize>() {
+                targets.insert(filepos);
             }
-
-            // Skip leading zeros
-            while start < html.len() && html[start] == b'0' {
-                start += 1;
-            }
-
-            // Parse digits
-            let mut val_end = start;
-            while val_end < html.len() && html[val_end].is_ascii_digit() {
-                val_end += 1;
-            }
-
-            // If we only had zeros, back up to include at least one
-            if val_end == start && start > val_start && html[start - 1] == b'0' {
-                start -= 1;
-            }
-
-            if val_end > start {
-                if let Ok(filepos) = String::from_utf8_lossy(&html[start..val_end]).parse::<usize>()
-                {
-                    targets.insert(filepos);
-                }
-            } else if val_end == start {
-                // Just "0" or empty after zeros
-                targets.insert(0);
-            }
-            pos = val_end;
-        } else {
-            pos += 1;
+        } else if val_end == start {
+            // Just "0" or empty after zeros
+            targets.insert(0);
         }
     }
 
