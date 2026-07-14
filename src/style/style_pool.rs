@@ -14,6 +14,10 @@ pub struct StylePool {
     styles: Vec<ComputedStyle>,
     /// Hash-based deduplication map.
     intern_map: FxHashMap<ComputedStyle, StyleId>,
+    /// Most recently interned id. Consecutive elements very often share a
+    /// style, so an equality check against this (which short-circuits on the
+    /// first differing field) skips hashing the whole `ComputedStyle`.
+    last: StyleId,
 }
 
 impl Default for StylePool {
@@ -32,6 +36,7 @@ impl StylePool {
         Self {
             styles: vec![default_style],
             intern_map,
+            last: StyleId::DEFAULT,
         }
     }
 
@@ -40,13 +45,18 @@ impl StylePool {
     /// If an identical style already exists, returns the existing ID.
     /// Otherwise, allocates a new style and returns its ID.
     pub fn intern(&mut self, style: ComputedStyle) -> StyleId {
+        if self.styles[self.last.0 as usize] == style {
+            return self.last;
+        }
         if let Some(&id) = self.intern_map.get(&style) {
+            self.last = id;
             return id;
         }
 
         let id = StyleId(self.styles.len() as u32);
         self.intern_map.insert(style.clone(), id);
         self.styles.push(style);
+        self.last = id;
         id
     }
 
@@ -55,13 +65,18 @@ impl StylePool {
     /// Like [`intern`](Self::intern) but only clones the style on a cache
     /// miss — use this on hot paths where the caller keeps ownership.
     pub fn intern_ref(&mut self, style: &ComputedStyle) -> StyleId {
+        if self.styles[self.last.0 as usize] == *style {
+            return self.last;
+        }
         if let Some(&id) = self.intern_map.get(style) {
+            self.last = id;
             return id;
         }
 
         let id = StyleId(self.styles.len() as u32);
         self.intern_map.insert(style.clone(), id);
         self.styles.push(style.clone());
+        self.last = id;
         id
     }
 

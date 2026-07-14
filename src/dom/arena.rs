@@ -26,6 +26,9 @@ impl ArenaNodeId {
     }
 }
 
+/// Sentinel for "no such attribute" in the pre-extracted attribute indices.
+const NO_ATTR: u32 = u32::MAX;
+
 /// Node type in the arena DOM.
 #[derive(Debug, Clone)]
 pub enum ArenaNodeData {
@@ -35,10 +38,15 @@ pub enum ArenaNodeData {
     Element {
         name: QualName,
         attrs: Vec<Attribute>,
-        /// Pre-extracted id for fast matching.
-        id: Option<String>,
-        /// Pre-extracted classes for fast matching.
-        classes: Vec<String>,
+        /// Index into `attrs` of the `id` attribute for fast matching
+        /// (`NO_ATTR` if absent). Attributes are only ever appended, so the
+        /// index stays valid.
+        id_attr: u32,
+        /// Index into `attrs` of the `class` attribute (`NO_ATTR` if absent).
+        class_attr: u32,
+        /// Pre-split `(start, len)` byte spans of each class within the
+        /// class attribute's value — avoids one `String` per class.
+        class_spans: Box<[(u32, u32)]>,
     },
     /// Text content.
     Text(String),
@@ -140,34 +148,33 @@ impl ArenaDom {
     /// Create a new element node.
     pub fn create_element(&mut self, name: QualName, attrs: Vec<Attribute>) -> ArenaNodeId {
         // Pre-extract id and class for fast CSS matching
-        let mut id = None;
-        let mut classes = Vec::new();
+        let mut id_attr = NO_ATTR;
+        let mut class_attr = NO_ATTR;
+        let mut class_spans: Box<[(u32, u32)]> = Box::default();
 
-        for attr in &attrs {
+        for (idx, attr) in attrs.iter().enumerate() {
             if attr.name.local.as_ref() == "id" {
-                id = Some(attr.value.clone());
+                id_attr = idx as u32;
             } else if attr.name.local.as_ref() == "class" {
-                classes = attr
-                    .value
-                    .split_whitespace()
-                    .map(|s| s.to_string())
-                    .collect();
+                class_attr = idx as u32;
+                class_spans = split_class_spans(&attr.value);
             }
         }
 
-        let node_id = self.alloc(ArenaNode::new(ArenaNodeData::Element {
-            name,
-            attrs,
-            id: id.clone(),
-            classes,
-        }));
-
-        // Register in id map
-        if let Some(id_str) = id {
-            self.id_map.insert(id_str, node_id);
+        // Register in id map (the only place an owned copy of the id is needed)
+        let node_id = ArenaNodeId(self.nodes.len() as u32);
+        if id_attr != NO_ATTR {
+            self.id_map
+                .insert(attrs[id_attr as usize].value.clone(), node_id);
         }
 
-        node_id
+        self.alloc(ArenaNode::new(ArenaNodeData::Element {
+            name,
+            attrs,
+            id_attr,
+            class_attr,
+            class_spans,
+        }))
     }
 
     /// Add attributes to an element if missing, updating cached id/classes.
@@ -176,8 +183,9 @@ impl ArenaDom {
         if let Some(node) = self.get_mut(id)
             && let ArenaNodeData::Element {
                 attrs: existing,
-                id: existing_id,
-                classes,
+                id_attr,
+                class_attr,
+                class_spans,
                 ..
             } = &mut node.data
         {
@@ -187,15 +195,13 @@ impl ArenaDom {
                 }
 
                 let local = attr.name.local.as_ref();
-                if local == "id" && existing_id.is_none() {
-                    *existing_id = Some(attr.value.clone());
+                let idx = existing.len() as u32;
+                if local == "id" && *id_attr == NO_ATTR {
+                    *id_attr = idx;
                     new_id = Some(attr.value.clone());
-                } else if local == "class" && classes.is_empty() {
-                    *classes = attr
-                        .value
-                        .split_whitespace()
-                        .map(|s| s.to_string())
-                        .collect();
+                } else if local == "class" && *class_attr == NO_ATTR {
+                    *class_attr = idx;
+                    *class_spans = split_class_spans(&attr.value);
                 }
 
                 existing.push(attr);
@@ -379,6 +385,19 @@ impl Default for ArenaDom {
     }
 }
 
+/// Compute the `(start, len)` byte span of each whitespace-separated class
+/// within a class attribute value. Class-less values yield an empty (and
+/// allocation-free) boxed slice.
+fn split_class_spans(value: &str) -> Box<[(u32, u32)]> {
+    value
+        .split_whitespace()
+        .map(|class| {
+            let start = class.as_ptr() as usize - value.as_ptr() as usize;
+            (start as u32, class.len() as u32)
+        })
+        .collect()
+}
+
 /// Iterator over children of a node.
 pub struct ChildrenIter<'a> {
     dom: &'a ArenaDom,
@@ -434,20 +453,28 @@ impl ArenaDom {
     /// Get element's id attribute.
     pub fn element_id(&self, id: ArenaNodeId) -> Option<&str> {
         self.get(id).and_then(|n| match &n.data {
-            ArenaNodeData::Element { id, .. } => id.as_deref(),
+            ArenaNodeData::Element { attrs, id_attr, .. } if *id_attr != NO_ATTR => {
+                Some(attrs[*id_attr as usize].value.as_str())
+            }
             _ => None,
         })
     }
 
-    /// Get element's classes.
-    pub fn element_classes(&self, id: ArenaNodeId) -> &[String] {
-        static EMPTY: &[String] = &[];
-        self.get(id)
-            .and_then(|n| match &n.data {
-                ArenaNodeData::Element { classes, .. } => Some(classes.as_slice()),
-                _ => None,
-            })
-            .unwrap_or(EMPTY)
+    /// Iterate over element's classes as `&str` slices of the class
+    /// attribute's value (empty for non-elements and class-less elements).
+    pub fn element_classes(&self, id: ArenaNodeId) -> impl Iterator<Item = &str> {
+        let (value, spans): (&str, &[(u32, u32)]) = match self.get(id).map(|n| &n.data) {
+            Some(ArenaNodeData::Element {
+                attrs,
+                class_attr,
+                class_spans,
+                ..
+            }) if *class_attr != NO_ATTR => (&attrs[*class_attr as usize].value, class_spans),
+            _ => ("", &[]),
+        };
+        spans
+            .iter()
+            .map(move |&(start, len)| &value[start as usize..(start + len) as usize])
     }
 
     /// Check if node is an element.
@@ -555,9 +582,9 @@ mod tests {
         );
 
         assert_eq!(dom.element_id(div), Some("main"));
-        let classes = dom.element_classes(div);
-        assert!(classes.contains(&"container".to_string()));
-        assert!(classes.contains(&"header".to_string()));
+        let classes: Vec<&str> = dom.element_classes(div).collect();
+        assert!(classes.contains(&"container"));
+        assert!(classes.contains(&"header"));
         assert_eq!(dom.get_by_id("main"), Some(div));
     }
 }

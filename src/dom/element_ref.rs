@@ -441,9 +441,8 @@ impl<'a> selectors::Element for ElementRef<'a> {
     }
 
     fn has_class(&self, name: &IdentStr, case_sensitivity: CaseSensitivity) -> bool {
-        let classes = self.dom.element_classes(self.id);
-        classes
-            .iter()
+        self.dom
+            .element_classes(self.id)
             .any(|c| case_sensitivity.eq(c.as_bytes(), name.0.as_bytes()))
     }
 

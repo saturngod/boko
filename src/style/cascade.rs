@@ -242,7 +242,7 @@ impl<'a> CascadeIndex<'a> {
             out.extend_from_slice(v);
         }
         for class in elem.dom.element_classes(elem.id) {
-            if let Some(v) = self.by_class.get(class.as_str()) {
+            if let Some(v) = self.by_class.get(class) {
                 out.extend_from_slice(v);
             }
         }

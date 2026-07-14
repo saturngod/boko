@@ -6,15 +6,17 @@ use html5ever::tendril::StrTendril;
 use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::{Attribute as Html5Attribute, QualName};
 
-use std::rc::Rc;
-
 use super::arena::{ArenaDom, ArenaNodeId, Attribute};
 
 /// Handle used by TreeSink to reference nodes.
+///
+/// Stores the element's `QualName` inline rather than behind an `Rc`:
+/// `QualName` is three atoms (word-sized, and static for HTML names), so
+/// cloning it is cheaper than allocating an `Rc` per created element.
 #[derive(Debug, Clone)]
 pub struct NodeHandle {
     pub id: ArenaNodeId,
-    name: Option<Rc<QualName>>,
+    name: Option<QualName>,
 }
 
 impl PartialEq for NodeHandle {
@@ -93,7 +95,7 @@ impl TreeSink for ArenaSink {
             local: html5ever::local_name!(""),
         };
 
-        target.name.as_deref().unwrap_or(&EMPTY)
+        target.name.as_ref().unwrap_or(&EMPTY)
     }
 
     fn create_element(
@@ -110,11 +112,11 @@ impl TreeSink for ArenaSink {
             })
             .collect();
 
-        let name_rc = Rc::new(name.clone());
+        let handle_name = name.clone();
         let id = self.dom.borrow_mut().create_element(name, converted_attrs);
         NodeHandle {
             id,
-            name: Some(name_rc),
+            name: Some(handle_name),
         }
     }
 
@@ -334,9 +336,9 @@ mod tests {
         let div = dom.find_by_tag("div").expect("should find div");
         assert_eq!(dom.element_id(div), Some("main"));
 
-        let classes = dom.element_classes(div);
-        assert!(classes.contains(&"container".to_string()));
-        assert!(classes.contains(&"header".to_string()));
+        let classes: Vec<&str> = dom.element_classes(div).collect();
+        assert!(classes.contains(&"container"));
+        assert!(classes.contains(&"header"));
     }
 
     #[test]
