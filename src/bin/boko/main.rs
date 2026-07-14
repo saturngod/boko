@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 mod kfx_dump;
 use serde::Serialize;
@@ -21,7 +21,7 @@ struct Cli {
 enum Command {
     /// Show book metadata and structure
     Info {
-        /// Input file (EPUB, AZW3, or MOBI)
+        /// Input file (EPUB, AZW3, MOBI, or KFX)
         file: String,
 
         /// Output as JSON
@@ -37,13 +37,13 @@ enum Command {
         /// Output file (default: stdout for text formats)
         output: Option<String>,
 
-        /// Input format (epub, azw3, mobi, txt). Required when reading from stdin.
-        #[arg(short = 'f', long = "from")]
-        from_format: Option<String>,
+        /// Input format. Required when reading from stdin.
+        #[arg(short = 'f', long = "from", value_enum, ignore_case = true)]
+        from_format: Option<FormatArg>,
 
-        /// Output format (md, txt, epub, azw3). Inferred from output extension if not specified.
-        #[arg(short = 't', long = "to")]
-        to_format: Option<String>,
+        /// Output format. Inferred from output extension if not specified.
+        #[arg(short = 't', long = "to", value_enum, ignore_case = true)]
+        to_format: Option<FormatArg>,
 
         /// Suppress output messages
         #[arg(short, long)]
@@ -55,13 +55,13 @@ enum Command {
 
     /// Extract hierarchical section tree (JSON)
     Sections {
-        /// Input file (EPUB, AZW3, or MOBI)
+        /// Input file (EPUB, AZW3, MOBI, or KFX)
         file: String,
     },
 
     /// Dump the IR (Intermediate Representation) for a book
     Dump {
-        /// Input file (EPUB, AZW3, or MOBI)
+        /// Input file (EPUB, AZW3, MOBI, or KFX)
         file: String,
 
         /// Output as JSON
@@ -107,13 +107,7 @@ fn main() -> ExitCode {
             from_format,
             to_format,
             quiet,
-        } => convert(
-            &input,
-            output.as_deref(),
-            from_format.as_deref(),
-            to_format.as_deref(),
-            quiet,
-        ),
+        } => convert(&input, output.as_deref(), from_format, to_format, quiet),
         Command::Dump {
             file,
             json,
@@ -235,7 +229,7 @@ struct LandmarkInfo {
 }
 
 fn show_info(path: &str, json: bool) -> Result<(), String> {
-    let mut book = Book::open(path).map_err(|e| e.to_string())?;
+    let mut book = Book::open(path).map_err(|e| format!("Failed to open '{path}': {e}"))?;
 
     if json {
         print_json(&mut book, path)
@@ -245,7 +239,7 @@ fn show_info(path: &str, json: bool) -> Result<(), String> {
 }
 
 fn show_sections(path: &str) -> Result<(), String> {
-    let mut book = Book::open(path).map_err(|e| e.to_string())?;
+    let mut book = Book::open(path).map_err(|e| format!("Failed to open '{path}': {e}"))?;
     let tree = extract_section_tree(&mut book).map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(&tree).map_err(|e| e.to_string())?;
     println!("{json}");
@@ -363,10 +357,11 @@ fn print_human(book: &mut Book, path: &str) -> Result<(), String> {
     }
     if let Some(ref desc) = meta.description {
         let desc = desc.trim();
-        if desc.len() > 200 {
-            println!("Description: {}...", &desc[..200]);
-        } else {
-            println!("Description: {desc}");
+        // Cut at a char boundary: byte-slicing (`&desc[..200]`) panics on
+        // multi-byte UTF-8 when byte 200 is not a boundary.
+        match desc.char_indices().nth(200) {
+            Some((cut, _)) => println!("Description: {}...", &desc[..cut]),
+            None => println!("Description: {desc}"),
         }
     }
     if let Some(ref modified) = meta.modified_date {
@@ -455,24 +450,39 @@ fn print_toc_human(entries: &[TocEntry], depth: usize) {
     }
 }
 
-fn parse_format(fmt: &str) -> Result<Format, String> {
-    match fmt.to_lowercase().as_str() {
-        "md" | "markdown" | "txt" | "text" => Ok(Format::Markdown),
-        "epub" => Ok(Format::Epub),
-        "azw3" => Ok(Format::Azw3),
-        "mobi" => Ok(Format::Mobi),
-        "kfx" => Ok(Format::Kfx),
-        _ => Err(format!(
-            "Unknown format: {fmt}. Supported: md, txt, epub, azw3, mobi, kfx"
-        )),
+/// Format names accepted by `-f/--from` and `-t/--to`.
+///
+/// Deriving `ValueEnum` makes clap generate both the validation and the
+/// help text from this one list, so they cannot drift apart.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum FormatArg {
+    Epub,
+    Azw3,
+    Mobi,
+    Kfx,
+    #[value(alias = "markdown")]
+    Md,
+    #[value(alias = "text")]
+    Txt,
+}
+
+impl From<FormatArg> for Format {
+    fn from(arg: FormatArg) -> Self {
+        match arg {
+            FormatArg::Epub => Format::Epub,
+            FormatArg::Azw3 => Format::Azw3,
+            FormatArg::Mobi => Format::Mobi,
+            FormatArg::Kfx => Format::Kfx,
+            FormatArg::Md | FormatArg::Txt => Format::Markdown,
+        }
     }
 }
 
 fn convert(
     input: &str,
     output: Option<&str>,
-    from_format: Option<&str>,
-    to_format: Option<&str>,
+    from_format: Option<FormatArg>,
+    to_format: Option<FormatArg>,
     quiet: bool,
 ) -> Result<(), String> {
     // Check if reading from stdin
@@ -480,11 +490,11 @@ fn convert(
 
     // Determine input format
     let input_format = if let Some(fmt) = from_format {
-        Some(parse_format(fmt)?)
+        Some(Format::from(fmt))
     } else if from_stdin {
-        // Default to EPUB for stdin since that's most common
         return Err(
-            "Input format required when reading from stdin. Use -f (epub|azw3|mobi)".to_string(),
+            "Input format required when reading from stdin. Use -f (epub|azw3|mobi|kfx)"
+                .to_string(),
         );
     } else {
         Format::from_path(input)
@@ -499,7 +509,7 @@ fn convert(
 
     // Determine output format
     let output_format = if let Some(fmt) = to_format {
-        parse_format(fmt)?
+        Format::from(fmt)
     } else if let Some(out) = output {
         if out == "-" {
             // Explicit stdout, default to markdown
@@ -507,7 +517,7 @@ fn convert(
         } else {
             Format::from_path(out).ok_or_else(|| {
                 format!(
-                    "Unknown output format: {out}. Supported: .epub, .azw3, .txt, .md"
+                    "Cannot infer output format from '{out}'. Supported extensions: .epub, .azw3, .kfx, .md, .txt (or pass -t)"
                 )
             })?
         }
@@ -544,9 +554,10 @@ fn convert(
     } else {
         let fmt = input_format.or_else(|| Format::from_path(input));
         if let Some(fmt) = fmt {
-            Book::open_format(input, fmt).map_err(|e| format!("Failed to open input: {e}"))?
+            Book::open_format(input, fmt)
+                .map_err(|e| format!("Failed to open input '{input}': {e}"))?
         } else {
-            Book::open(input).map_err(|e| format!("Failed to open input: {e}"))?
+            Book::open(input).map_err(|e| format!("Failed to open input '{input}': {e}"))?
         }
     };
 
@@ -563,7 +574,7 @@ fn convert(
     } else {
         let output_path = output.unwrap();
         let file = std::fs::File::create(output_path)
-            .map_err(|e| format!("Failed to create output: {e}"))?;
+            .map_err(|e| format!("Failed to create output '{output_path}': {e}"))?;
         // Buffer the writer: the EPUB ZipWriter issues many small writes, each
         // of which would otherwise be a syscall.
         let mut writer = std::io::BufWriter::with_capacity(64 << 10, file);
@@ -594,7 +605,7 @@ struct DumpOptions {
 }
 
 fn dump_ir(path: &str, opts: DumpOptions) -> Result<(), String> {
-    let mut book = Book::open(path).map_err(|e| e.to_string())?;
+    let mut book = Book::open(path).map_err(|e| format!("Failed to open '{path}': {e}"))?;
 
     if opts.json {
         dump_ir_json(&mut book, path, &opts)
