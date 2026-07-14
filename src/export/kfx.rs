@@ -97,15 +97,13 @@ fn build_kfx_container(book: &mut Book) -> io::Result<Vec<u8>> {
     let standalone_cover_path: Option<String> = match (cover_image, first_chapter_id) {
         (Some(cover_img), Some(first_id)) => {
             let normalized = normalize_cover_path(&cover_img, &asset_paths);
-            book.load_chapter_cached(first_id)
-                .ok()
-                .and_then(|first_chapter| {
-                    if needs_standalone_cover(&normalized, &first_chapter) {
-                        Some(normalized)
-                    } else {
-                        None
-                    }
-                })
+            book.load_chapter(first_id).ok().and_then(|first_chapter| {
+                if needs_standalone_cover(&normalized, &first_chapter) {
+                    Some(normalized)
+                } else {
+                    None
+                }
+            })
         }
         _ => None,
     };
@@ -173,7 +171,7 @@ fn build_kfx_container(book: &mut Book) -> io::Result<Vec<u8>> {
         }
 
         // Load and survey chapter
-        if let Ok(chapter) = book.load_chapter_cached(*chapter_id) {
+        if let Ok(chapter) = book.load_chapter(*chapter_id) {
             survey_chapter(&chapter, *chapter_id, &source_path, &mut ctx);
         }
     }
@@ -190,7 +188,7 @@ fn build_kfx_container(book: &mut Book) -> io::Result<Vec<u8>> {
 
     if !has_cover || !has_srl {
         for (chapter_id, _section_name) in &spine_info {
-            if let Ok(chapter) = book.load_chapter_cached(*chapter_id) {
+            if let Ok(chapter) = book.load_chapter(*chapter_id) {
                 let is_cover = is_image_only_chapter(&chapter);
                 let fragment_id = ctx.chapter_fragments.get(chapter_id).copied();
 
@@ -250,6 +248,16 @@ fn build_kfx_container(book: &mut Book) -> io::Result<Vec<u8>> {
             // Create and intern the short name (e.g., "e0")
             let short_name = ctx.resource_registry.get_or_create_name(&href);
             ctx.symbols.get_or_intern(&short_name);
+        }
+    }
+
+    // 1f. Record which @font-face families the book actually ships a file for.
+    // Styles naming any other family get it stripped during style registration so
+    // the reader's font choice still applies. Must run after resource registration.
+    for font_face in book.font_faces() {
+        if resolve_font_resource_name(&ctx, &font_face.src).is_some() {
+            ctx.embedded_font_families
+                .insert(font_face.font_family.to_lowercase());
         }
     }
 
@@ -314,7 +322,7 @@ fn build_kfx_container(book: &mut Book) -> io::Result<Vec<u8>> {
     }
 
     for (chapter_id, section_name) in &spine_info {
-        if let Ok(chapter) = book.load_chapter_cached(*chapter_id) {
+        if let Ok(chapter) = book.load_chapter(*chapter_id) {
             // Set up chapter-start anchor before generating content
             ctx.begin_chapter_export(*chapter_id);
 
@@ -512,7 +520,7 @@ fn register_link_targets(
     ctx: &mut ExportContext,
 ) -> io::Result<()> {
     for (chapter_id, _) in spine_info {
-        let chapter = book.load_chapter_cached(*chapter_id)?;
+        let chapter = book.load_chapter(*chapter_id)?;
         register_chapter_link_targets(&chapter, *chapter_id, resolved, ctx);
     }
     Ok(())
@@ -1625,6 +1633,29 @@ fn build_resource_fragment(href: &str, data: &[u8], ctx: &mut ExportContext) -> 
 ///
 /// Font entities link font_family names (e.g., "cover-Ubuntu") to resource locations.
 /// This enables Kindle to properly render custom fonts.
+/// Resolve a `@font-face` src to the short name of the asset holding the font file.
+///
+/// Returns `None` when the EPUB declares a face whose file it never ships, which
+/// is common in stylesheets copied between books.
+fn resolve_font_resource_name(ctx: &ExportContext, src: &str) -> Option<String> {
+    if let Some(name) = ctx.resource_registry.get_name(src) {
+        return Some(name.to_string());
+    }
+
+    // Fall back to matching on filename alone, since @font-face srcs are relative
+    // to the stylesheet while resources are keyed relative to the EPUB root.
+    let filename = std::path::Path::new(src)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(src);
+
+    ctx.resource_registry
+        .iter()
+        .find(|(href, _)| href.ends_with(filename))
+        .and_then(|(href, _)| ctx.resource_registry.get_name(href))
+        .map(|s| s.to_string())
+}
+
 fn build_font_fragments(book: &mut Book, ctx: &mut ExportContext) -> Vec<KfxFragment> {
     use crate::style::{FontStyle, FontWeight};
 
@@ -1633,28 +1664,9 @@ fn build_font_fragments(book: &mut Book, ctx: &mut ExportContext) -> Vec<KfxFrag
 
     for font_face in font_faces {
         // Check if the font file exists as a resource
-        let resource_name = match ctx.resource_registry.get_name(&font_face.src) {
-            Some(name) => name.to_string(),
-            None => {
-                // Try without leading path components
-                let filename = std::path::Path::new(&font_face.src)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&font_face.src);
-
-                // Search for matching resource
-                let mut found = None;
-                for (href, _) in ctx.resource_registry.iter() {
-                    if href.ends_with(filename) {
-                        found = ctx.resource_registry.get_name(href).map(|s| s.to_string());
-                        break;
-                    }
-                }
-                match found {
-                    Some(name) => name,
-                    None => continue, // Skip if font file not found
-                }
-            }
+        let resource_name = match resolve_font_resource_name(ctx, &font_face.src) {
+            Some(name) => name,
+            None => continue, // Skip if font file not found
         };
 
         // Build location path

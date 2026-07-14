@@ -415,8 +415,11 @@ impl StyleSchema {
             ir_key: "font-size",
             ir_field: Some(IrField::FontSize),
             kfx_symbol: KfxSymbol::FontSize,
-            transform: ValueTransform::Dimensioned {
-                unit: KfxSymbol::Rem,
+            // Absolute units (px/pt/in/...) must be scaled against the 16px base,
+            // not just relabelled: a bare `Dimensioned` turns `12px` into `12rem`.
+            transform: ValueTransform::ConvertToDimensioned {
+                base_pixels: DEFAULT_BASE_FONT_SIZE,
+                target_unit: KfxSymbol::Rem,
             },
             context: StyleContext::Any,
         });

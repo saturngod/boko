@@ -586,6 +586,11 @@ pub struct ExportContext {
     /// Resource tracking: href → resource symbol.
     pub resource_registry: ResourceRegistry,
 
+    /// Lowercased family names of `@font-face` rules whose font file the book
+    /// actually ships. Any other family is stripped from styles by
+    /// [`ExportContext::apply_font_family_policy`].
+    pub embedded_font_families: HashSet<String>,
+
     /// Section IDs in spine order (for reading order).
     pub section_ids: Vec<u64>,
 
@@ -705,6 +710,7 @@ impl ExportContext {
             symbols,
             fragment_ids: IdGenerator::new(),
             resource_registry: ResourceRegistry::new(),
+            embedded_font_families: HashSet::new(),
             section_ids: Vec::new(),
             text_accumulator: TextAccumulator::new(),
             current_content_name: 0,
@@ -797,8 +803,29 @@ impl ExportContext {
         let schema = crate::kfx::style_schema::StyleSchema::standard();
         let mut builder = crate::kfx::style_registry::StyleBuilder::new(schema);
         builder.ingest_ir_style(ir_style);
-        let kfx_style = builder.build();
+        let mut kfx_style = builder.build();
+        self.apply_font_family_policy(&mut kfx_style);
         self.style_registry.register(kfx_style, &mut self.symbols)
+    }
+
+    /// Drop `font_family` from a style unless a font on the device can honour it.
+    ///
+    /// A family pinned in the style wins over the reader's font choice on Kindle,
+    /// so a family the book neither embeds nor the device stocks would lock the
+    /// book to a fallback face and disable the font menu for no benefit.
+    fn apply_font_family_policy(&self, style: &mut crate::kfx::style_registry::ComputedStyle) {
+        use crate::kfx::style_registry::resolve_font_family;
+        use crate::kfx::style_schema::KfxValue;
+        use crate::kfx::symbols::KfxSymbol;
+
+        let Some(KfxValue::String(list)) = style.get(KfxSymbol::FontFamily) else {
+            return;
+        };
+
+        match resolve_font_family(&list.clone(), &self.embedded_font_families) {
+            Some(family) => style.set(KfxSymbol::FontFamily, KfxValue::String(family)),
+            None => style.remove(KfxSymbol::FontFamily),
+        }
     }
 
     /// Register an IR style by StyleId.

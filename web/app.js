@@ -1,16 +1,3 @@
-import init, {
-    epub_to_azw3,
-    epub_to_kfx,
-    epub_to_markdown,
-    azw3_to_epub,
-    azw3_to_markdown,
-    kfx_to_epub,
-    kfx_to_markdown,
-    mobi_to_epub,
-    mobi_to_azw3,
-    mobi_to_markdown
-} from './pkg/boko.js';
-
 // DOM elements
 const dropzone = document.getElementById('dropzone');
 const fileInput = document.getElementById('file-input');
@@ -28,18 +15,48 @@ const result = document.getElementById('result');
 const downloadLink = document.getElementById('download-link');
 const error = document.getElementById('error');
 const errorMessage = document.getElementById('error-message');
+const stepLabel = document.getElementById('step-label');
 
 let wasmReady = false;
+let wasmPromise = null;
+let converters = null;
 let currentFile = null;
+let downloadUrl = null;
 
-// Initialize WASM
+// Load the conversion engine only after a file is selected. This keeps the
+// initial page lightweight and avoids downloading ~2 MB for casual visitors.
 async function initWasm() {
-    try {
-        await init();
+    if (wasmReady) return;
+    if (wasmPromise) return wasmPromise;
+
+    convertBtn.disabled = true;
+    convertBtn.textContent = 'Preparing…';
+
+    wasmPromise = import('./pkg/boko.js').then(async (boko) => {
+        await boko.default();
+        converters = {
+            'epub_azw3': boko.epub_to_azw3,
+            'epub_kfx': boko.epub_to_kfx,
+            'epub_markdown': boko.epub_to_markdown,
+            'azw3_epub': boko.azw3_to_epub,
+            'azw3_markdown': boko.azw3_to_markdown,
+            'kfx_epub': boko.kfx_to_epub,
+            'kfx_markdown': boko.kfx_to_markdown,
+            'mobi_epub': boko.mobi_to_epub,
+            'mobi_azw3': boko.mobi_to_azw3,
+            'mobi_markdown': boko.mobi_to_markdown,
+        };
         wasmReady = true;
-    } catch (e) {
-        showError('Failed to load WASM module: ' + e.message);
-    }
+    }).catch((e) => {
+        wasmPromise = null;
+        showError('Failed to load the converter: ' + e.message);
+        throw e;
+    }).finally(() => {
+        convertBtn.disabled = false;
+        convertBtn.textContent = 'Convert';
+    });
+
+    return wasmPromise;
 }
 
 // File handling
@@ -108,10 +125,14 @@ function handleFile(file) {
 
     updateOutputOptions(inputFormat);
     conversionOptions.classList.remove('hidden');
+    stepLabel.textContent = 'Step 2 of 2';
 
     // Hide previous results/errors
     result.classList.add('hidden');
     error.classList.add('hidden');
+
+    // Start loading in the background while the user chooses an output format.
+    initWasm().catch(() => {});
 }
 
 function clearFile() {
@@ -123,6 +144,12 @@ function clearFile() {
     result.classList.add('hidden');
     error.classList.add('hidden');
     dropzone.classList.remove('hidden');
+    stepLabel.textContent = 'Step 1 of 2';
+
+    if (downloadUrl) {
+        URL.revokeObjectURL(downloadUrl);
+        downloadUrl = null;
+    }
 }
 
 function showError(message) {
@@ -141,27 +168,14 @@ function showProgress(message) {
 }
 
 function showResult(blob, filename) {
-    const url = URL.createObjectURL(blob);
-    downloadLink.href = url;
+    if (downloadUrl) URL.revokeObjectURL(downloadUrl);
+    downloadUrl = URL.createObjectURL(blob);
+    downloadLink.href = downloadUrl;
     downloadLink.download = filename;
 
     progress.classList.add('hidden');
     result.classList.remove('hidden');
 }
-
-// Conversion functions map
-const converters = {
-    'epub_azw3': epub_to_azw3,
-    'epub_kfx': epub_to_kfx,
-    'epub_markdown': epub_to_markdown,
-    'azw3_epub': azw3_to_epub,
-    'azw3_markdown': azw3_to_markdown,
-    'kfx_epub': kfx_to_epub,
-    'kfx_markdown': kfx_to_markdown,
-    'mobi_epub': mobi_to_epub,
-    'mobi_azw3': mobi_to_azw3,
-    'mobi_markdown': mobi_to_markdown,
-};
 
 const mimeTypes = {
     'epub': 'application/epub+zip',
@@ -179,8 +193,12 @@ const extensions = {
 
 async function convert() {
     if (!wasmReady) {
-        showError('WASM module not ready. Please refresh the page.');
-        return;
+        showProgress('Preparing converter…');
+        try {
+            await initWasm();
+        } catch {
+            return;
+        }
     }
 
     if (!currentFile) {
@@ -222,6 +240,13 @@ async function convert() {
 // Event listeners
 dropzone.addEventListener('click', () => fileInput.click());
 
+dropzone.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        fileInput.click();
+    }
+});
+
 dropzone.addEventListener('dragover', (e) => {
     e.preventDefault();
     dropzone.classList.add('dragover');
@@ -249,6 +274,3 @@ fileInput.addEventListener('change', (e) => {
 
 clearFileBtn.addEventListener('click', clearFile);
 convertBtn.addEventListener('click', convert);
-
-// Initialize
-initWasm();

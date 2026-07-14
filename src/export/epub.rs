@@ -110,21 +110,6 @@ impl EpubExporter {
         let mut manifest_items: Vec<ManifestItem> = Vec::new();
         let mut spine_refs: Vec<String> = Vec::new();
 
-        // The importer surfaces every ZIP entry as an asset, including the spine
-        // XHTML documents. Those are written as chapters below, so track their
-        // output paths and skip them when emitting assets — otherwise each spine
-        // file is written (and added to the manifest) twice, which fails with a
-        // duplicate-filename error on strict ZIP writers.
-        let chapter_paths: std::collections::HashSet<String> = spine
-            .iter()
-            .map(|entry| {
-                format!(
-                    "OEBPS/{}",
-                    sanitize_path(book.source_id(entry.id).unwrap_or("unknown.xhtml"))
-                )
-            })
-            .collect();
-
         // Add chapters to manifest
         for (i, entry) in spine.iter().enumerate() {
             let source_path = book.source_id(entry.id).unwrap_or("unknown.xhtml");
@@ -149,13 +134,9 @@ impl EpubExporter {
 
         for (i, asset_path) in assets.iter().enumerate() {
             let path_str = asset_path.to_string_lossy();
-            let href = format!("OEBPS/{}", sanitize_path(&path_str));
-            // Skip spine documents already emitted as chapters (see above).
-            if chapter_paths.contains(&href) {
-                continue;
-            }
             let media_type = guess_media_type(&path_str);
             let id = format!("asset_{}", i);
+            let href = format!("OEBPS/{}", sanitize_path(&path_str));
 
             manifest_items.push(ManifestItem {
                 id: id.clone(),
@@ -190,13 +171,10 @@ impl EpubExporter {
             zip.write_all(&content)?;
         }
 
-        // 7. Write assets (skipping spine documents already written as chapters).
+        // 7. Write assets
         for asset_path in &assets {
-            let zip_path = format!("OEBPS/{}", sanitize_path(&asset_path.to_string_lossy()));
-            if chapter_paths.contains(&zip_path) {
-                continue;
-            }
             let content = book.load_asset(asset_path)?;
+            let zip_path = format!("OEBPS/{}", sanitize_path(&asset_path.to_string_lossy()));
 
             zip.start_file(&zip_path, deflated).map_err(io_error)?;
             zip.write_all(&content)?;

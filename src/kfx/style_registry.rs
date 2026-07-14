@@ -4,13 +4,44 @@
 //! - Pass 1: Collect unique style combinations, assign IDs via hashing
 //! - Pass 2: Emit style fragment with all definitions, reference by ID in content
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use crate::kfx::ion::IonValue;
 use crate::kfx::style_schema::{KfxValue, StyleContext, StyleSchema, extract_ir_field};
 use crate::kfx::symbols::KfxSymbol;
 use crate::style as ir_style;
+
+/// Generic CSS families that every Kindle can resolve to a real face on its own.
+///
+/// These stay in the style because the device honours them; every other family
+/// has to be backed by an embedded font or it is dropped.
+const DEVICE_GENERIC_FAMILIES: [&str; 2] = ["monospace", "cursive"];
+
+/// Pick the one family from a CSS `font-family` list that KFX should pin, if any.
+///
+/// Walks the list in CSS priority order and keeps the first family the device can
+/// actually render: an embedded font, or a generic the device stocks. Returns
+/// `None` when nothing in the list qualifies, which means the style should carry no
+/// `font_family` at all and the reader's font choice applies.
+pub fn resolve_font_family(list: &str, embedded: &HashSet<String>) -> Option<String> {
+    for raw in list.split(',') {
+        let name = raw.trim().trim_matches(['"', '\'']).trim();
+        if name.is_empty() {
+            continue;
+        }
+
+        let lowered = name.to_lowercase();
+        if embedded.contains(&lowered) {
+            return Some(name.to_string());
+        }
+        if DEVICE_GENERIC_FAMILIES.contains(&lowered.as_str()) {
+            return Some(lowered);
+        }
+    }
+
+    None
+}
 
 // ============================================================================
 // Computed Style
@@ -45,6 +76,11 @@ impl ComputedStyle {
             .iter()
             .find(|(s, _)| *s == symbol)
             .map(|(_, v)| v)
+    }
+
+    /// Remove a property, if present.
+    pub fn remove(&mut self, symbol: KfxSymbol) {
+        self.properties.retain(|(s, _)| *s != symbol);
     }
 
     /// Check if the style is empty.
@@ -454,6 +490,58 @@ fn expand_font_shorthand(value: &str) -> Option<Vec<(String, String)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn embedded(families: &[&str]) -> HashSet<String> {
+        families.iter().map(|f| f.to_lowercase()).collect()
+    }
+
+    #[test]
+    fn test_resolve_font_family_keeps_embedded_font() {
+        let fonts = embedded(&["Ubuntu"]);
+        assert_eq!(
+            resolve_font_family("Ubuntu, Georgia, serif", &fonts),
+            Some("Ubuntu".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_font_family_matches_embedded_case_insensitively() {
+        let fonts = embedded(&["Ubuntu"]);
+        assert_eq!(
+            resolve_font_family("'ubuntu', serif", &fonts),
+            Some("ubuntu".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_font_family_drops_families_with_no_font_behind_them() {
+        // The bug this guards: a family the book neither embeds nor the device
+        // stocks used to be pinned anyway, which disabled the Kindle font menu.
+        assert_eq!(
+            resolve_font_family(
+                "Noto Sans Myanmar, Noto Serif, Times New Roman, serif",
+                &embedded(&[]),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_font_family_keeps_monospace_for_code() {
+        assert_eq!(
+            resolve_font_family("SF Mono, Menlo, Consolas, monospace", &embedded(&[])),
+            Some("monospace".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_font_family_prefers_embedded_over_later_generic() {
+        let fonts = embedded(&["UbuntuMono"]);
+        assert_eq!(
+            resolve_font_family("UbuntuMono, monospace", &fonts),
+            Some("UbuntuMono".to_string())
+        );
+    }
 
     #[test]
     fn test_computed_style_hash_consistency() {
