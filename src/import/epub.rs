@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 use zip::ZipArchive;
 
 use crate::dom::Stylesheet;
-use crate::epub::{parse_container_xml, parse_nav_landmarks, parse_ncx, parse_opf};
+use crate::epub::{parse_container_xml, parse_nav_landmarks, parse_nav_toc, parse_ncx, parse_opf};
 use crate::import::{ChapterId, Importer, SpineEntry, resolve_path_based_href};
 use crate::io::{ByteSource, ByteSourceCursor, FileSource};
 use crate::model::{AnchorTarget, Chapter, GlobalNodeId, Landmark, Metadata, TocEntry};
@@ -217,29 +217,48 @@ impl EpubImporter {
         let opf_str = crate::util::decode_text(&opf_bytes, hint_encoding);
         let opf = parse_opf(&opf_str)?;
 
-        // 4. Build spine
+        // 4. Build spine. Manifest hrefs are URLs (may be percent-encoded);
+        // archive entry names are literal, so decode at this join point.
         let mut spine = Vec::new();
         let mut spine_paths = Vec::new();
 
-        for (i, spine_id) in opf.spine_ids.iter().enumerate() {
+        for spine_id in &opf.spine_ids {
             if let Some((href, _media_type)) = opf.manifest.get(spine_id) {
-                let full_path = format!("{}{}", opf_base, href);
+                let full_path =
+                    format!("{}{}", opf_base, crate::util::percent_decode_href(href));
                 let size_estimate = zip_index
                     .get(&full_path)
                     .map(|loc| loc.compressed_size as usize)
                     .unwrap_or(0);
 
                 spine.push(SpineEntry {
-                    id: ChapterId(i as u32),
+                    // Id by position in spine_paths, not the itemref index: a
+                    // dangling idref (no manifest entry) is skipped, and using
+                    // the raw index would desync every later ChapterId from
+                    // its path in spine_paths.
+                    id: ChapterId(spine_paths.len() as u32),
                     size_estimate,
                 });
                 spine_paths.push(full_path);
             }
         }
 
-        // 5. Parse TOC (NCX)
-        let toc = if let Some(ncx_href) = &opf.ncx_href {
-            let ncx_path = format!("{}{}", opf_base, ncx_href);
+        // Load the EPUB 3 nav document once, if declared: it serves both the
+        // TOC fallback (step 5) and landmarks (step 6).
+        let nav_str: Option<String> = opf.nav_href.as_ref().and_then(|nav_href| {
+            let nav_path = format!("{}{}", opf_base, crate::util::percent_decode_href(nav_href));
+            read_entry(&source, &zip_index, &nav_path).ok().map(|nav_bytes| {
+                let hint_encoding = crate::util::extract_xml_encoding(&nav_bytes);
+                crate::util::decode_text(&nav_bytes, hint_encoding).into_owned()
+            })
+        });
+
+        // 5. Parse TOC. The NCX is used when it yields entries (existing
+        // behavior, kept for dual-TOC books to avoid churn); EPUB 3 makes the
+        // nav document canonical and the NCX optional, so books without a
+        // usable NCX fall back to `<nav epub:type="toc">`.
+        let mut toc = if let Some(ncx_href) = &opf.ncx_href {
+            let ncx_path = format!("{}{}", opf_base, crate::util::percent_decode_href(ncx_href));
             if let Ok(ncx_bytes) = read_entry(&source, &zip_index, &ncx_path) {
                 let hint_encoding = crate::util::extract_xml_encoding(&ncx_bytes);
                 let ncx_str = crate::util::decode_text(&ncx_bytes, hint_encoding);
@@ -252,24 +271,27 @@ impl EpubImporter {
         } else {
             Vec::new()
         };
+        if toc.is_empty()
+            && let Some(nav_str) = &nav_str
+        {
+            let toc_entries = parse_nav_toc(nav_str)?;
+            toc = prepend_base_to_toc(&toc_entries, &opf_base);
+        }
 
         // 6. Parse landmarks from EPUB 3 nav document
-        let landmarks = if let Some(nav_href) = &opf.nav_href {
-            let nav_path = format!("{}{}", opf_base, nav_href);
-            if let Ok(nav_bytes) = read_entry(&source, &zip_index, &nav_path) {
-                let hint_encoding = crate::util::extract_xml_encoding(&nav_bytes);
-                let nav_str = crate::util::decode_text(&nav_bytes, hint_encoding);
-                let mut parsed = parse_nav_landmarks(&nav_str)?;
-                // Prepend base path to hrefs (nav uses relative paths)
-                for landmark in &mut parsed {
-                    if !landmark.href.starts_with('#') && !landmark.href.is_empty() {
-                        landmark.href = format!("{}{}", opf_base, landmark.href);
-                    }
+        let landmarks = if let Some(nav_str) = &nav_str {
+            let mut parsed = parse_nav_landmarks(nav_str)?;
+            // Prepend base path to hrefs (nav uses relative, URL-encoded paths)
+            for landmark in &mut parsed {
+                if !landmark.href.starts_with('#') && !landmark.href.is_empty() {
+                    landmark.href = format!(
+                        "{}{}",
+                        opf_base,
+                        crate::util::percent_decode_href(&landmark.href)
+                    );
                 }
-                parsed
-            } else {
-                Vec::new()
             }
+            parsed
         } else {
             Vec::new()
         };
@@ -284,13 +306,17 @@ impl EpubImporter {
 
         // Resolve cover_image to an absolute (zip-relative) path so it matches
         // asset keys downstream. The OPF parser leaves it as a manifest href
-        // relative to opf_base.
+        // relative to opf_base; like all manifest hrefs it may be
+        // percent-encoded while asset keys are literal.
         let mut metadata = opf.metadata;
         if let Some(ref href) = metadata.cover_image
             && !href.is_empty()
-            && !opf_base.is_empty()
         {
-            metadata.cover_image = Some(format!("{}{}", opf_base, href));
+            metadata.cover_image = Some(format!(
+                "{}{}",
+                opf_base,
+                crate::util::percent_decode_href(href)
+            ));
         }
 
         Ok(Self {
@@ -360,15 +386,24 @@ fn compression_to_u16(method: zip::CompressionMethod) -> u16 {
     }
 }
 
-/// Prepend base path to TOC entry hrefs (NCX uses relative paths).
+/// Prepend base path to TOC entry hrefs (NCX/nav use relative paths).
+///
+/// TOC hrefs are URLs: percent-escapes are decoded here (path and fragment
+/// separately) so the stored hrefs match literal archive entry names.
 fn prepend_base_to_toc(entries: &[TocEntry], base: &str) -> Vec<TocEntry> {
     entries
         .iter()
         .map(|entry| {
-            let href = if entry.href.starts_with('#') || entry.href.is_empty() {
+            let href = if entry.href.is_empty() {
                 entry.href.clone()
+            } else if entry.href.starts_with('#') {
+                crate::util::percent_decode_href(&entry.href).into_owned()
             } else {
-                format!("{}{}", base, entry.href)
+                format!(
+                    "{}{}",
+                    base,
+                    crate::util::percent_decode_href(&entry.href)
+                )
             };
             TocEntry {
                 title: entry.title.clone(),

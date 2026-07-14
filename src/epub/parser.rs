@@ -681,6 +681,137 @@ pub fn parse_ncx(content: &str) -> io::Result<Vec<TocEntry>> {
     Ok(stack.pop().map(|s| s.children).unwrap_or_default())
 }
 
+/// Parse EPUB 3 nav document table of contents.
+///
+/// The TOC lives in a `<nav epub:type="toc">` element as nested ordered
+/// lists: each `<li>` holds an `<a href="...">` (or, for unlinked headings, a
+/// `<span>`) label, optionally followed by a nested `<ol>` of children. EPUB 3
+/// makes this nav document the canonical TOC — the NCX is optional there — so
+/// the importer falls back to this when no usable NCX exists.
+pub fn parse_nav_toc(content: &str) -> io::Result<Vec<TocEntry>> {
+    let mut reader = Reader::from_str(content);
+    reader.config_mut().trim_text(true);
+
+    struct ItemState {
+        title: String,
+        href: Option<String>,
+        children: Vec<TocEntry>,
+        /// Whether this item's label element (`<a>`/`<span>`) has been seen;
+        /// only the first one names the entry.
+        labeled: bool,
+    }
+
+    let mut root: Vec<TocEntry> = Vec::new();
+    let mut stack: Vec<ItemState> = Vec::new();
+    let mut in_toc_nav = false;
+    let mut in_label = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let name = e.name();
+                let local = local_name(name.as_ref());
+
+                match local {
+                    b"nav" => {
+                        // Check for epub:type="toc"
+                        for attr in e.attributes().flatten() {
+                            if local_name(attr.key.as_ref()) == b"type" {
+                                let value = String::from_utf8_lossy(&attr.value);
+                                if value.split_ascii_whitespace().any(|v| v == "toc") {
+                                    in_toc_nav = true;
+                                }
+                            }
+                        }
+                    }
+                    b"li" if in_toc_nav => {
+                        // Same guard as parse_ncx: the resulting TocEntry tree
+                        // is consumed (and dropped) recursively downstream, so
+                        // unbounded nesting would overflow the stack later.
+                        if stack.len() > crate::util::MAX_TREE_DEPTH {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "nav TOC list nesting too deep",
+                            ));
+                        }
+                        stack.push(ItemState {
+                            title: String::new(),
+                            href: None,
+                            children: Vec::new(),
+                            labeled: false,
+                        });
+                    }
+                    b"a" | b"span" if in_toc_nav => {
+                        if let Some(item) = stack.last_mut()
+                            && !item.labeled
+                        {
+                            item.labeled = true;
+                            in_label = true;
+                            if local == b"a" {
+                                for attr in e.attributes().flatten() {
+                                    if local_name(attr.key.as_ref()) == b"href" {
+                                        item.href = Some(
+                                            attr.unescape_value()
+                                                .map(|v| v.into_owned())
+                                                .map_err(io::Error::other)?,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(e)) if in_label => {
+                if let Some(item) = stack.last_mut() {
+                    item.title.push_str(&String::from_utf8_lossy(e.as_ref()));
+                }
+            }
+            Ok(Event::GeneralRef(e)) if in_label => {
+                if let Some(item) = stack.last_mut() {
+                    let entity = String::from_utf8_lossy(e.as_ref());
+                    if let Some(resolved) = resolve_entity(&entity) {
+                        item.title.push_str(&resolved);
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                let local = local_name(name.as_ref());
+
+                match local {
+                    b"a" | b"span" => in_label = false,
+                    b"li" if in_toc_nav => {
+                        if let Some(item) = stack.pop() {
+                            // Keep linked entries and unlinked headings that
+                            // still contribute children; drop empty <li>s.
+                            if item.href.is_some() || !item.children.is_empty() {
+                                let mut entry = TocEntry::new(
+                                    item.title.trim(),
+                                    item.href.unwrap_or_default(),
+                                );
+                                entry.children = item.children;
+                                match stack.last_mut() {
+                                    Some(parent) => parent.children.push(entry),
+                                    None => root.push(entry),
+                                }
+                            }
+                        }
+                    }
+                    b"nav" if in_toc_nav => break, // finished the toc nav
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(io::Error::other(e)),
+            _ => {}
+        }
+    }
+
+    Ok(root)
+}
+
 /// Parse EPUB 3 nav document landmarks.
 ///
 /// Landmarks are in a `<nav epub:type="landmarks">` element containing
@@ -1108,6 +1239,129 @@ mod tests {
         assert_eq!(result[0].children.len(), 2);
         assert_eq!(result[0].children[0].title, "Chapter 1");
         assert_eq!(result[0].children[1].title, "Chapter 2");
+    }
+
+    #[test]
+    fn test_parse_nav_toc_flat() {
+        let nav = r#"<?xml version="1.0"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+  <body>
+    <nav epub:type="toc">
+      <ol>
+        <li><a href="text/ch1.xhtml">Chapter 1</a></li>
+        <li><a href="text/ch2.xhtml#start">Chapter 2</a></li>
+      </ol>
+    </nav>
+  </body>
+</html>"#;
+
+        let result = parse_nav_toc(nav).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].title, "Chapter 1");
+        assert_eq!(result[0].href, "text/ch1.xhtml");
+        assert_eq!(result[1].title, "Chapter 2");
+        assert_eq!(result[1].href, "text/ch2.xhtml#start");
+    }
+
+    #[test]
+    fn test_parse_nav_toc_nested() {
+        let nav = r#"<?xml version="1.0"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+  <body>
+    <nav epub:type="toc">
+      <ol>
+        <li><a href="part1.xhtml">Part I</a>
+          <ol>
+            <li><a href="ch1.xhtml">Chapter 1</a></li>
+            <li><a href="ch2.xhtml">Chapter 2</a>
+              <ol>
+                <li><a href="ch2.xhtml#sec1">Section 1</a></li>
+              </ol>
+            </li>
+          </ol>
+        </li>
+      </ol>
+    </nav>
+  </body>
+</html>"#;
+
+        let result = parse_nav_toc(nav).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "Part I");
+        assert_eq!(result[0].children.len(), 2);
+        assert_eq!(result[0].children[0].title, "Chapter 1");
+        assert_eq!(result[0].children[1].title, "Chapter 2");
+        assert_eq!(result[0].children[1].children.len(), 1);
+        assert_eq!(result[0].children[1].children[0].href, "ch2.xhtml#sec1");
+    }
+
+    #[test]
+    fn test_parse_nav_toc_span_heading_and_ignores_other_navs() {
+        // An unlinked <span> heading keeps its children; the landmarks nav
+        // must not leak entries into the TOC.
+        let nav = r#"<?xml version="1.0"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+  <body>
+    <nav epub:type="landmarks">
+      <ol>
+        <li><a href="cover.xhtml" epub:type="cover">Cover</a></li>
+      </ol>
+    </nav>
+    <nav epub:type="toc">
+      <ol>
+        <li><span>Front Matter</span>
+          <ol>
+            <li><a href="preface.xhtml">Preface</a></li>
+          </ol>
+        </li>
+        <li><span>Empty heading, no children</span></li>
+      </ol>
+    </nav>
+  </body>
+</html>"#;
+
+        let result = parse_nav_toc(nav).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].title, "Front Matter");
+        assert_eq!(result[0].href, "");
+        assert_eq!(result[0].children.len(), 1);
+        assert_eq!(result[0].children[0].title, "Preface");
+        assert_eq!(result[0].children[0].href, "preface.xhtml");
+    }
+
+    #[test]
+    fn test_parse_nav_toc_no_toc_nav() {
+        let nav = r#"<?xml version="1.0"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+  <body>
+    <nav epub:type="landmarks">
+      <ol><li><a href="cover.xhtml" epub:type="cover">Cover</a></li></ol>
+    </nav>
+  </body>
+</html>"#;
+
+        assert!(parse_nav_toc(nav).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_nav_toc_rejects_pathological_nesting() {
+        let depth = 5000;
+        let mut nav = String::from(
+            r#"<html xmlns:epub="http://www.idpf.org/2007/ops"><body><nav epub:type="toc">"#,
+        );
+        for _ in 0..depth {
+            nav.push_str("<ol><li><a href=\"a.xhtml\">x</a>");
+        }
+        for _ in 0..depth {
+            nav.push_str("</li></ol>");
+        }
+        nav.push_str("</nav></body></html>");
+
+        let err = parse_nav_toc(&nav).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

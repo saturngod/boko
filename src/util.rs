@@ -134,6 +134,49 @@ pub fn decode_text<'a>(bytes: &'a [u8], hint_encoding: Option<&str>) -> Cow<'a, 
 }
 
 // ============================================================================
+// Percent Decoding (hrefs)
+// ============================================================================
+
+/// Percent-decode a single href component (path or fragment).
+///
+/// Hrefs in OPF manifests, NCX/nav documents, and chapter content are URLs
+/// (`my%20chapter.xhtml`), while ZIP archive entry names are literal bytes
+/// (`my chapter.xhtml`). Hrefs must be decoded at the parse boundary before
+/// being matched against archive names; archive names themselves are literal
+/// and must never be decoded.
+///
+/// Invalid escape sequences pass through untouched (per the
+/// `percent-encoding` crate) and non-UTF-8 decodes are replaced lossily, so
+/// decoding is safe on already-literal strings without a `%`.
+pub fn percent_decode(s: &str) -> Cow<'_, str> {
+    if !s.contains('%') {
+        return Cow::Borrowed(s);
+    }
+    percent_encoding::percent_decode_str(s).decode_utf8_lossy()
+}
+
+/// Percent-decode an href, treating the fragment separately from the path.
+///
+/// The `#` separating path from fragment is structural and must survive
+/// decoding: path and fragment are decoded independently and re-joined, so an
+/// encoded `%23` inside either component becomes a literal `#` in that
+/// component without being mistaken for the separator downstream (splitting
+/// on the first `#` was already done here).
+pub fn percent_decode_href(href: &str) -> Cow<'_, str> {
+    if !href.contains('%') {
+        return Cow::Borrowed(href);
+    }
+    match href.split_once('#') {
+        Some((path, fragment)) => Cow::Owned(format!(
+            "{}#{}",
+            percent_decode(path),
+            percent_decode(fragment)
+        )),
+        None => percent_decode(href),
+    }
+}
+
+// ============================================================================
 // Image Dimension Extraction
 // ============================================================================
 
@@ -506,6 +549,37 @@ mod tests {
         // A cap above the true size succeeds and round-trips.
         let out = bounded_inflate(&compressed, 0, 1 << 21).unwrap();
         assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn test_percent_decode_basic() {
+        // No escapes: borrowed passthrough.
+        assert!(matches!(percent_decode("plain.xhtml"), Cow::Borrowed(_)));
+        assert_eq!(percent_decode("my%20chapter.xhtml"), "my chapter.xhtml");
+        // Invalid escape sequences pass through untouched.
+        assert_eq!(percent_decode("100%.png"), "100%.png");
+        assert_eq!(percent_decode("bad%zzseq"), "bad%zzseq");
+        // Non-ASCII UTF-8.
+        assert_eq!(percent_decode("caf%C3%A9.xhtml"), "café.xhtml");
+    }
+
+    #[test]
+    fn test_percent_decode_href_fragment_separate() {
+        // No escapes: borrowed passthrough.
+        assert!(matches!(
+            percent_decode_href("ch1.xhtml#sec1"),
+            Cow::Borrowed(_)
+        ));
+        // Path and fragment decoded independently; separator preserved.
+        assert_eq!(
+            percent_decode_href("my%20chapter.xhtml#sec%201"),
+            "my chapter.xhtml#sec 1"
+        );
+        // Encoded %23 in the path becomes a literal '#' in the path component
+        // but the structural separator is the first literal '#'.
+        assert_eq!(percent_decode_href("a%23b.xhtml#frag"), "a#b.xhtml#frag");
+        // Fragment-only href.
+        assert_eq!(percent_decode_href("#note%201"), "#note 1");
     }
 
     #[test]

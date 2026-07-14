@@ -359,6 +359,12 @@ fn resolve_relative_path(base: &str, relative: &str) -> String {
         return normalize_separators(relative.to_string());
     }
 
+    // `relative` comes from parsed content (hrefs, CSS urls) and is a URL:
+    // percent-escapes like `my%20image.png` must be decoded (path and
+    // fragment separately) to match literal archive entry names. `base` is
+    // already an archive name and stays literal.
+    let relative = crate::util::percent_decode_href(relative);
+
     // Handle fragment-only paths (#anchor) - resolve to base file + fragment
     if relative.starts_with('#') {
         return normalize_separators(format!("{}{}", base, relative));
@@ -368,7 +374,7 @@ fn resolve_relative_path(base: &str, relative: &str) -> String {
     // from Windows-authored content must split into components, or the `..`
     // survives as a literal segment and the archive lookup silently misses.
     let base = normalize_separators(base.to_string());
-    let relative = normalize_separators(relative.to_string());
+    let relative = normalize_separators(relative.into_owned());
 
     // Get the directory of the base path
     let base_dir = base.rsplit_once('/').map_or("", |(dir, _)| dir);
@@ -441,6 +447,21 @@ mod tests {
     fn test_resolve_absolute_path_unchanged() {
         let result = resolve_relative_path("text/chapter.xhtml", "/absolute/path.css");
         assert_eq!(result, "/absolute/path.css");
+    }
+
+    #[test]
+    fn test_resolve_percent_encoded_relative() {
+        // Percent-escapes in content hrefs decode to literal archive names.
+        let result = resolve_relative_path("OEBPS/text/ch1.xhtml", "my%20image.png");
+        assert_eq!(result, "OEBPS/text/my image.png");
+
+        // Path and fragment decoded independently; separator preserved.
+        let result = resolve_relative_path("OEBPS/ch1.xhtml", "ch%202.xhtml#sec%201");
+        assert_eq!(result, "OEBPS/ch 2.xhtml#sec 1");
+
+        // The base is a literal archive name: a '%' in it is never re-decoded.
+        let result = resolve_relative_path("OEBPS/100%/ch1.xhtml", "next.xhtml");
+        assert_eq!(result, "OEBPS/100%/next.xhtml");
     }
 
     #[test]
