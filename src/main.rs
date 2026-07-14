@@ -253,7 +253,7 @@ fn print_json(book: &mut Book, path: &str) -> Result<(), String> {
     let assets: Vec<AssetInfo> = asset_paths
         .iter()
         .map(|p| {
-            let size = book.load_asset(p).map(|d| d.len()).unwrap_or(0);
+            let size = book.load_asset(p).map_or(0, |d| d.len());
             AssetInfo {
                 path: p.to_string_lossy().to_string(),
                 size,
@@ -427,9 +427,7 @@ fn print_human(book: &mut Book, path: &str) -> Result<(), String> {
     println!("\nAssets ({}):", assets.len());
     for asset in &assets {
         let size = book
-            .load_asset(asset)
-            .map(|data| format_bytes(data.len()))
-            .unwrap_or_else(|_| "?".to_string());
+            .load_asset(asset).map_or_else(|_| "?".to_string(), |data| format_bytes(data.len()));
         println!("  {} ({})", asset.display(), size);
     }
 
@@ -438,7 +436,7 @@ fn print_human(book: &mut Book, path: &str) -> Result<(), String> {
 
 /// Format byte size.
 fn format_bytes(bytes: usize) -> String {
-    format!("{} bytes", bytes)
+    format!("{bytes} bytes")
 }
 
 fn print_toc_human(entries: &[TocEntry], depth: usize) {
@@ -459,8 +457,7 @@ fn parse_format(fmt: &str) -> Result<Format, String> {
         "mobi" => Ok(Format::Mobi),
         "kfx" => Ok(Format::Kfx),
         _ => Err(format!(
-            "Unknown format: {}. Supported: md, txt, epub, azw3, mobi, kfx",
-            fmt
+            "Unknown format: {fmt}. Supported: md, txt, epub, azw3, mobi, kfx"
         )),
     }
 }
@@ -491,7 +488,7 @@ fn convert(
     if let Some(fmt) = input_format
         && !fmt.can_import()
     {
-        return Err(format!("{:?} cannot be used as input format", fmt));
+        return Err(format!("{fmt:?} cannot be used as input format"));
     }
 
     // Determine output format
@@ -504,8 +501,7 @@ fn convert(
         } else {
             Format::from_path(out).ok_or_else(|| {
                 format!(
-                    "Unknown output format: {}. Supported: .epub, .azw3, .txt, .md",
-                    out
+                    "Unknown output format: {out}. Supported: .epub, .azw3, .txt, .md"
                 )
             })?
         }
@@ -682,10 +678,10 @@ fn dump_ir_json(book: &mut Book, path: &str, opts: &DumpOptions) -> Result<(), S
     for (id, source_path) in chapter_ids {
         let chapter = book.load_chapter(id).map_err(|e| e.to_string())?;
 
-        let tree = if !opts.styles_only {
-            Some(dump_node_json(&chapter, NodeId::ROOT, opts, 0))
-        } else {
+        let tree = if opts.styles_only {
             None
+        } else {
+            Some(dump_node_json(&chapter, NodeId::ROOT, opts, 0))
         };
 
         info.chapters.push(ChapterDump {
@@ -841,7 +837,7 @@ fn dump_node_tree(chapter: &Chapter, id: NodeId, opts: &DumpOptions, depth: usiz
         line.push_str(&format!(" alt=\"{}\"", truncate_text(alt, 30)));
     }
     if let Some(anchor_id) = chapter.semantics.id(id) {
-        line.push_str(&format!(" id=\"{}\"", anchor_id));
+        line.push_str(&format!(" id=\"{anchor_id}\""));
     }
 
     // Add text content for text nodes
@@ -873,7 +869,7 @@ fn role_to_string(role: Role) -> String {
     match role {
         Role::Text => "Text".to_string(),
         Role::Paragraph => "Paragraph".to_string(),
-        Role::Heading(level) => format!("Heading({})", level),
+        Role::Heading(level) => format!("Heading({level})"),
         Role::Container => "Container".to_string(),
         Role::Image => "Image".to_string(),
         Role::Link => "Link".to_string(),
@@ -911,6 +907,6 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
         normalized
     } else {
         let truncated: String = normalized.chars().take(max_chars).collect();
-        format!("{}...", truncated)
+        format!("{truncated}...")
     }
 }

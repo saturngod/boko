@@ -97,7 +97,7 @@ pub struct BookSummary {
 impl BookSummary {
     /// The set of distinct content words, for overlap comparisons.
     pub fn word_set(&self) -> BTreeSet<&str> {
-        self.words.iter().map(|s| s.as_str()).collect()
+        self.words.iter().map(std::string::String::as_str).collect()
     }
 }
 
@@ -113,7 +113,7 @@ pub fn summarize(book: &mut Book) -> BookSummary {
         .list_assets()
         .iter()
         .filter_map(|p| p.extension().and_then(|s| s.to_str()))
-        .map(|s| s.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
         .collect();
 
     let markdown = String::from_utf8(export_to_bytes(book, Format::Markdown))
@@ -162,7 +162,7 @@ pub fn strip_link_targets(md: &str) -> String {
 pub fn content_words(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.chars().count() >= 4)
-        .map(|w| w.to_lowercase())
+        .map(str::to_lowercase)
         .collect()
 }
 

@@ -21,7 +21,7 @@ use common::{Doc, EpubBuilder, Nav, roundtrip, summarize, word_retention};
 /// enough that a dropped paragraph/chapter fails the test.
 const RETENTION_THRESHOLD: f64 = 0.9;
 
-const COMPLEX_CSS: &str = r#"
+const COMPLEX_CSS: &str = r"
 body { margin: 1em; font-family: serif; line-height: 1.5; }
 h1 { font-size: 2em; text-align: center; page-break-before: always; }
 h2 { font-size: 1.4em; color: #333; }
@@ -32,7 +32,7 @@ ul, ol { margin-left: 1.5em; }
 .note { font-size: 0.85em; color: #555; }
 blockquote { margin: 1em 2em; font-style: italic; }
 a { color: #0645ad; text-decoration: underline; }
-"#;
+";
 
 /// The diverse corpus. Each entry is (name, marker-word, builder).
 fn corpus() -> Vec<(&'static str, &'static str, EpubBuilder)> {

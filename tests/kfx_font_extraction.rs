@@ -1,6 +1,6 @@
 //! Test KFX bcRawFont entity extraction.
 //!
-//! Uses a stripped KFX fixture (fonts_only.kfx.gz) containing only
+//! Uses a stripped KFX fixture (`fonts_only.kfx.gz`) containing only
 //! bcRawFont ($418) and Font ($262) entities from a real book.
 
 use boko::Book;
@@ -53,8 +53,7 @@ fn test_kfx_font_assets_discovered() {
     assert_eq!(
         font_assets.len(),
         3,
-        "Expected 3 font assets, got: {:?}",
-        font_assets
+        "Expected 3 font assets, got: {font_assets:?}"
     );
 
     // Verify paths follow the expected naming pattern
