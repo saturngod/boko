@@ -42,7 +42,7 @@ pub trait Importer: Send + Sync {
     // --- Lifecycle ---
 
     /// Open a file and parse structure (metadata, TOC, spine).
-    fn open(path: &Path) -> std::io::Result<Self>
+    fn open(path: &Path) -> crate::Result<Self>
     where
         Self: Sized;
 
@@ -69,7 +69,7 @@ pub trait Importer: Send + Sync {
     /// 4. Compiles HTML + CSS to IR via `compile_html()`
     ///
     /// Implementations may override for format-specific optimizations.
-    fn load_chapter(&mut self, id: ChapterId) -> std::io::Result<Chapter> {
+    fn load_chapter(&mut self, id: ChapterId) -> crate::Result<Chapter> {
         // Load raw HTML
         let html_bytes = self.load_raw(id)?;
         let hint_encoding = crate::util::extract_xml_encoding(&html_bytes);
@@ -118,7 +118,7 @@ pub trait Importer: Send + Sync {
     fn source_id(&self, id: ChapterId) -> Option<&str>;
 
     /// Returns the raw bytes of a chapter.
-    fn load_raw(&mut self, id: ChapterId) -> std::io::Result<Vec<u8>>;
+    fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>>;
 
     // --- Assets ---
 
@@ -126,7 +126,7 @@ pub trait Importer: Send + Sync {
     fn list_assets(&self) -> &[PathBuf];
 
     /// Load an asset by path.
-    fn load_asset(&mut self, path: &Path) -> std::io::Result<Vec<u8>>;
+    fn load_asset(&mut self, path: &Path) -> crate::Result<Vec<u8>>;
 
     /// Load and parse a stylesheet, optionally using a cache.
     ///
@@ -418,7 +418,7 @@ mod tests {
         }
 
         impl Importer for TestImporter {
-            fn open(_path: &Path) -> io::Result<Self> {
+            fn open(_path: &Path) -> crate::Result<Self> {
                 unreachable!()
             }
 
@@ -446,23 +446,23 @@ mod tests {
                 self.source_ids.get(id.0 as usize).map(|s| s.as_str())
             }
 
-            fn load_raw(&mut self, id: ChapterId) -> io::Result<Vec<u8>> {
+            fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
                 self.chapters
                     .get(&id.0)
                     .map(|s| s.as_bytes().to_vec())
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "chapter not found"))
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "chapter not found").into())
             }
 
             fn list_assets(&self) -> &[PathBuf] {
                 &self.asset_list
             }
 
-            fn load_asset(&mut self, path: &Path) -> io::Result<Vec<u8>> {
+            fn load_asset(&mut self, path: &Path) -> crate::Result<Vec<u8>> {
                 let key = path.to_string_lossy().replace('\\', "/");
                 self.assets
                     .get(&key)
                     .cloned()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "asset not found"))
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "asset not found").into())
             }
 
             fn load_stylesheet(&mut self, path: &Path) -> Option<Stylesheet> {
@@ -532,7 +532,7 @@ mod tests {
         }
 
         impl Importer for TestImporter {
-            fn open(_path: &Path) -> io::Result<Self> {
+            fn open(_path: &Path) -> crate::Result<Self> {
                 unreachable!()
             }
 
@@ -560,18 +560,16 @@ mod tests {
                 None
             }
 
-            fn load_raw(&mut self, _id: ChapterId) -> io::Result<Vec<u8>> {
-                Err(io::Error::other("unused"))
+            fn load_raw(&mut self, _id: ChapterId) -> crate::Result<Vec<u8>> {
+                Err(io::Error::other("unused").into())
             }
 
             fn list_assets(&self) -> &[PathBuf] {
                 &self.asset_list
             }
 
-            fn load_asset(&mut self, _path: &Path) -> io::Result<Vec<u8>> {
-                Err(io::Error::other(
-                    "load_asset should not be called",
-                ))
+            fn load_asset(&mut self, _path: &Path) -> crate::Result<Vec<u8>> {
+                Err(io::Error::other("load_asset should not be called").into())
             }
 
             fn load_stylesheet(&mut self, _path: &Path) -> Option<Stylesheet> {

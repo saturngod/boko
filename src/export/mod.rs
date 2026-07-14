@@ -24,10 +24,10 @@
 //!
 //! // Or using the Book convenience method
 //! // book.export(Format::Epub, &mut file)?;
-//! # Ok::<(), std::io::Error>(())
+//! # Ok::<(), boko::Error>(())
 //! ```
 
-use std::io::{self, Seek, Write};
+use std::io::{Seek, Write};
 
 use crate::model::Book;
 
@@ -62,5 +62,5 @@ pub trait Exporter {
     /// - `Vec<u8>` for in-memory output
     /// - `std::io::Cursor<Vec<u8>>` for seekable in-memory output
     /// - Any other type implementing `Write + Seek`
-    fn export<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> io::Result<()>;
+    fn export<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> crate::Result<()>;
 }

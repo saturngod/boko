@@ -183,7 +183,7 @@ pub struct Landmark {
 ///     let raw = book.load_raw(entry.id)?;
 ///     println!("Chapter {}: {} bytes", entry.id.0, raw.len());
 /// }
-/// # Ok::<(), std::io::Error>(())
+/// # Ok::<(), boko::Error>(())
 /// ```
 pub struct Book {
     backend: Box<dyn Importer>,
@@ -224,7 +224,7 @@ impl Format {
 
 impl Book {
     /// Open an ebook file, auto-detecting the format.
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+    pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
         let path = path.as_ref();
         let format = Format::from_path(path).ok_or_else(|| {
             io::Error::new(
@@ -236,17 +236,16 @@ impl Book {
     }
 
     /// Open an ebook file with an explicit format.
-    pub fn open_format(path: impl AsRef<Path>, format: Format) -> io::Result<Self> {
+    pub fn open_format(path: impl AsRef<Path>, format: Format) -> crate::Result<Self> {
         let backend: Box<dyn Importer> = match format {
             Format::Epub => Box::new(EpubImporter::open(path.as_ref())?),
             Format::Azw3 => Box::new(Azw3Importer::open(path.as_ref())?),
             Format::Mobi => Box::new(MobiImporter::open(path.as_ref())?),
             Format::Kfx => Box::new(KfxImporter::open(path.as_ref())?),
             Format::Markdown => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "Markdown format is export-only",
-                ));
+                return Err(crate::Error::UnsupportedFormat {
+                    detail: "Markdown format is export-only".into(),
+                });
             }
         };
         Ok(Self {
@@ -258,7 +257,7 @@ impl Book {
     /// Create a Book from in-memory bytes with an explicit format.
     ///
     /// This is useful for reading from stdin or other non-file sources.
-    pub fn from_bytes(data: &[u8], format: Format) -> io::Result<Self> {
+    pub fn from_bytes(data: &[u8], format: Format) -> crate::Result<Self> {
         let source = Arc::new(MemorySource::new(data.to_vec()));
         let backend: Box<dyn Importer> = match format {
             Format::Epub => Box::new(EpubImporter::from_source(source)?),
@@ -266,10 +265,9 @@ impl Book {
             Format::Mobi => Box::new(MobiImporter::from_source(source)?),
             Format::Kfx => Box::new(KfxImporter::from_source(source)?),
             Format::Markdown => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "Markdown format is export-only",
-                ));
+                return Err(crate::Error::UnsupportedFormat {
+                    detail: "Markdown format is export-only".into(),
+                });
             }
         };
         Ok(Self {
@@ -304,7 +302,7 @@ impl Book {
     }
 
     /// Load raw chapter bytes.
-    pub fn load_raw(&mut self, id: ChapterId) -> io::Result<Vec<u8>> {
+    pub fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
         self.backend.load_raw(id)
     }
 
@@ -330,9 +328,9 @@ impl Book {
     ///         }
     ///     }
     /// }
-    /// # Ok::<(), std::io::Error>(())
+    /// # Ok::<(), boko::Error>(())
     /// ```
-    pub fn load_chapter(&mut self, id: ChapterId) -> io::Result<Chapter> {
+    pub fn load_chapter(&mut self, id: ChapterId) -> crate::Result<Chapter> {
         self.backend.load_chapter(id)
     }
 
@@ -355,9 +353,9 @@ impl Book {
     ///
     /// // Second call returns cached version (cheap Arc clone)
     /// let chapter2 = book.load_chapter_cached(spine[0].id)?;
-    /// # Ok::<(), std::io::Error>(())
+    /// # Ok::<(), boko::Error>(())
     /// ```
-    pub fn load_chapter_cached(&mut self, id: ChapterId) -> io::Result<Arc<Chapter>> {
+    pub fn load_chapter_cached(&mut self, id: ChapterId) -> crate::Result<Arc<Chapter>> {
         // Fast path: check read lock first
         {
             let cache = self
@@ -415,10 +413,10 @@ impl Book {
     /// for (source, href) in resolved.broken_links() {
     ///     eprintln!("Broken link at {:?}: {}", source, href);
     /// }
-    /// # Ok::<(), std::io::Error>(())
+    /// # Ok::<(), boko::Error>(())
     /// ```
-    pub fn resolve_links(&mut self) -> io::Result<ResolvedLinks> {
-        resolve_book_links(self)
+    pub fn resolve_links(&mut self) -> crate::Result<ResolvedLinks> {
+        Ok(resolve_book_links(self)?)
     }
 
     /// Index anchors for link resolution.
@@ -487,7 +485,7 @@ impl Book {
     }
 
     /// Load an asset by path.
-    pub fn load_asset(&mut self, path: &Path) -> io::Result<Vec<u8>> {
+    pub fn load_asset(&mut self, path: &Path) -> crate::Result<Vec<u8>> {
         self.backend.load_asset(path)
     }
 
@@ -534,18 +532,17 @@ impl Book {
     /// let mut book = Book::open("input.azw3")?;
     /// let mut file = File::create("output.epub")?;
     /// book.export(Format::Epub, &mut file)?;
-    /// # Ok::<(), std::io::Error>(())
+    /// # Ok::<(), boko::Error>(())
     /// ```
-    pub fn export<W: Write + Seek>(&mut self, format: Format, writer: &mut W) -> io::Result<()> {
+    pub fn export<W: Write + Seek>(&mut self, format: Format, writer: &mut W) -> crate::Result<()> {
         match format {
             Format::Epub => EpubExporter::new().export(self, writer),
             Format::Azw3 => Azw3Exporter::new().export(self, writer),
             Format::Markdown => MarkdownExporter::new().export(self, writer),
             Format::Kfx => KfxExporter::new().export(self, writer),
-            Format::Mobi => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("{:?} export is not supported", format),
-            )),
+            Format::Mobi => Err(crate::Error::UnsupportedFormat {
+                detail: format!("{:?} export is not supported", format),
+            }),
         }
     }
 }

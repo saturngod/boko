@@ -102,10 +102,10 @@ impl From<ContainerError> for io::Error {
 }
 
 impl Importer for KfxImporter {
-    fn open(path: &Path) -> io::Result<Self> {
+    fn open(path: &Path) -> crate::Result<Self> {
         let file = std::fs::File::open(path)?;
         let source = Arc::new(FileSource::new(file)?);
-        Self::from_source(source)
+        Ok(Self::from_source(source)?)
     }
 
     fn metadata(&self) -> &Metadata {
@@ -132,7 +132,7 @@ impl Importer for KfxImporter {
         self.section_names.get(id.0 as usize).map(|s| s.as_str())
     }
 
-    fn load_chapter(&mut self, id: ChapterId) -> io::Result<Chapter> {
+    fn load_chapter(&mut self, id: ChapterId) -> crate::Result<Chapter> {
         // Ensure anchors and styles are indexed
         self.index_anchor_entities()?;
         self.index_styles()?;
@@ -169,7 +169,7 @@ impl Importer for KfxImporter {
         Ok(chapter)
     }
 
-    fn load_raw(&mut self, id: ChapterId) -> io::Result<Vec<u8>> {
+    fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
         let section_name = self
             .section_names
             .get(id.0 as usize)
@@ -178,19 +178,19 @@ impl Importer for KfxImporter {
 
         // Find section entity and resolve to storyline
         let storyline_loc = self.resolve_section_to_storyline(&section_name)?;
-        self.read_entity(storyline_loc)
+        Ok(self.read_entity(storyline_loc)?)
     }
 
     fn list_assets(&self) -> &[PathBuf] {
         &self.asset_paths
     }
 
-    fn load_asset(&mut self, path: &Path) -> io::Result<Vec<u8>> {
+    fn load_asset(&mut self, path: &Path) -> crate::Result<Vec<u8>> {
         let name = path.to_string_lossy();
 
         // Handle font path lookup (e.g., "fonts/font_0000.otf")
         if let Some(loc) = self.font_entities.get(&*name) {
-            return self.read_entity(*loc);
+            return Ok(self.read_entity(*loc)?);
         }
 
         // Handle direct entity ID lookup (e.g., "#1102" from list_assets)
@@ -198,10 +198,10 @@ impl Importer for KfxImporter {
             if let Ok(id) = id_str.parse::<u32>() {
                 // Find entity by ID
                 if let Some(loc) = self.entities.iter().find(|e| e.id == id) {
-                    return self.read_entity(*loc);
+                    return Ok(self.read_entity(*loc)?);
                 }
             }
-            return Err(io::Error::new(io::ErrorKind::NotFound, "Entity not found"));
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Entity not found").into());
         }
 
         // Ensure resources are indexed for name-based lookup
@@ -214,7 +214,7 @@ impl Importer for KfxImporter {
             .get(&*name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Asset not found"))?;
 
-        self.read_entity(*loc)
+        Ok(self.read_entity(*loc)?)
     }
 
     fn requires_normalized_export(&self) -> bool {

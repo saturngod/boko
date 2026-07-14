@@ -99,10 +99,10 @@ struct Kf8Structure {
 }
 
 impl Importer for Azw3Importer {
-    fn open(path: &Path) -> io::Result<Self> {
+    fn open(path: &Path) -> crate::Result<Self> {
         let file = std::fs::File::open(path)?;
         let source = Arc::new(FileSource::new(file)?);
-        Self::from_source(source)
+        Ok(Self::from_source(source)?)
     }
 
     fn metadata(&self) -> &Metadata {
@@ -129,7 +129,7 @@ impl Importer for Azw3Importer {
         self.chapter_paths.get(id.0 as usize).map(|s| s.as_str())
     }
 
-    fn load_raw(&mut self, id: ChapterId) -> io::Result<Vec<u8>> {
+    fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
         // Check chapter cache first
         if let Some(content) = self.chapter_cache.get(&id.0) {
             return Ok(content.clone());
@@ -152,7 +152,7 @@ impl Importer for Azw3Importer {
         &self.assets
     }
 
-    fn load_asset(&mut self, path: &Path) -> io::Result<Vec<u8>> {
+    fn load_asset(&mut self, path: &Path) -> crate::Result<Vec<u8>> {
         let key = path.to_string_lossy();
 
         // Parse index from path (images/image_XXXX.ext or fonts/font_XXXX.ext).
@@ -170,7 +170,7 @@ impl Importer for Azw3Importer {
                 )
             })?;
 
-        self.load_image_record(idx)
+        Ok(self.load_image_record(idx)?)
     }
 
     fn load_stylesheet(&mut self, path: &Path) -> Option<Stylesheet> {

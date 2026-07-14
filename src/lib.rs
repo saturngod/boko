@@ -33,10 +33,11 @@
 //!     let content = book.load_raw(entry.id)?;
 //!     println!("Chapter: {} bytes", content.len());
 //! }
-//! # Ok::<(), std::io::Error>(())
+//! # Ok::<(), boko::Error>(())
 //! ```
 
 pub mod dom;
+pub mod error;
 pub mod export;
 pub mod import;
 pub mod io;
@@ -52,6 +53,9 @@ pub(crate) mod util;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;
+
+// Error handling
+pub use error::{Error, Result};
 
 // Primary exports from model
 pub use model::{

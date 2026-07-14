@@ -44,7 +44,7 @@ impl KfxExporter {
 }
 
 impl Exporter for KfxExporter {
-    fn export<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> io::Result<()> {
+    fn export<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> crate::Result<()> {
         // Build the KFX container
         let data = build_kfx_container(book)?;
         writer.write_all(&data)?;

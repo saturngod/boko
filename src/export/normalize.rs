@@ -21,7 +21,7 @@
 //! // content.css contains the unified stylesheet
 //! // content.chapters contains synthesized XHTML documents
 //! // content.assets contains all referenced asset paths
-//! # Ok::<(), std::io::Error>(())
+//! # Ok::<(), boko::Error>(())
 //! ```
 
 use std::collections::{HashMap, HashSet};

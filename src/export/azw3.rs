@@ -63,9 +63,9 @@ impl Default for Azw3Exporter {
 }
 
 impl Exporter for Azw3Exporter {
-    fn export<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> io::Result<()> {
+    fn export<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> crate::Result<()> {
         let builder = Kf8Builder::new(book, self.config.normalize)?;
-        builder.write(writer)
+        Ok(builder.write(writer)?)
     }
 }
 

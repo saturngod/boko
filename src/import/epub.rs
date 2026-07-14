@@ -59,10 +59,10 @@ struct ZipEntryLoc {
 }
 
 impl Importer for EpubImporter {
-    fn open(path: &Path) -> io::Result<Self> {
+    fn open(path: &Path) -> crate::Result<Self> {
         let file = std::fs::File::open(path)?;
         let source = Arc::new(FileSource::new(file)?);
-        Self::from_source(source)
+        Ok(Self::from_source(source)?)
     }
 
     fn metadata(&self) -> &Metadata {
@@ -89,23 +89,23 @@ impl Importer for EpubImporter {
         self.spine_paths.get(id.0 as usize).map(|s| s.as_str())
     }
 
-    fn load_raw(&mut self, id: ChapterId) -> io::Result<Vec<u8>> {
+    fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
         let path = self.spine_paths.get(id.0 as usize).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Chapter ID {} not found", id.0),
             )
         })?;
-        self.read_entry(path)
+        Ok(self.read_entry(path)?)
     }
 
     fn list_assets(&self) -> &[PathBuf] {
         &self.assets
     }
 
-    fn load_asset(&mut self, path: &Path) -> io::Result<Vec<u8>> {
+    fn load_asset(&mut self, path: &Path) -> crate::Result<Vec<u8>> {
         let key = path.to_string_lossy().replace('\\', "/");
-        self.read_entry(&key)
+        Ok(self.read_entry(&key)?)
     }
 
     fn load_stylesheet(&mut self, path: &Path) -> Option<Stylesheet> {

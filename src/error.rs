@@ -1,0 +1,137 @@
+//! Typed error handling for boko's importers, exporters, and [`Book`] API.
+//!
+//! [`Error`] lets callers programmatically distinguish failure classes
+//! (unsupported format, malformed input, DRM protection, missing resources)
+//! instead of string-matching on `io::Error`. Internal code that produces
+//! plain I/O errors keeps working via `From<std::io::Error>` and `?`.
+//!
+//! [`Book`]: crate::Book
+
+use std::fmt;
+
+use crate::model::Format;
+
+/// Errors produced by boko's importers, exporters, and `Book` API.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Error {
+    /// Underlying I/O failure (file access, writer errors).
+    Io(std::io::Error),
+    /// The input doesn't match any supported format, or the format doesn't
+    /// support the requested direction (e.g. writing MOBI).
+    UnsupportedFormat {
+        /// Human-readable explanation of what was unsupported.
+        detail: String,
+    },
+    /// The input claims to be `format` but its structure is invalid.
+    Malformed {
+        /// The format the input claimed to be.
+        format: Format,
+        /// What was invalid about the input.
+        context: String,
+    },
+    /// The input is DRM-protected / encrypted; boko does not decrypt.
+    DrmProtected(Format),
+    /// A referenced chapter, asset, or resource does not exist.
+    NotFound {
+        /// The missing chapter, asset, or resource.
+        what: String,
+    },
+}
+
+/// Convenience alias used throughout boko's public API.
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Io(e) => write!(f, "I/O error: {}", e),
+            Error::UnsupportedFormat { detail } => {
+                write!(f, "unsupported format: {}", detail)
+            }
+            Error::Malformed { format, context } => {
+                write!(f, "malformed {:?} input: {}", format, context)
+            }
+            Error::DrmProtected(format) => {
+                write!(f, "{:?} file is DRM-protected; boko does not decrypt", format)
+            }
+            Error::NotFound { what } => write!(f, "not found: {}", what),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e)
+    }
+}
+
+/// Compat shim: lets callers that still want `io::Result` convert back.
+impl From<Error> for std::io::Error {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::Io(io) => io,
+            Error::NotFound { .. } => std::io::Error::new(std::io::ErrorKind::NotFound, e),
+            Error::UnsupportedFormat { .. } => {
+                std::io::Error::new(std::io::ErrorKind::Unsupported, e)
+            }
+            _ => std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn io_error_roundtrip() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "nope");
+        let err = Error::from(io);
+        let back: std::io::Error = err.into();
+        assert_eq!(back.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn kind_mapping() {
+        let err: std::io::Error = Error::NotFound {
+            what: "chapter 3".into(),
+        }
+        .into();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+
+        let err: std::io::Error = Error::UnsupportedFormat {
+            detail: "mobi write".into(),
+        }
+        .into();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+
+        let err: std::io::Error = Error::DrmProtected(Format::Azw3).into();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn display_output() {
+        let err = Error::Malformed {
+            format: Format::Kfx,
+            context: "truncated entity table".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "malformed Kfx input: truncated entity table"
+        );
+        let err = Error::NotFound {
+            what: "images/cover.jpg".into(),
+        };
+        assert_eq!(err.to_string(), "not found: images/cover.jpg");
+    }
+}
