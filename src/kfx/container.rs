@@ -72,31 +72,36 @@ impl From<std::io::Error> for ContainerError {
 }
 
 // --- Byte reading helpers ---
+//
+// All return `Option` so a truncated buffer is an error the caller handles,
+// never a panic: these are `pub` and read attacker-controlled container
+// bytes, so the bounds contract belongs in the signature.
+
+/// Read a little-endian u16 from a byte slice at the given offset.
+#[inline]
+pub fn read_u16_le(data: &[u8], offset: usize) -> Option<u16> {
+    data.get(offset..offset.checked_add(2)?)?
+        .try_into()
+        .ok()
+        .map(u16::from_le_bytes)
+}
 
 /// Read a little-endian u32 from a byte slice at the given offset.
 #[inline]
-pub fn read_u32_le(data: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        data[offset],
-        data[offset + 1],
-        data[offset + 2],
-        data[offset + 3],
-    ])
+pub fn read_u32_le(data: &[u8], offset: usize) -> Option<u32> {
+    data.get(offset..offset.checked_add(4)?)?
+        .try_into()
+        .ok()
+        .map(u32::from_le_bytes)
 }
 
 /// Read a little-endian u64 from a byte slice at the given offset.
 #[inline]
-pub fn read_u64_le(data: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes([
-        data[offset],
-        data[offset + 1],
-        data[offset + 2],
-        data[offset + 3],
-        data[offset + 4],
-        data[offset + 5],
-        data[offset + 6],
-        data[offset + 7],
-    ])
+pub fn read_u64_le(data: &[u8], offset: usize) -> Option<u64> {
+    data.get(offset..offset.checked_add(8)?)?
+        .try_into()
+        .ok()
+        .map(u64::from_le_bytes)
 }
 
 // --- Container header parsing ---
@@ -113,10 +118,12 @@ pub fn parse_container_header(data: &[u8]) -> Result<ContainerHeader, ContainerE
         return Err(ContainerError::InvalidMagic);
     }
 
+    // The length check above guarantees these reads succeed.
+    let read = |offset| read_u32_le(data, offset).ok_or(ContainerError::TooShort);
     Ok(ContainerHeader {
-        header_len: read_u32_le(data, 6) as usize,
-        container_info_offset: read_u32_le(data, 10) as usize,
-        container_info_length: read_u32_le(data, 14) as usize,
+        header_len: read(6)? as usize,
+        container_info_offset: read(10)? as usize,
+        container_info_length: read(14)? as usize,
     })
 }
 
@@ -182,23 +189,27 @@ pub fn parse_index_table(data: &[u8], header_len: usize) -> Vec<EntityLoc> {
 
     for i in 0..num_entries {
         let entry_offset = i * ENTRY_SIZE;
-        if entry_offset + ENTRY_SIZE > data.len() {
-            break;
-        }
 
         // Offsets/lengths are untrusted u64s. Do the arithmetic in u64 (so the
         // `as usize` truncation on 32-bit/wasm targets can't turn a >4 GiB value
         // into a small in-bounds one) and saturate on overflow; an out-of-range
         // offset/length is rejected by the bounds-checked `read_at` downstream.
-        let raw_offset = read_u64_le(data, entry_offset + 8);
+        let (Some(id), Some(type_id), Some(raw_offset), Some(raw_length)) = (
+            read_u32_le(data, entry_offset),
+            read_u32_le(data, entry_offset + 4),
+            read_u64_le(data, entry_offset + 8),
+            read_u64_le(data, entry_offset + 16),
+        ) else {
+            break;
+        };
         let offset = (header_len as u64)
             .checked_add(raw_offset)
             .and_then(|o| usize::try_from(o).ok())
             .unwrap_or(usize::MAX);
-        let length = usize::try_from(read_u64_le(data, entry_offset + 16)).unwrap_or(usize::MAX);
+        let length = usize::try_from(raw_length).unwrap_or(usize::MAX);
         entities.push(EntityLoc {
-            id: read_u32_le(data, entry_offset),
-            type_id: read_u32_le(data, entry_offset + 4),
+            id,
+            type_id,
             offset,
             length,
         });
@@ -213,11 +224,12 @@ pub fn parse_index_table(data: &[u8], header_len: usize) -> Vec<EntityLoc> {
 ///
 /// Returns the slice after the ENTY header, or the original slice if no header.
 pub fn skip_enty_header(data: &[u8]) -> &[u8] {
-    if data.len() >= 10 && &data[0..4] == b"ENTY" {
-        let header_len = read_u32_le(data, 6) as usize;
-        if header_len < data.len() {
-            return &data[header_len..];
-        }
+    if data.len() >= 10
+        && &data[0..4] == b"ENTY"
+        && let Some(header_len) = read_u32_le(data, 6)
+        && (header_len as usize) < data.len()
+    {
+        return &data[header_len as usize..];
     }
     data
 }
@@ -306,13 +318,16 @@ mod tests {
     #[test]
     fn test_read_u32_le() {
         let data = [0x01, 0x02, 0x03, 0x04];
-        assert_eq!(read_u32_le(&data, 0), 0x04030201);
+        assert_eq!(read_u32_le(&data, 0), Some(0x04030201));
+        assert_eq!(read_u32_le(&data, 1), None);
+        assert_eq!(read_u32_le(&data, usize::MAX), None);
     }
 
     #[test]
     fn test_read_u64_le() {
         let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
-        assert_eq!(read_u64_le(&data, 0), 0x0807060504030201);
+        assert_eq!(read_u64_le(&data, 0), Some(0x0807060504030201));
+        assert_eq!(read_u64_le(&data, 1), None);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use boko::kfx::container::extract_doc_symbols;
+use boko::kfx::container::{extract_doc_symbols, read_u16_le, read_u32_le, read_u64_le};
 use boko::kfx::symbols::KFX_SYMBOL_TABLE;
 use clap::Parser;
 use ion_rs::{
@@ -138,30 +138,6 @@ fn main() -> IonResult<()> {
     }
 
     Ok(())
-}
-
-/// Read a little-endian u16 from a slice with bounds checking
-fn read_u16_le(data: &[u8], offset: usize) -> Option<u16> {
-    data.get(offset..offset + 2)?
-        .try_into()
-        .ok()
-        .map(u16::from_le_bytes)
-}
-
-/// Read a little-endian u32 from a slice with bounds checking
-fn read_u32_le(data: &[u8], offset: usize) -> Option<u32> {
-    data.get(offset..offset + 4)?
-        .try_into()
-        .ok()
-        .map(u32::from_le_bytes)
-}
-
-/// Read a little-endian u64 from a slice with bounds checking
-fn read_u64_le(data: &[u8], offset: usize) -> Option<u64> {
-    data.get(offset..offset + 8)?
-        .try_into()
-        .ok()
-        .map(u64::from_le_bytes)
 }
 
 /// Parse and dump a KFX container file
