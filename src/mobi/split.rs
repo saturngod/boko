@@ -27,9 +27,9 @@ pub(crate) fn split_mobi_html(html: &[u8], ncx_positions: Option<&[u32]>) -> Cha
 
     // Split body: pagebreaks first, NCX fallback, then single chapter
     let body_chunks = if !pagebreak_positions.is_empty() {
-        split_at_pagebreaks(&body_content, &pagebreak_positions)
+        split_at_pagebreaks(body_content, &pagebreak_positions)
     } else if let Some(positions) = ncx_positions {
-        let ncx_chunks = split_at_ncx_anchors(&body_content, positions);
+        let ncx_chunks = split_at_ncx_anchors(body_content, positions);
         if ncx_chunks.len() > 1 {
             ncx_chunks
         } else {
@@ -98,7 +98,7 @@ pub(crate) fn split_mobi_html_ncx_only(html: &[u8], ncx_positions: &[u32]) -> Ch
     let (head_content, body_content) = extract_head_and_body(&html_str);
 
     let body_chunks = {
-        let ncx_chunks = split_at_ncx_anchors(&body_content, ncx_positions);
+        let ncx_chunks = split_at_ncx_anchors(body_content, ncx_positions);
         if ncx_chunks.len() > 1 {
             ncx_chunks
         } else {
@@ -149,36 +149,71 @@ pub(crate) fn split_mobi_html_ncx_only(html: &[u8], ncx_positions: &[u32]) -> Ch
     }
 }
 
+/// Find `needle` (must be given lowercase) case-insensitively, without
+/// materializing a lowercased copy of the haystack: memchr to candidate
+/// positions of the (non-alphabetic) first byte, then compare in place.
+fn find_ci(haystack: &[u8], needle_lower: &[u8], mut from: usize) -> Option<usize> {
+    let first = *needle_lower.first()?;
+    while from + needle_lower.len() <= haystack.len() {
+        let pos = from + memchr::memchr(first, &haystack[from..])?;
+        if pos + needle_lower.len() > haystack.len() {
+            return None;
+        }
+        if haystack[pos..pos + needle_lower.len()].eq_ignore_ascii_case(needle_lower) {
+            return Some(pos);
+        }
+        from = pos + 1;
+    }
+    None
+}
+
+/// Case-insensitive rfind, same contract as [`find_ci`].
+fn rfind_ci(haystack: &[u8], needle_lower: &[u8]) -> Option<usize> {
+    let first = *needle_lower.first()?;
+    let mut end = haystack.len();
+    while end >= needle_lower.len() {
+        let pos = memchr::memrchr(first, &haystack[..end])?;
+        if pos + needle_lower.len() <= haystack.len()
+            && haystack[pos..pos + needle_lower.len()].eq_ignore_ascii_case(needle_lower)
+        {
+            return Some(pos);
+        }
+        end = pos;
+    }
+    None
+}
+
 /// Extract the content inside `<head>...</head>` and `<body>...</body>`.
 ///
-/// Returns (head_inner, body_inner). If tags aren't found, returns reasonable
-/// defaults.
-fn extract_head_and_body(html: &str) -> (String, String) {
-    let html_lower = html.to_ascii_lowercase();
+/// Returns (head_inner, body_inner) as borrowed slices — the previous
+/// version lowercased the entire book just to locate four tags and copied
+/// both regions out. If tags aren't found, returns reasonable defaults.
+fn extract_head_and_body(html: &str) -> (&str, &str) {
+    let bytes = html.as_bytes();
 
     // Find <head> content
-    let head_content = if let Some(head_start) = html_lower.find("<head") {
+    let head_content = if let Some(head_start) = find_ci(bytes, b"<head", 0) {
         let after_tag = html[head_start..].find('>').map(|p| head_start + p + 1);
-        let head_end = html_lower.find("</head>");
+        let head_end = find_ci(bytes, b"</head>", 0);
         match (after_tag, head_end) {
-            (Some(start), Some(end)) if start <= end => html[start..end].to_string(),
-            _ => String::new(),
+            (Some(start), Some(end)) if start <= end => &html[start..end],
+            _ => "",
         }
     } else {
-        String::new()
+        ""
     };
 
     // Find <body> content
-    let body_content = if let Some(body_start) = html_lower.find("<body") {
+    let body_content = if let Some(body_start) = find_ci(bytes, b"<body", 0) {
         let after_tag = html[body_start..].find('>').map(|p| body_start + p + 1);
-        let body_end = html_lower.rfind("</body>");
+        let body_end = rfind_ci(bytes, b"</body>");
         match (after_tag, body_end) {
-            (Some(start), Some(end)) if start <= end => html[start..end].to_string(),
-            (Some(start), None) => html[start..].to_string(),
-            _ => html.to_string(),
+            (Some(start), Some(end)) if start <= end => &html[start..end],
+            (Some(start), None) => &html[start..],
+            _ => html,
         }
     } else {
-        html.to_string()
+        html
     };
 
     (head_content, body_content)
@@ -198,15 +233,12 @@ struct PagebreakPos {
 /// `<mbp:pagebreak>`, with optional attributes, case-insensitive.
 fn find_pagebreaks(body: &[u8]) -> Vec<PagebreakPos> {
     let mut results = Vec::new();
-    let body_lower: Vec<u8> = body.iter().map(|b| b.to_ascii_lowercase()).collect();
     let needle = b"<mbp:pagebreak";
 
-    // SIMD substring search over the lowercased body (needed for the
-    // case-insensitive match), plus memchr for the tag's closing `>`, instead
-    // of a byte-by-byte `windows().position()` scan.
+    // Case-insensitive scan without materializing a lowercased copy of the
+    // whole body, plus memchr for the tag's closing `>`.
     let mut search_from = 0;
-    while let Some(rel) = memchr::memmem::find(&body_lower[search_from..], needle) {
-        let tag_start = search_from + rel;
+    while let Some(tag_start) = find_ci(body, needle, search_from) {
         // Find the closing > for this tag.
         if let Some(close_rel) = memchr::memchr(b'>', &body[tag_start..]) {
             let tag_end = tag_start + close_rel + 1;

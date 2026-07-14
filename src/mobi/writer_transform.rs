@@ -66,16 +66,30 @@ pub fn rewrite_html_references_fast(
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    // Finders for tag detection
+    // Finders for tag detection, with memoized next-match positions. A
+    // cached hit stays valid while it lies at or ahead of `pos`, so
+    // consuming an `<a>` tag doesn't force the `<img>`/`<link>` finders to
+    // re-scan the rest of the document (previously O(tags × document) on
+    // anchor-heavy chapters with no images).
     let link_finder = memmem::Finder::new(b"<link ");
     let img_finder = memmem::Finder::new(b"<img ");
     let a_finder = memmem::Finder::new(b"<a ");
+    let mut next_link = link_finder.find(html);
+    let mut next_img = img_finder.find(html);
+    let mut next_a = a_finder.find(html);
 
     while pos < html.len() {
-        // Find next tag of interest
-        let next_link = link_finder.find(&html[pos..]).map(|p| p + pos);
-        let next_img = img_finder.find(&html[pos..]).map(|p| p + pos);
-        let next_a = a_finder.find(&html[pos..]).map(|p| p + pos);
+        // Refresh only the finders whose cached match has been passed.
+        // A `None` stays `None`: `pos` only advances.
+        if next_link.is_some_and(|p| p < pos) {
+            next_link = link_finder.find(&html[pos..]).map(|p| p + pos);
+        }
+        if next_img.is_some_and(|p| p < pos) {
+            next_img = img_finder.find(&html[pos..]).map(|p| p + pos);
+        }
+        if next_a.is_some_and(|p| p < pos) {
+            next_a = a_finder.find(&html[pos..]).map(|p| p + pos);
+        }
 
         // Find the earliest match
         let next_match = [next_link, next_img, next_a].into_iter().flatten().min();
