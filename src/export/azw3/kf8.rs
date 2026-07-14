@@ -213,15 +213,27 @@ impl Kf8Builder {
         }
         self.flows_length = all_flows.len();
 
-        // Split into records and PalmDoc-compress.
-        let mut pos = 0;
-        while pos < all_flows.len() {
-            let end = (pos + RECORD_SIZE).min(all_flows.len());
-            let chunk = &all_flows[pos..end];
+        // Split into records and PalmDoc-compress. Records are compressed
+        // independently, so this fans out across chunks (the compression is
+        // the bulk of AZW3 export time on large books).
+        fn compress_record(chunk: &[u8]) -> Vec<u8> {
             let mut record = crate::mobi::palmdoc::compress(chunk);
             record.push(0); // multibyte indicator (0 = no UTF-8 overlap)
-            self.records.push(record);
-            pos = end;
+            record
+        }
+        #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+        {
+            use rayon::prelude::*;
+            self.records.par_extend(
+                all_flows
+                    .par_chunks(RECORD_SIZE)
+                    .map(compress_record),
+            );
+        }
+        #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+        {
+            self.records
+                .extend(all_flows.chunks(RECORD_SIZE).map(compress_record));
         }
 
         self.last_text_record = (self.records.len() - 1) as u16;
