@@ -376,7 +376,7 @@ impl Kf8Builder {
             // Build SKEL index
             if !chunker_result.skel_table.is_empty() {
                 self.skel_index = self.records.len() as u32;
-                let skel_records = build_skel_indx(&chunker_result.skel_table);
+                let skel_records = build_skel_indx(&chunker_result.skel_table)?;
                 for record in skel_records {
                     self.records.push(record);
                 }
@@ -390,10 +390,10 @@ impl Kf8Builder {
                     .map(|c| c.selector.clone())
                     .collect();
                 let cncx_offsets = calculate_cncx_offsets(&selectors);
-                let cncx = build_cncx(&selectors);
+                let cncx = build_cncx(&selectors)?;
 
                 self.frag_index = self.records.len() as u32;
-                let chunk_records = build_chunk_indx(&chunker_result.chunk_table, &cncx_offsets);
+                let chunk_records = build_chunk_indx(&chunker_result.chunk_table, &cncx_offsets)?;
                 for record in chunk_records {
                     self.records.push(record);
                 }
@@ -418,7 +418,7 @@ impl Kf8Builder {
 
             if !ncx_entries.is_empty() {
                 self.ncx_index = self.records.len() as u32;
-                let (ncx_records, ncx_cncx) = build_ncx_indx(&ncx_entries);
+                let (ncx_records, ncx_cncx) = build_ncx_indx(&ncx_entries)?;
                 for record in ncx_records {
                     self.records.push(record);
                 }
@@ -440,7 +440,7 @@ impl Kf8Builder {
             );
             if !guide_entries.is_empty() {
                 self.guide_index = self.records.len() as u32;
-                let (guide_records, guide_cncx) = build_guide_indx(&guide_entries);
+                let (guide_records, guide_cncx) = build_guide_indx(&guide_entries)?;
                 for record in guide_records {
                     self.records.push(record);
                 }

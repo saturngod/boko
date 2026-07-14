@@ -649,9 +649,29 @@ impl IndxBuilder {
     /// data record (last entry name + count) + a trailing IDXT, and data
     /// records use a completely different INDX header layout (8 bytes of
     /// 0xFF at offset 28).
-    pub fn build(&self) -> Vec<Vec<u8>> {
+    pub fn build(&self) -> io::Result<Vec<Vec<u8>>> {
         if self.entries.is_empty() {
-            return vec![self.build_header_record(0, &[], &[])];
+            return Ok(vec![self.build_header_record(0, &[], &[])]);
+        }
+
+        // IDXT offsets are u16s pointing past the 192-byte data-record header.
+        // A very large index (~2800+ chunks) can push entry data past
+        // 64 KB, and the `as u16` casts below would silently truncate the
+        // offsets — writing a corrupt AZW3. Boko emits a single data record
+        // (no multi-record split), so refuse to build past the limit. This
+        // also bounds the entry count, so `entries.len() as u16` in the
+        // header geometry cannot truncate either (every entry occupies at
+        // least one byte of entry data).
+        let entry_data_len: usize = self
+            .entries
+            .iter()
+            .map(|(name, tag_data)| 1 + name.len() + tag_data.len())
+            .sum();
+        if 192 + entry_data_len > usize::from(u16::MAX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "INDX entry data exceeds the 64 KB single-record limit (book has too many index entries)",
+            ));
         }
 
         let (entry_data, idxt_offsets) = self.build_entries();
@@ -673,7 +693,7 @@ impl IndxBuilder {
             &[1],
         );
 
-        vec![header_record, data_record]
+        Ok(vec![header_record, data_record])
     }
 
     fn build_header_record(
@@ -799,6 +819,8 @@ impl IndxBuilder {
         let mut offsets = Vec::new();
 
         for (name, tag_data) in &self.entries {
+            // Cannot truncate: `build()` rejects indexes whose total entry
+            // data would push any offset past u16::MAX.
             offsets.push((192 + data.len()) as u16);
 
             let name_bytes = name.as_bytes();
@@ -821,7 +843,8 @@ impl IndxBuilder {
             idxt.extend_from_slice(&offset.to_be_bytes());
         }
 
-        // Add end-of-data offset
+        // Add end-of-data offset. Cannot truncate: `build()` rejects indexes
+        // where 192 + entry_data_len exceeds u16::MAX.
         let end_offset = (192 + entry_data_len) as u16;
         idxt.extend_from_slice(&end_offset.to_be_bytes());
 
@@ -855,7 +878,7 @@ const SKEL_TAG_EOF: TagDef = TagDef {
 };
 
 /// Build skeleton index records
-pub fn build_skel_indx(skeletons: &[super::skeleton::SkelEntry]) -> Vec<Vec<u8>> {
+pub fn build_skel_indx(skeletons: &[super::skeleton::SkelEntry]) -> io::Result<Vec<Vec<u8>>> {
     let tagx = vec![SKEL_TAG_CHUNK_COUNT, SKEL_TAG_GEOMETRY, SKEL_TAG_EOF];
     let mut builder = IndxBuilder::new(tagx, 1);
 
@@ -915,13 +938,25 @@ const CHUNK_TAG_EOF: TagDef = TagDef {
 };
 
 /// Build CNCX record from chunk selectors
-pub fn build_cncx(selectors: &[String]) -> Vec<u8> {
+pub fn build_cncx(selectors: &[String]) -> io::Result<Vec<u8>> {
     let mut cncx = Vec::new();
 
     for selector in selectors {
         let bytes = selector.as_bytes();
         cncx.extend(encint(bytes.len() as u32));
         cncx.extend_from_slice(bytes);
+    }
+
+    // Boko writes a single CNCX record. PDB records are capped at 64 KB, and
+    // offsets past 0x10000 select a *different* CNCX record in the Kindle
+    // format (calibre rolls over: `offset = record_number * 0x10000`). A very
+    // large book would silently produce dangling offsets into a record that
+    // doesn't exist; refuse to build instead (no multi-record split).
+    if cncx.len() > 0x10000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CNCX data exceeds the 64 KB single-record limit (book has too many index labels)",
+        ));
     }
 
     // CNCX records must be 4-byte aligned. Calibre's `CNCX` class calls
@@ -932,14 +967,14 @@ pub fn build_cncx(selectors: &[String]) -> Vec<u8> {
         cncx.push(0);
     }
 
-    cncx
+    Ok(cncx)
 }
 
 /// Build chunk/fragment index records
 pub fn build_chunk_indx(
     chunks: &[super::skeleton::ChunkEntry],
     cncx_offsets: &[u32],
-) -> Vec<Vec<u8>> {
+) -> io::Result<Vec<Vec<u8>>> {
     let tagx = vec![
         CHUNK_TAG_CNCX,
         CHUNK_TAG_FILE_NUM,
@@ -1083,13 +1118,13 @@ pub struct GuideBuildEntry {
 }
 
 /// Build the K8 guide index records (one or more INDX records + a CNCX).
-pub fn build_guide_indx(entries: &[GuideBuildEntry]) -> (Vec<Vec<u8>>, Vec<u8>) {
+pub fn build_guide_indx(entries: &[GuideBuildEntry]) -> io::Result<(Vec<Vec<u8>>, Vec<u8>)> {
     let tagx = vec![GUIDE_TAG_TITLE, GUIDE_TAG_POS_FID, GUIDE_TAG_EOF];
     let mut builder = IndxBuilder::new(tagx, 1);
 
     let titles: Vec<String> = entries.iter().map(|e| e.title.clone()).collect();
     let title_offsets = calculate_cncx_offsets(&titles);
-    let cncx = build_cncx(&titles);
+    let cncx = build_cncx(&titles)?;
 
     if !entries.is_empty() {
         builder.set_cncx_count(1);
@@ -1112,7 +1147,7 @@ pub fn build_guide_indx(entries: &[GuideBuildEntry]) -> (Vec<Vec<u8>>, Vec<u8>) 
         builder.add_entry(entry.guide_type.clone(), tag_data);
     }
 
-    (builder.build(), cncx)
+    Ok((builder.build()?, cncx))
 }
 
 /// NCX entry for building table of contents
@@ -1137,7 +1172,7 @@ pub struct NcxBuildEntry {
 }
 
 /// Build NCX index for table of contents
-pub fn build_ncx_indx(entries: &[NcxBuildEntry]) -> (Vec<Vec<u8>>, Vec<u8>) {
+pub fn build_ncx_indx(entries: &[NcxBuildEntry]) -> io::Result<(Vec<Vec<u8>>, Vec<u8>)> {
     let tagx = vec![
         NCX_TAG_OFFSET,
         NCX_TAG_LENGTH,
@@ -1159,7 +1194,7 @@ pub fn build_ncx_indx(entries: &[NcxBuildEntry]) -> (Vec<Vec<u8>>, Vec<u8>) {
     // Build CNCX with labels
     let labels: Vec<String> = entries.iter().map(|e| e.label.clone()).collect();
     let label_offsets = calculate_cncx_offsets(&labels);
-    let cncx = build_cncx(&labels);
+    let cncx = build_cncx(&labels)?;
 
     if !entries.is_empty() {
         builder.set_cncx_count(1);
@@ -1227,7 +1262,7 @@ pub fn build_ncx_indx(entries: &[NcxBuildEntry]) -> (Vec<Vec<u8>>, Vec<u8>) {
         builder.add_entry(name, tag_data);
     }
 
-    (builder.build(), cncx)
+    Ok((builder.build()?, cncx))
 }
 
 #[cfg(test)]
@@ -1274,7 +1309,7 @@ mod tests {
             "Simple Text".to_string(),
         ];
 
-        let cncx_bytes = build_cncx(&labels);
+        let cncx_bytes = build_cncx(&labels).unwrap();
         let offsets = calculate_cncx_offsets(&labels);
 
         let parsed = Cncx::parse(&[cncx_bytes], "utf-8");
@@ -1290,6 +1325,49 @@ mod tests {
                 offset
             );
         }
+    }
+
+    #[test]
+    fn test_indx_build_rejects_entry_data_past_u16() {
+        // IDXT offsets are u16; entry data pushing past 64 KB used to be
+        // silently truncated by `as u16`, writing corrupt AZW3 index records
+        // for very large books. Exactly at the boundary must still build;
+        // one byte past must error.
+        let make_builder = |tag_data_len: usize| {
+            let mut builder = IndxBuilder::new(vec![SKEL_TAG_EOF], 1);
+            // Entry data size = 1 (name length byte) + name + tag_data.
+            builder.add_entry("A".to_string(), vec![0u8; tag_data_len]);
+            builder
+        };
+
+        // 192 + 1 + 1 + tag_data_len == u16::MAX  =>  tag_data_len = 65341
+        let at_limit = make_builder(65341);
+        assert!(at_limit.build().is_ok(), "boundary case must still build");
+
+        let past_limit = make_builder(65342);
+        let err = past_limit.build().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("64 KB"),
+            "Expected 64 KB limit error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_cncx_rejects_data_past_64kb() {
+        // Offsets past 0x10000 select a nonexistent second CNCX record;
+        // build_cncx must refuse rather than emit dangling offsets.
+        // encint(65533) is 3 bytes, so this string lands exactly on 0x10000.
+        let at_limit = vec!["x".repeat(65533)];
+        assert!(build_cncx(&at_limit).is_ok(), "boundary case must build");
+
+        let past_limit = vec!["x".repeat(65534)];
+        let err = build_cncx(&past_limit).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("64 KB"),
+            "Expected 64 KB limit error, got: {err}"
+        );
     }
 
     #[test]
@@ -1317,7 +1395,7 @@ mod tests {
             },
         ];
 
-        let (ncx_records, ncx_cncx) = build_ncx_indx(&entries);
+        let (ncx_records, ncx_cncx) = build_ncx_indx(&entries).unwrap();
 
         // Should have 2 records: header + data
         assert_eq!(ncx_records.len(), 2, "Should have header + data record");
@@ -1404,7 +1482,7 @@ mod tests {
             },
         ];
 
-        let skel_records = build_skel_indx(&entries);
+        let skel_records = build_skel_indx(&entries).unwrap();
 
         // Should have 2 records: header + data
         assert_eq!(skel_records.len(), 2, "Should have header + data record");

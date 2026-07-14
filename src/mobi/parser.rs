@@ -282,6 +282,12 @@ pub fn detect_font_type(data: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// Maximum bytes a single FONT record may decompress to. Even the largest
+/// real embedded fonts (full CJK families) are well under this; a crafted
+/// zlib stream ("font bomb") hits the cap and errors instead of exhausting
+/// memory. Mirrors `util::MAX_DECOMPRESSED_ENTRY` / `MAX_DECOMPRESSED_RECORD`.
+const MAX_FONT_DECOMPRESSED: usize = 32 * 1024 * 1024;
+
 /// Decode a Kindle `FONT` container record into raw font bytes.
 ///
 /// AZW3 and MOBI ebooks may embed fonts wrapped in a `FONT` FourCC container
@@ -346,14 +352,24 @@ pub fn decode_font_record(data: &[u8]) -> io::Result<Vec<u8>> {
         }
     }
 
-    // Decompress
+    // Decompress. The zlib stream is untrusted, so cap the output (same
+    // `.take(cap + 1)` pattern as `util::bounded_inflate`, which handles raw
+    // DEFLATE; FONT records are zlib-wrapped): a tiny crafted record could
+    // otherwise inflate to gigabytes. No real font approaches this cap.
     if is_compressed {
         use std::io::Read;
-        let mut decoder = flate2::read::ZlibDecoder::new(&font_data[..]);
+        let mut decoder = flate2::read::ZlibDecoder::new(&font_data[..])
+            .take(MAX_FONT_DECOMPRESSED as u64 + 1);
         let mut decompressed = Vec::new();
         decoder.read_to_end(&mut decompressed).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("FONT zlib error: {e}"))
         })?;
+        if decompressed.len() > MAX_FONT_DECOMPRESSED {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FONT record decompresses beyond size limit",
+            ));
+        }
         Ok(decompressed)
     } else {
         Ok(font_data)
@@ -488,6 +504,54 @@ mod tests {
         data.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // num_sections (lie)
         let flows = parse_fdst(&data).unwrap();
         assert!(flows.is_empty());
+    }
+
+    /// Build a FONT record (no obfuscation) wrapping the given zlib payload.
+    fn make_font_record(compressed: &[u8]) -> Vec<u8> {
+        let mut rec = Vec::with_capacity(24 + compressed.len());
+        rec.extend_from_slice(b"FONT");
+        rec.extend_from_slice(&0u32.to_be_bytes()); // uncompressed size (unused)
+        rec.extend_from_slice(&1u32.to_be_bytes()); // flags: bit 0 = compressed
+        rec.extend_from_slice(&24u32.to_be_bytes()); // data offset
+        rec.extend_from_slice(&0u32.to_be_bytes()); // xor key len
+        rec.extend_from_slice(&0u32.to_be_bytes()); // xor key offset
+        rec.extend_from_slice(compressed);
+        rec
+    }
+
+    fn zlib_compress(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn test_decode_font_record_compressed_roundtrip() {
+        let font = b"OTTO fake font bytes";
+        let record = make_font_record(&zlib_compress(font));
+        let decoded = decode_font_record(&record).unwrap();
+        assert_eq!(decoded, font);
+    }
+
+    #[test]
+    fn test_decode_font_record_rejects_decompression_bomb() {
+        // A few KB of zlib-compressed zeros that inflate past the 32 MB cap.
+        // Unbounded read_to_end would previously balloon this into memory;
+        // it must now error cleanly at the cap.
+        let bomb = zlib_compress(&vec![0u8; MAX_FONT_DECOMPRESSED + 1]);
+        assert!(
+            bomb.len() < MAX_FONT_DECOMPRESSED / 100,
+            "bomb should be tiny relative to its expansion"
+        );
+        let record = make_font_record(&bomb);
+        let err = decode_font_record(&record).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("size limit"),
+            "Expected size-limit error, got: {err}"
+        );
     }
 
     fn make_pdb_header(name: &str, num_records: u16, offsets: &[u32]) -> Vec<u8> {

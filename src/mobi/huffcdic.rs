@@ -96,12 +96,21 @@ impl HuffCdicReader {
             let term = (v & 0x80) != 0;
             let maxcode_raw = v >> 8;
 
+            // A zero code length would make the decode loop consume zero bits
+            // and emit zero bytes per iteration — an infinite loop on hostile
+            // input (the output budget never fires because nothing is
+            // emitted). Real HUFF tables always use 1..=32-bit codes, so
+            // reject codelen == 0 outright. (The 0x1f mask already caps the
+            // value at 31, so > 32 is impossible.)
+            if codelen == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HUFF dict1 entry has zero code length",
+                ));
+            }
+
             // Calculate maxcode for this entry
-            let maxcode = if codelen > 0 {
-                ((maxcode_raw + 1) << (32 - codelen)).wrapping_sub(1)
-            } else {
-                0
-            };
+            let maxcode = ((maxcode_raw + 1) << (32 - codelen)).wrapping_sub(1);
 
             self.dict1.push((codelen, term, maxcode));
         }
@@ -426,6 +435,41 @@ mod tests {
         };
         assert!(reader.load_huff(&huff).is_ok());
         assert_eq!(reader.dict1.len(), 256);
+    }
+
+    #[test]
+    fn test_load_huff_rejects_zero_codelen() {
+        // A dict1 entry with codelen == 0 used to make the decode loop consume
+        // zero bits and emit zero bytes forever (the output budget never fires
+        // because nothing is emitted) — an infinite loop on hostile input.
+        // Craft a HUFF record whose dict1 entries are all terminal with
+        // codelen == 0; load_huff must reject it up front.
+        let mut huff = make_huff();
+        // Overwrite every dict1 entry (at off1 = 24) with codelen = 0, term set:
+        // (maxcode_raw << 8) | 0x80 | 0 = 0x0000FF80
+        let bad_entry = 0x0000_FF80u32.to_be_bytes();
+        for i in 0..256 {
+            let pos = 24 + i * 4;
+            huff[pos..pos + 4].copy_from_slice(&bad_entry);
+        }
+
+        let mut reader = HuffCdicReader {
+            dict1: Vec::new(),
+            mincode: Vec::new(),
+            maxcode: Vec::new(),
+            dictionary: Vec::new(),
+        };
+        let err = reader.load_huff(&huff).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("zero code length"),
+            "Expected zero-code-length error, got: {err}"
+        );
+
+        // The full constructor path must also fail (this is the path that
+        // previously produced a reader whose decompress() spun forever).
+        let cdic = make_cdic();
+        assert!(HuffCdicReader::new(&huff, &[cdic.as_slice()]).is_err());
     }
 
     #[test]
