@@ -64,9 +64,9 @@ pub trait Importer: Send + Sync {
     ///
     /// The default implementation:
     /// 1. Loads raw HTML via `load_raw()`
-    /// 2. Extracts linked stylesheets and inline styles
+    /// 2. Parses the DOM once and extracts linked/inline stylesheets from it
     /// 3. Loads and parses linked CSS via `load_asset()`
-    /// 4. Compiles HTML + CSS to IR via `compile_html()`
+    /// 4. Compiles the parsed DOM + CSS to IR via `compile_dom()`
     ///
     /// Implementations may override for format-specific optimizations.
     fn load_chapter(&mut self, id: ChapterId) -> crate::Result<Chapter> {
