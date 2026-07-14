@@ -101,11 +101,20 @@ impl From<ContainerError> for io::Error {
     }
 }
 
+impl From<ContainerError> for crate::Error {
+    fn from(e: ContainerError) -> Self {
+        crate::Error::Malformed {
+            format: crate::Format::Kfx,
+            context: e.to_string(),
+        }
+    }
+}
+
 impl Importer for KfxImporter {
     fn open(path: &Path) -> crate::Result<Self> {
         let file = std::fs::File::open(path)?;
         let source = Arc::new(FileSource::new(file)?);
-        Ok(Self::from_source(source)?)
+        Self::from_source(source)
     }
 
     fn metadata(&self) -> &Metadata {
@@ -140,7 +149,9 @@ impl Importer for KfxImporter {
         let section_name = self
             .section_names
             .get(id.0 as usize)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Chapter not found"))?
+            .ok_or_else(|| crate::Error::NotFound {
+                what: format!("chapter {}", id.0),
+            })?
             .clone();
 
         // Get storyline location
@@ -173,7 +184,9 @@ impl Importer for KfxImporter {
         let section_name = self
             .section_names
             .get(id.0 as usize)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Chapter not found"))?
+            .ok_or_else(|| crate::Error::NotFound {
+                what: format!("chapter {}", id.0),
+            })?
             .clone();
 
         // Find section entity and resolve to storyline
@@ -201,7 +214,9 @@ impl Importer for KfxImporter {
                     return Ok(self.read_entity(*loc)?);
                 }
             }
-            return Err(io::Error::new(io::ErrorKind::NotFound, "Entity not found").into());
+            return Err(crate::Error::NotFound {
+                what: format!("entity {}", name),
+            });
         }
 
         // Ensure resources are indexed for name-based lookup
@@ -212,7 +227,9 @@ impl Importer for KfxImporter {
         let loc = self
             .resources
             .get(&*name)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Asset not found"))?;
+            .ok_or_else(|| crate::Error::NotFound {
+                what: format!("asset {}", name),
+            })?;
 
         Ok(self.read_entity(*loc)?)
     }
@@ -292,7 +309,7 @@ impl Importer for KfxImporter {
 
 impl KfxImporter {
     /// Create an importer from a ByteSource.
-    pub fn from_source(source: Arc<dyn ByteSource>) -> io::Result<Self> {
+    pub fn from_source(source: Arc<dyn ByteSource>) -> crate::Result<Self> {
         // Read and parse container header (18 bytes)
         let header_data = source.read_at(0, 18)?;
         let header = parse_container_header(&header_data)?;

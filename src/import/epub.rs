@@ -13,6 +13,15 @@ use crate::import::{ChapterId, Importer, SpineEntry, resolve_path_based_href};
 use crate::io::{ByteSource, ByteSourceCursor, FileSource};
 use crate::model::{AnchorTarget, Chapter, GlobalNodeId, Landmark, Metadata, TocEntry};
 
+impl From<zip::result::ZipError> for crate::Error {
+    fn from(e: zip::result::ZipError) -> Self {
+        crate::Error::Malformed {
+            format: crate::Format::Epub,
+            context: e.to_string(),
+        }
+    }
+}
+
 /// EPUB format importer with random-access ZIP reading.
 pub struct EpubImporter {
     /// Random-access byte source for the ZIP file.
@@ -62,7 +71,7 @@ impl Importer for EpubImporter {
     fn open(path: &Path) -> crate::Result<Self> {
         let file = std::fs::File::open(path)?;
         let source = Arc::new(FileSource::new(file)?);
-        Ok(Self::from_source(source)?)
+        Self::from_source(source)
     }
 
     fn metadata(&self) -> &Metadata {
@@ -90,12 +99,12 @@ impl Importer for EpubImporter {
     }
 
     fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
-        let path = self.spine_paths.get(id.0 as usize).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Chapter ID {} not found", id.0),
-            )
-        })?;
+        let path = self
+            .spine_paths
+            .get(id.0 as usize)
+            .ok_or_else(|| crate::Error::NotFound {
+                what: format!("chapter {}", id.0),
+            })?;
         Ok(self.read_entry(path)?)
     }
 
@@ -154,7 +163,7 @@ impl Importer for EpubImporter {
 
 impl EpubImporter {
     /// Create an importer from a ByteSource.
-    pub fn from_source(source: Arc<dyn ByteSource>) -> io::Result<Self> {
+    pub fn from_source(source: Arc<dyn ByteSource>) -> crate::Result<Self> {
         // 1. Scan ZIP central directory and cache entry locations
         let cursor = ByteSourceCursor::new(source.clone());
         let mut archive = ZipArchive::new(cursor)?;

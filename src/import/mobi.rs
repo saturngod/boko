@@ -71,7 +71,7 @@ impl Importer for MobiImporter {
     fn open(path: &Path) -> crate::Result<Self> {
         let file = std::fs::File::open(path)?;
         let source = Arc::new(FileSource::new(file)?);
-        Ok(Self::from_source(source)?)
+        Self::from_source(source)
     }
 
     fn metadata(&self) -> &Metadata {
@@ -122,11 +122,8 @@ impl Importer for MobiImporter {
             .or_else(|| key.strip_prefix("fonts/font_"))
             .and_then(|s| s.split('.').next())
             .and_then(|s| s.parse().ok())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("Invalid asset path: {}", key),
-                )
+            .ok_or_else(|| crate::Error::NotFound {
+                what: format!("asset {}", key),
             })?;
 
         Ok(self.load_image_record(idx)?)
@@ -183,16 +180,16 @@ impl MobiImporter {
     /// Create an importer from a ByteSource.
     ///
     /// Text is extracted eagerly to determine chapter boundaries for the spine.
-    pub fn from_source(source: Arc<dyn ByteSource>) -> io::Result<Self> {
+    pub fn from_source(source: Arc<dyn ByteSource>) -> crate::Result<Self> {
         let file_len = source.len();
 
         // Read PDB header
         let header_start = source.read_at(0, 78)?;
         if header_start.len() < 78 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "File too short for PDB header",
-            ));
+            return Err(crate::Error::Malformed {
+                format: crate::Format::Mobi,
+                context: "file too short for PDB header".into(),
+            });
         }
 
         let num_records = u16::from_be_bytes([header_start[76], header_start[77]]) as usize;
@@ -201,10 +198,10 @@ impl MobiImporter {
         let (pdb, _) = PdbInfo::parse(&header_bytes)?;
 
         if pdb.num_records < 2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Not enough records",
-            ));
+            return Err(crate::Error::Malformed {
+                format: crate::Format::Mobi,
+                context: "not enough PDB records".into(),
+            });
         }
 
         // Read record 0 (MOBI header)
@@ -213,10 +210,7 @@ impl MobiImporter {
         let mobi = MobiHeader::parse(&record0)?;
 
         if mobi.encryption != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Encrypted files are not supported",
-            ));
+            return Err(crate::Error::DrmProtected(crate::Format::Mobi));
         }
 
         // Parse EXTH metadata

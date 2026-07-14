@@ -226,11 +226,8 @@ impl Book {
     /// Open an ebook file, auto-detecting the format.
     pub fn open(path: impl AsRef<Path>) -> crate::Result<Self> {
         let path = path.as_ref();
-        let format = Format::from_path(path).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unknown file format: {}", path.display()),
-            )
+        let format = Format::from_path(path).ok_or_else(|| crate::Error::UnsupportedFormat {
+            detail: format!("unknown file format: {}", path.display()),
         })?;
         Self::open_format(path, format)
     }

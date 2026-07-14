@@ -1,6 +1,6 @@
 [package]
 name = "boko"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Fast ebook conversion library for EPUB and Kindle formats"
 license = "GPL-3.0-or-later"
