@@ -28,11 +28,12 @@ pub fn bounded_inflate(
     claimed_len: u64,
     hard_cap: usize,
 ) -> io::Result<Vec<u8>> {
-    // Clamp the up-front reservation: never trust `claimed_len`, and never
-    // reserve more than the cap or a modest multiple of the input.
-    let reserve = claimed_len
-        .min(hard_cap as u64)
-        .min(compressed.len().saturating_mul(8) as u64) as usize;
+    // Reserve the claimed size so a normal entry allocates once, but cap the
+    // up-front reservation so a lying header can't trigger a giant allocation
+    // (the `take` below is the real bomb guard; anything past the reservation
+    // just grows the Vec as needed).
+    const MAX_RESERVE: u64 = 16 * 1024 * 1024;
+    let reserve = claimed_len.min(hard_cap as u64).min(MAX_RESERVE) as usize;
     let mut out = Vec::with_capacity(reserve);
     let mut reader =
         flate2::read::DeflateDecoder::new(compressed).take(hard_cap as u64 + 1);
