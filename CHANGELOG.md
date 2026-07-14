@@ -84,6 +84,16 @@ refactor. It contains breaking changes to the public API.
 - A diverse synthetic EPUB test corpus with roundtrip invariants, and
   `tests/error_classification.rs` locking in the error-variant guarantees.
 
+### Contributors
+
+Thanks to [@Imaclean74](https://github.com/Imaclean74) for the embedded-font
+and format-compatibility work in this release:
+
+- Decode Kindle `FONT` container records for AZW3/MOBI font extraction (#21)
+- EPUB export: resolve TOC fragments and write embedded font assets (#23)
+- Strip top-level Ion annotations so annotated KFX entities parse (#19)
+- Recognize the `.azw` extension as MOBI (#18)
+
 ## [0.3.0]
 
 - GPL-3.0-or-later license; KFX-first README.
