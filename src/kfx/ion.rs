@@ -699,7 +699,13 @@ impl IonWriter {
 
         // Convert to coefficient and exponent with precision 6
         // (matches Kindle Previewer output like 0.833333)
-        let mut coef = (val * 1_000_000.0).round() as i64;
+        //
+        // The float→int cast saturates; i64::MIN's magnitude is 2^63, whose
+        // signed-Int encoding needs 9 bytes — more than the reader accepts —
+        // so the writer would emit bytes its own parser rejects (found by the
+        // ion_roundtrip fuzz target). Clamp to MIN+1 (magnitude 2^63-1, 8
+        // bytes); the one-ulp precision loss is meaningless at 9.2e12.
+        let mut coef = ((val * 1_000_000.0).round() as i64).max(i64::MIN + 1);
         let mut exp: i8 = -6;
 
         // Normalize: remove trailing zeros
