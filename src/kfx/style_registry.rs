@@ -293,9 +293,13 @@ impl StyleRegistry {
         )]);
         result.push(("s0".to_string(), default_ion));
 
-        // Then all registered styles
-        // Each bucket holds one or more (style_id, name_symbol, computed_style).
-        for (style_id, name_symbol, style) in self.styles.drain().flat_map(|(_, v)| v) {
+        // Then all registered styles. Sort by style_id so the emitted fragment
+        // order is deterministic across runs (HashMap drain order is not),
+        // which keeps KFX output byte-for-byte reproducible.
+        let mut styles: Vec<(u64, u64, ComputedStyle)> =
+            self.styles.drain().flat_map(|(_, v)| v).collect();
+        styles.sort_by_key(|(style_id, _, _)| *style_id);
+        for (style_id, name_symbol, style) in styles {
             let ion = style.to_ion(name_symbol);
             // Use style_id for the fragment name (e.g., "s1", "s2", "sA")
             let name = format!("s{:X}", style_id);
