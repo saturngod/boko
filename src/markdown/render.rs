@@ -61,6 +61,9 @@ pub struct RenderContext<'a> {
     last_block_role: Option<Role>,
     // Current recursion depth, to bound stack usage on hostile trees.
     depth: usize,
+    // Number of footnotes emitted by earlier chapters, so labels stay unique
+    // once chapters are concatenated into one markdown document.
+    footnote_start: usize,
 }
 
 impl<'a> RenderContext<'a> {
@@ -70,6 +73,7 @@ impl<'a> RenderContext<'a> {
         chapter_id: ChapterId,
         resolved: &'a ResolvedLinks,
         heading_slugs: &'a HashMap<GlobalNodeId, String>,
+        footnote_start: usize,
     ) -> Self {
         Self {
             chapter,
@@ -85,6 +89,7 @@ impl<'a> RenderContext<'a> {
             pending_newline: false,
             last_block_role: None,
             depth: 0,
+            footnote_start,
         }
     }
 
@@ -410,21 +415,36 @@ impl<'a> RenderContext<'a> {
 
             Role::Table => {
                 self.start_block();
-                self.walk_children(id);
+                let rows: Vec<NodeId> = self.chapter.children(id).collect();
+                for (i, row_id) in rows.iter().enumerate() {
+                    let cells = self.table_cells(*row_id);
+                    self.ensure_line_started();
+                    self.output.push_str("| ");
+                    self.output.push_str(&cells.join(" | "));
+                    self.output.push_str(" |");
+                    self.write_newline();
+                    // GFM requires a delimiter row after the header so parsers
+                    // recognize the block as a table rather than plain text.
+                    if i == 0 {
+                        self.ensure_line_started();
+                        self.output.push('|');
+                        for _ in 0..cells.len().max(1) {
+                            self.output.push_str(" --- |");
+                        }
+                        self.write_newline();
+                    }
+                }
                 self.end_block(role);
             }
 
             Role::TableRow => {
+                // Reached only for a stray row outside a Table; render the cells
+                // as a GFM row (escaped) without a delimiter.
+                let cells = self.table_cells(id);
                 self.ensure_line_started();
-                let mut first = true;
-                for child_id in self.chapter.children(id) {
-                    if !first {
-                        self.output.push_str(" | ");
-                    }
-                    first = false;
-                    let text = self.collect_text(child_id);
-                    self.output.push_str(&text);
-                }
+                self.output.push_str("| ");
+                self.output.push_str(&cells.join(" | "));
+                self.output.push_str(" |");
                 self.write_newline();
             }
 
@@ -449,7 +469,7 @@ impl<'a> RenderContext<'a> {
             Role::Footnote => {
                 self.ensure_line_started();
                 let text = self.collect_text(id);
-                let note_num = self.footnotes.len() + 1;
+                let note_num = self.footnote_start + self.footnotes.len() + 1;
                 self.footnotes.push(Footnote {
                     number: note_num,
                     content: text,
@@ -573,6 +593,20 @@ impl<'a> RenderContext<'a> {
         }
     }
 
+    /// Collect the cell texts of a table row, escaped for a GFM table cell
+    /// (pipes escaped, newlines flattened to spaces).
+    fn table_cells(&mut self, row_id: NodeId) -> Vec<String> {
+        let cell_ids: Vec<NodeId> = self.chapter.children(row_id).collect();
+        cell_ids
+            .into_iter()
+            .map(|cell| {
+                self.collect_text(cell)
+                    .replace('|', "\\|")
+                    .replace('\n', " ")
+            })
+            .collect()
+    }
+
     fn walk_children(&mut self, id: NodeId) {
         // Bound recursion depth: a hostile chapter can nest arbitrarily deep.
         // All descent flows through here, so guarding this one site suffices.
@@ -688,8 +722,9 @@ pub fn render_chapter(
     chapter_id: ChapterId,
     resolved: &ResolvedLinks,
     heading_slugs: &HashMap<GlobalNodeId, String>,
+    footnote_start: usize,
 ) -> RenderResult {
-    let ctx = RenderContext::new(chapter, chapter_id, resolved, heading_slugs);
+    let ctx = RenderContext::new(chapter, chapter_id, resolved, heading_slugs, footnote_start);
     ctx.render()
 }
 
@@ -701,7 +736,7 @@ mod tests {
     fn render_to_string(chapter: &Chapter) -> String {
         let resolved = ResolvedLinks::default();
         let heading_slugs = HashMap::new();
-        let result = render_chapter(chapter, ChapterId(0), &resolved, &heading_slugs);
+        let result = render_chapter(chapter, ChapterId(0), &resolved, &heading_slugs, 0);
         result.content
     }
 
@@ -794,12 +829,56 @@ mod tests {
 
         let resolved = ResolvedLinks::default();
         let heading_slugs = HashMap::new();
-        let result = render_chapter(&chapter, ChapterId(0), &resolved, &heading_slugs);
+        let result = render_chapter(&chapter, ChapterId(0), &resolved, &heading_slugs, 0);
 
         assert!(result.content.contains("[^1]"));
         assert_eq!(result.footnotes.len(), 1);
         assert_eq!(result.footnotes[0].number, 1);
         assert_eq!(result.footnotes[0].content, "This is a footnote");
+    }
+
+    #[test]
+    fn footnote_numbering_honors_start_offset() {
+        let mut chapter = Chapter::new();
+        let p = chapter.alloc_node(Node::new(Role::Paragraph));
+        chapter.append_child(NodeId::ROOT, p);
+        let note = chapter.alloc_node(Node::new(Role::Footnote));
+        chapter.append_child(p, note);
+        let t = chapter.append_text("note");
+        let tn = chapter.alloc_node(Node::text(t));
+        chapter.append_child(note, tn);
+
+        let resolved = ResolvedLinks::default();
+        let heading_slugs = HashMap::new();
+        // Simulate two earlier chapters' footnotes: this one starts at 3.
+        let result = render_chapter(&chapter, ChapterId(0), &resolved, &heading_slugs, 2);
+        assert!(result.content.contains("[^3]"));
+        assert_eq!(result.footnotes[0].number, 3);
+    }
+
+    #[test]
+    fn table_emits_gfm_delimiter_and_escapes_pipes() {
+        let mut chapter = Chapter::new();
+        let table = chapter.alloc_node(Node::new(Role::Table));
+        chapter.append_child(NodeId::ROOT, table);
+        for cells in [["A", "B|C"], ["1", "2"]] {
+            let row = chapter.alloc_node(Node::new(Role::TableRow));
+            chapter.append_child(table, row);
+            for cell in cells {
+                let c = chapter.alloc_node(Node::new(Role::TableCell));
+                chapter.append_child(row, c);
+                let t = chapter.append_text(cell);
+                let tn = chapter.alloc_node(Node::text(t));
+                chapter.append_child(c, tn);
+            }
+        }
+
+        let resolved = ResolvedLinks::default();
+        let heading_slugs = HashMap::new();
+        let out = render_chapter(&chapter, ChapterId(0), &resolved, &heading_slugs, 0).content;
+        assert!(out.contains("| A | B\\|C |"), "header + escaped pipe: {out}");
+        assert!(out.contains("| --- | --- |"), "delimiter row: {out}");
+        assert!(out.contains("| 1 | 2 |"), "body row: {out}");
     }
 
     #[test]

@@ -55,6 +55,9 @@ impl Exporter for MarkdownExporter {
 
         // 3. Render each chapter (pure) and write (I/O)
         let mut first = true;
+        // Running footnote count so labels stay unique across the concatenated
+        // chapters (each chapter otherwise numbers its own from 1).
+        let mut footnote_total = 0;
         for (chapter_id, chapter) in &chapters {
             if !first {
                 // Chapter separator
@@ -65,7 +68,8 @@ impl Exporter for MarkdownExporter {
             first = false;
 
             // Pure rendering
-            let result = render_chapter(chapter, *chapter_id, &resolved, &heading_slugs);
+            let result = render_chapter(chapter, *chapter_id, &resolved, &heading_slugs, footnote_total);
+            footnote_total += result.footnotes.len();
 
             // I/O: write content
             write!(writer, "{}", result.content)?;
