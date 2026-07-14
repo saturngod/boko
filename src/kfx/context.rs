@@ -625,6 +625,11 @@ pub struct ExportContext {
     /// Style registry for deduplicating and tracking KFX styles.
     pub style_registry: StyleRegistry,
 
+    /// Memo for `register_style_id`: chapter-local StyleId → KFX style symbol.
+    /// StyleIds are only meaningful within one chapter's StylePool, so this
+    /// is cleared by `begin_chapter`.
+    ir_style_memo: HashMap<StyleId, u64>,
+
     /// Anchor registry for link target resolution.
     pub anchor_registry: AnchorRegistry,
 
@@ -716,6 +721,7 @@ impl ExportContext {
             path_to_fragment: HashMap::new(),
             default_style_symbol,
             style_registry: StyleRegistry::new(default_style_symbol),
+            ir_style_memo: HashMap::new(),
             anchor_registry: AnchorRegistry::new(),
             landmark_fragments: HashMap::new(),
             nav_container_symbols: NavContainerSymbols::default(),
@@ -742,6 +748,7 @@ impl ExportContext {
     /// Prepare context for processing a new chapter.
     pub fn begin_chapter(&mut self, content_name: &str) -> u64 {
         self.text_accumulator = TextAccumulator::new();
+        self.ir_style_memo.clear();
         self.current_content_name = self.symbols.get_or_intern(content_name);
         self.current_content_name
     }
@@ -811,11 +818,17 @@ impl ExportContext {
             return self.default_style_symbol;
         }
 
-        if let Some(ir_style) = style_pool.get(style_id) {
+        if let Some(&symbol) = self.ir_style_memo.get(&style_id) {
+            return symbol;
+        }
+
+        let symbol = if let Some(ir_style) = style_pool.get(style_id) {
             self.register_ir_style(ir_style)
         } else {
             self.default_style_symbol
-        }
+        };
+        self.ir_style_memo.insert(style_id, symbol);
+        symbol
     }
 
     // =========================================================================
