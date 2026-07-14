@@ -10,6 +10,9 @@ documentation = "https://docs.rs/boko"
 readme = "README.md"
 keywords = ["ebook", "epub", "mobi", "azw3", "kindle"]
 categories = ["parsing", "encoding"]
+# Test fixtures (binary ebooks) and the fuzz harness are only needed to develop
+# boko, not to build it — keep them out of the published crate.
+exclude = ["/tests/fixtures", "/fuzz"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
