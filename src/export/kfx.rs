@@ -97,13 +97,15 @@ fn build_kfx_container(book: &mut Book) -> io::Result<Vec<u8>> {
     let standalone_cover_path: Option<String> = match (cover_image, first_chapter_id) {
         (Some(cover_img), Some(first_id)) => {
             let normalized = normalize_cover_path(&cover_img, &asset_paths);
-            book.load_chapter(first_id).ok().and_then(|first_chapter| {
-                if needs_standalone_cover(&normalized, &first_chapter) {
-                    Some(normalized)
-                } else {
-                    None
-                }
-            })
+            book.load_chapter_cached(first_id)
+                .ok()
+                .and_then(|first_chapter| {
+                    if needs_standalone_cover(&normalized, &first_chapter) {
+                        Some(normalized)
+                    } else {
+                        None
+                    }
+                })
         }
         _ => None,
     };
@@ -171,7 +173,7 @@ fn build_kfx_container(book: &mut Book) -> io::Result<Vec<u8>> {
         }
 
         // Load and survey chapter
-        if let Ok(chapter) = book.load_chapter(*chapter_id) {
+        if let Ok(chapter) = book.load_chapter_cached(*chapter_id) {
             survey_chapter(&chapter, *chapter_id, &source_path, &mut ctx);
         }
     }
@@ -188,7 +190,7 @@ fn build_kfx_container(book: &mut Book) -> io::Result<Vec<u8>> {
 
     if !has_cover || !has_srl {
         for (chapter_id, _section_name) in &spine_info {
-            if let Ok(chapter) = book.load_chapter(*chapter_id) {
+            if let Ok(chapter) = book.load_chapter_cached(*chapter_id) {
                 let is_cover = is_image_only_chapter(&chapter);
                 let fragment_id = ctx.chapter_fragments.get(chapter_id).copied();
 
@@ -312,7 +314,7 @@ fn build_kfx_container(book: &mut Book) -> io::Result<Vec<u8>> {
     }
 
     for (chapter_id, section_name) in &spine_info {
-        if let Ok(chapter) = book.load_chapter(*chapter_id) {
+        if let Ok(chapter) = book.load_chapter_cached(*chapter_id) {
             // Set up chapter-start anchor before generating content
             ctx.begin_chapter_export(*chapter_id);
 
@@ -510,7 +512,7 @@ fn register_link_targets(
     ctx: &mut ExportContext,
 ) -> io::Result<()> {
     for (chapter_id, _) in spine_info {
-        let chapter = book.load_chapter(*chapter_id)?;
+        let chapter = book.load_chapter_cached(*chapter_id)?;
         register_chapter_link_targets(&chapter, *chapter_id, resolved, ctx);
     }
     Ok(())
