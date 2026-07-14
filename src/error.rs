@@ -78,13 +78,17 @@ impl From<std::io::Error> for Error {
 /// Compat shim: lets callers that still want `io::Result` convert back.
 impl From<Error> for std::io::Error {
     fn from(e: Error) -> Self {
+        // Explicit arms (no `_`) so a new variant forces a decision here.
         match e {
             Error::Io(io) => io,
             Error::NotFound { .. } => std::io::Error::new(std::io::ErrorKind::NotFound, e),
             Error::UnsupportedFormat { .. } => {
                 std::io::Error::new(std::io::ErrorKind::Unsupported, e)
             }
-            _ => std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+            Error::DrmProtected(_) => {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
+            }
+            Error::Malformed { .. } => std::io::Error::new(std::io::ErrorKind::InvalidData, e),
         }
     }
 }
@@ -116,6 +120,13 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
 
         let err: std::io::Error = Error::DrmProtected(Format::Azw3).into();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let err: std::io::Error = Error::Malformed {
+            format: Format::Kfx,
+            context: "bad".into(),
+        }
+        .into();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 

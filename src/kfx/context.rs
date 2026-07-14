@@ -745,6 +745,15 @@ impl ExportContext {
             .insert(short_name.to_string());
     }
 
+    /// Reset the per-chapter StyleId → style-symbol memo.
+    ///
+    /// The memo is keyed by chapter-local `StyleId`, which is only meaningful
+    /// within a single chapter's `StylePool`. Call this whenever the active
+    /// chapter (and thus pool) changes, before registering its styles.
+    pub fn reset_style_memo(&mut self) {
+        self.ir_style_memo.clear();
+    }
+
     /// Prepare context for processing a new chapter.
     pub fn begin_chapter(&mut self, content_name: &str) -> u64 {
         self.text_accumulator = TextAccumulator::new();

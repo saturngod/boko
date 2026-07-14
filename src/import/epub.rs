@@ -15,9 +15,15 @@ use crate::model::{AnchorTarget, Chapter, GlobalNodeId, Landmark, Metadata, TocE
 
 impl From<zip::result::ZipError> for crate::Error {
     fn from(e: zip::result::ZipError) -> Self {
-        crate::Error::Malformed {
-            format: crate::Format::Epub,
-            context: e.to_string(),
+        // A genuine I/O failure while reading the archive is not a malformed
+        // book — preserve it (and its ErrorKind) as Error::Io. Only structural
+        // ZIP problems become Malformed.
+        match e {
+            zip::result::ZipError::Io(io) => crate::Error::Io(io),
+            other => crate::Error::Malformed {
+                format: crate::Format::Epub,
+                context: other.to_string(),
+            },
         }
     }
 }

@@ -24,6 +24,13 @@ pub fn ir_to_tokens(chapter: &Chapter, ctx: &mut ExportContext) -> TokenStream {
     let sch = schema();
     let mut stream = TokenStream::new();
 
+    // The style memo is keyed by chapter-local StyleId; this chapter's pool is
+    // about to be the one in scope, so drop any prior chapter's entries. The
+    // shipped export path also clears via begin_chapter, but clearing here
+    // keeps the public build_storyline_ion/ir_to_tokens entry points safe when
+    // one ExportContext is reused across chapters.
+    ctx.reset_style_memo();
+
     walk_node_for_export(chapter, chapter.root(), sch, ctx, &mut stream);
     stream
 }

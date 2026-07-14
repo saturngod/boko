@@ -229,11 +229,14 @@ impl<'a> selectors::Element for ElementRef<'a> {
         // Key on the arena node, not on this transient ElementRef: the
         // selectors caches are shared across elements, and successive
         // ElementRefs occupy the same stack slot, which would alias
-        // distinct elements to one cache key.
-        match self.dom.get(self.id) {
-            Some(node) => OpaqueElement::new(node),
-            None => OpaqueElement::new(self),
-        }
+        // distinct elements to one cache key. A missing node would silently
+        // reintroduce that aliasing, so fail loudly instead — every
+        // ElementRef in the cascade comes from a live arena traversal.
+        let node = self
+            .dom
+            .get(self.id)
+            .expect("ElementRef id must reference a live arena node");
+        OpaqueElement::new(node)
     }
 
     fn parent_element(&self) -> Option<Self> {
