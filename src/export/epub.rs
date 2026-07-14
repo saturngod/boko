@@ -120,6 +120,7 @@ impl EpubExporter {
                 id: id.clone(),
                 href: filename,
                 media_type: "application/xhtml+xml".to_string(),
+                properties: None,
             });
             spine_refs.push(id);
 
@@ -142,6 +143,7 @@ impl EpubExporter {
                 id: id.clone(),
                 href: href.clone(),
                 media_type,
+                properties: None,
             });
             asset_map.insert(path_str.to_string(), href);
         }
@@ -176,7 +178,8 @@ impl EpubExporter {
             let content = book.load_asset(asset_path)?;
             let zip_path = format!("OEBPS/{}", sanitize_path(&asset_path.to_string_lossy()));
 
-            zip.start_file(&zip_path, deflated).map_err(io_error)?;
+            let opts = asset_options(&zip_path, &content, stored, deflated);
+            zip.start_file(&zip_path, opts).map_err(io_error)?;
             zip.write_all(&content)?;
         }
 
@@ -234,6 +237,7 @@ impl EpubExporter {
                 id: "stylesheet".to_string(),
                 href: "OEBPS/style.css".to_string(),
                 media_type: "text/css".to_string(),
+                properties: None,
             });
         }
 
@@ -246,9 +250,18 @@ impl EpubExporter {
                 id: id.clone(),
                 href,
                 media_type: "application/xhtml+xml".to_string(),
+                properties: None,
             });
             spine_refs.push(id);
         }
+
+        // EPUB 3 requires exactly one manifest item with the `nav` property.
+        manifest_items.push(ManifestItem {
+            id: "nav".to_string(),
+            href: "OEBPS/nav.xhtml".to_string(),
+            media_type: "application/xhtml+xml".to_string(),
+            properties: Some("nav"),
+        });
 
         // Add assets to manifest (from normalized content)
         for (asset_idx, asset_path) in content.assets.iter().enumerate() {
@@ -260,6 +273,7 @@ impl EpubExporter {
                 id,
                 href,
                 media_type,
+                properties: None,
             });
         }
 
@@ -281,6 +295,7 @@ impl EpubExporter {
                 id: format!("font_{}", extra_font_idx),
                 href: format!("OEBPS/{}", sanitize_path(&path_str)),
                 media_type: guess_media_type(&path_str),
+                properties: None,
             });
             extra_font_idx += 1;
         }
@@ -291,11 +306,19 @@ impl EpubExporter {
             .map_err(io_error)?;
         zip.write_all(opf.as_bytes())?;
 
-        // 5. Write toc.ncx
-        let ncx = generate_ncx(book.metadata(), book.toc());
+        // 5. Write toc.ncx. Rewrite the TOC hrefs (original source paths / bare
+        // `#anchor`s) to the emitted chapter files so navigation resolves.
+        let rewritten_toc = content.rewrite_toc(book.toc());
+        let ncx = generate_ncx(book.metadata(), &rewritten_toc);
         zip.start_file("OEBPS/toc.ncx", deflated)
             .map_err(io_error)?;
         zip.write_all(ncx.as_bytes())?;
+
+        // 5b. Write the EPUB 3 nav document (same TOC, XHTML form).
+        let nav = generate_nav(&book.metadata().title, &rewritten_toc);
+        zip.start_file("OEBPS/nav.xhtml", deflated)
+            .map_err(io_error)?;
+        zip.write_all(nav.as_bytes())?;
 
         // 6. Write unified stylesheet
         if !content.css.is_empty() {
@@ -317,7 +340,8 @@ impl EpubExporter {
 
             // Try to load the asset from the book
             if let Ok(data) = book.load_asset(std::path::Path::new(asset_path)) {
-                zip.start_file(&zip_path, deflated).map_err(io_error)?;
+                let opts = asset_options(&zip_path, &data, stored, deflated);
+                zip.start_file(&zip_path, opts).map_err(io_error)?;
                 zip.write_all(&data)?;
             }
         }
@@ -334,7 +358,8 @@ impl EpubExporter {
             }
             let zip_path = format!("OEBPS/{}", sanitize_path(&path_str));
             if let Ok(data) = book.load_asset(asset_path) {
-                zip.start_file(&zip_path, deflated).map_err(io_error)?;
+                let opts = asset_options(&zip_path, &data, stored, deflated);
+                zip.start_file(&zip_path, opts).map_err(io_error)?;
                 zip.write_all(&data)?;
             }
         }
@@ -362,6 +387,25 @@ struct ManifestItem {
     id: String,
     href: String,
     media_type: String,
+    /// Optional OPF `properties` (e.g. `nav`, `cover-image`).
+    properties: Option<&'static str>,
+}
+
+/// Pick a ZIP compression method for an asset. Images and fonts are already
+/// entropy-coded, so re-deflating them burns CPU for ~0% size gain (the
+/// dominant cost of exporting an image-heavy book) — store them uncompressed.
+fn asset_options(
+    path: &str,
+    data: &[u8],
+    stored: SimpleFileOptions,
+    deflated: SimpleFileOptions,
+) -> SimpleFileOptions {
+    let fmt = crate::util::detect_media_format(path, data);
+    if fmt.is_image() || fmt.is_font() {
+        stored
+    } else {
+        deflated
+    }
 }
 
 /// Generate content.opf from metadata and manifest.
@@ -548,11 +592,16 @@ fn generate_opf(
     for item in manifest {
         // Get relative path from OEBPS/
         let href = item.href.strip_prefix("OEBPS/").unwrap_or(&item.href);
+        let properties = match item.properties {
+            Some(p) => format!(" properties=\"{p}\""),
+            None => String::new(),
+        };
         opf.push_str(&format!(
-            "    <item id=\"{}\" href=\"{}\" media-type=\"{}\"/>\n",
+            "    <item id=\"{}\" href=\"{}\" media-type=\"{}\"{}/>\n",
             escape_xml(&item.id),
             escape_xml(href),
-            escape_xml(&item.media_type)
+            escape_xml(&item.media_type),
+            properties,
         ));
     }
     opf.push_str("  </manifest>\n");
@@ -606,6 +655,11 @@ fn generate_ncx(metadata: &crate::model::Metadata, toc: &[TocEntry]) -> String {
 
 /// Recursively write navPoint elements.
 fn write_nav_points(ncx: &mut String, entries: &[TocEntry], play_order: &mut usize, indent: usize) {
+    // `indent` grows one per nesting level; cap it so a pathologically deep TOC
+    // can't overflow the stack during export.
+    if indent > crate::util::MAX_TREE_DEPTH {
+        return;
+    }
     let indent_str = "  ".repeat(indent);
 
     for entry in entries {
@@ -632,6 +686,60 @@ fn write_nav_points(ncx: &mut String, entries: &[TocEntry], play_order: &mut usi
 
         ncx.push_str(&format!("{}</navPoint>\n", indent_str));
     }
+}
+
+/// Generate the EPUB 3 nav document (`nav.xhtml`) from TOC entries.
+fn generate_nav(title: &str, toc: &[TocEntry]) -> String {
+    let mut doc = String::new();
+    doc.push_str(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE html>\n\
+         <html xmlns=\"http://www.w3.org/1999/xhtml\" xmlns:epub=\"http://www.idpf.org/2007/ops\">\n\
+         <head>\n  <meta charset=\"utf-8\"/>\n  <title>",
+    );
+    doc.push_str(&escape_xml(title));
+    doc.push_str("</title>\n</head>\n<body>\n  <nav epub:type=\"toc\" id=\"toc\">\n");
+    if !toc.is_empty() {
+        write_nav_list(&mut doc, toc, 2);
+    }
+    doc.push_str("  </nav>\n</body>\n</html>\n");
+    doc
+}
+
+fn write_nav_list(doc: &mut String, entries: &[TocEntry], indent: usize) {
+    if indent > crate::util::MAX_TREE_DEPTH {
+        return;
+    }
+    let pad = "  ".repeat(indent);
+    doc.push_str(&pad);
+    doc.push_str("<ol>\n");
+    for entry in entries {
+        doc.push_str(&pad);
+        doc.push_str("  <li>");
+        // The nav spec requires a resolvable target; entries without one use a
+        // <span> label instead of an empty-href <a>.
+        if entry.href.is_empty() {
+            doc.push_str("<span>");
+            doc.push_str(&escape_xml(&entry.title));
+            doc.push_str("</span>");
+        } else {
+            doc.push_str("<a href=\"");
+            doc.push_str(&escape_xml(&entry.href));
+            doc.push_str("\">");
+            doc.push_str(&escape_xml(&entry.title));
+            doc.push_str("</a>");
+        }
+        if entry.children.is_empty() {
+            doc.push_str("</li>\n");
+        } else {
+            doc.push('\n');
+            write_nav_list(doc, &entry.children, indent + 2);
+            doc.push_str(&pad);
+            doc.push_str("  </li>\n");
+        }
+    }
+    doc.push_str(&pad);
+    doc.push_str("</ol>\n");
 }
 
 /// Escape XML special characters.

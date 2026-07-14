@@ -24,11 +24,9 @@ fn load_sample_content() -> (String, Stylesheet) {
         .iter()
         .find(|e| {
             book.source_id(e.id)
-                .map(|s| s.contains("enchiridion"))
-                .unwrap_or(false)
+                .is_some_and(|s| s.contains("enchiridion"))
         })
-        .map(|e| e.id)
-        .unwrap_or(spine[0].id);
+        .map_or(spine[0].id, |e| e.id);
 
     let html_bytes = book.load_raw(chapter_id).unwrap();
     let html = String::from_utf8_lossy(&html_bytes).into_owned();
@@ -106,7 +104,7 @@ fn build_synthetic_epub(chapters: usize) -> Vec<u8> {
             i + 1,
             body
         );
-        zip.start_file(format!("OEBPS/chapter_{}.xhtml", i), deflated)
+        zip.start_file(format!("OEBPS/chapter_{i}.xhtml"), deflated)
             .unwrap();
         zip.write_all(doc.as_bytes()).unwrap();
 

@@ -201,26 +201,22 @@ fn find_pagebreaks(body: &[u8]) -> Vec<PagebreakPos> {
     let body_lower: Vec<u8> = body.iter().map(|b| b.to_ascii_lowercase()).collect();
     let needle = b"<mbp:pagebreak";
 
-    let mut pos = 0;
-    while pos + needle.len() < body_lower.len() {
-        if let Some(rel) = body_lower[pos..]
-            .windows(needle.len())
-            .position(|w| w == needle)
-        {
-            let tag_start = pos + rel;
-            // Find the closing > for this tag
-            if let Some(close_rel) = body[tag_start..].iter().position(|&b| b == b'>') {
-                let tag_end = tag_start + close_rel + 1;
-                results.push(PagebreakPos {
-                    start: tag_start,
-                    end: tag_end,
-                });
-                pos = tag_end;
-            } else {
-                pos = tag_start + needle.len();
-            }
+    // SIMD substring search over the lowercased body (needed for the
+    // case-insensitive match), plus memchr for the tag's closing `>`, instead
+    // of a byte-by-byte `windows().position()` scan.
+    let mut search_from = 0;
+    while let Some(rel) = memchr::memmem::find(&body_lower[search_from..], needle) {
+        let tag_start = search_from + rel;
+        // Find the closing > for this tag.
+        if let Some(close_rel) = memchr::memchr(b'>', &body[tag_start..]) {
+            let tag_end = tag_start + close_rel + 1;
+            results.push(PagebreakPos {
+                start: tag_start,
+                end: tag_end,
+            });
+            search_from = tag_end;
         } else {
-            break;
+            search_from = tag_start + needle.len();
         }
     }
 

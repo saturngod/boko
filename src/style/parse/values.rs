@@ -16,21 +16,12 @@ pub struct TextDecorationValue {
 pub(crate) fn parse_color(input: &mut Parser<'_, '_>) -> Option<Color> {
     // Try named colors first
     if let Ok(token) = input.try_parse(|i| i.expect_ident_cloned()) {
-        let color = match token.as_ref() {
-            "black" => Color::BLACK,
-            "white" => Color::WHITE,
-            "red" => Color::rgb(255, 0, 0),
-            "green" => Color::rgb(0, 128, 0),
-            "blue" => Color::rgb(0, 0, 255),
-            "yellow" => Color::rgb(255, 255, 0),
-            "cyan" => Color::rgb(0, 255, 255),
-            "magenta" => Color::rgb(255, 0, 255),
-            "gray" | "grey" => Color::rgb(128, 128, 128),
-            "transparent" => Color::TRANSPARENT,
-            // Skip inherit/initial/unset for now
-            _ => return None,
-        };
-        return Some(color);
+        if let Some(color) = named_color(&token.to_ascii_lowercase()) {
+            return Some(color);
+        }
+        // Not a recognized color keyword (e.g. inherit/initial/unset): fall
+        // through so the caller can decide, rather than treating it as a color.
+        return None;
     }
 
     // Try ID token (which is how cssparser parses hex colors like #ff0000)
@@ -169,16 +160,98 @@ fn parse_hex_color(hex: &str) -> Option<Color> {
     }
 }
 
+/// Look up a CSS named color. Names are matched lowercase.
+fn named_color(name: &str) -> Option<Color> {
+    let (r, g, b) = match name {
+        "transparent" => return Some(Color::TRANSPARENT),
+        "black" => (0, 0, 0),
+        "silver" => (192, 192, 192),
+        "gray" | "grey" => (128, 128, 128),
+        "white" => (255, 255, 255),
+        "maroon" => (128, 0, 0),
+        "red" => (255, 0, 0),
+        "purple" => (128, 0, 128),
+        "fuchsia" | "magenta" => (255, 0, 255),
+        "green" => (0, 128, 0),
+        "lime" => (0, 255, 0),
+        "olive" => (128, 128, 0),
+        "yellow" => (255, 255, 0),
+        "navy" => (0, 0, 128),
+        "blue" => (0, 0, 255),
+        "teal" => (0, 128, 128),
+        "aqua" | "cyan" => (0, 255, 255),
+        "orange" => (255, 165, 0),
+        "pink" => (255, 192, 203),
+        "brown" => (165, 42, 42),
+        "gold" => (255, 215, 0),
+        "indigo" => (75, 0, 130),
+        "violet" => (238, 130, 238),
+        "darkgray" | "darkgrey" => (169, 169, 169),
+        "lightgray" | "lightgrey" => (211, 211, 211),
+        "darkred" => (139, 0, 0),
+        "darkgreen" => (0, 100, 0),
+        "darkblue" => (0, 0, 139),
+        "lightblue" => (173, 216, 230),
+        "darkorange" => (255, 140, 0),
+        "beige" => (245, 245, 220),
+        "ivory" => (255, 255, 240),
+        "khaki" => (240, 230, 140),
+        "salmon" => (250, 128, 114),
+        "crimson" => (220, 20, 60),
+        "coral" => (255, 127, 80),
+        "tan" => (210, 180, 140),
+        "turquoise" => (64, 224, 208),
+        "lavender" => (230, 230, 250),
+        "whitesmoke" => (245, 245, 245),
+        _ => return None,
+    };
+    Some(Color::rgb(r, g, b))
+}
+
+/// Parse an `rgb()` / `rgba()` color, accepting both comma-separated
+/// (`rgb(1, 2, 3)`) and modern space-separated (`rgb(1 2 3 / 0.5)`) syntaxes,
+/// with an optional alpha component.
 fn parse_rgb_function<'i, 't>(input: &mut Parser<'i, 't>) -> Result<Color, ParseError<'i, ()>> {
-    input.expect_function_matching("rgb")?;
+    let name = input.expect_function()?.clone();
+    if !name.eq_ignore_ascii_case("rgb") && !name.eq_ignore_ascii_case("rgba") {
+        return Err(input.new_custom_error(()));
+    }
     input.parse_nested_block(|input| {
         let r = parse_color_component(input)?;
-        input.expect_comma()?;
+        let comma = input.try_parse(|i| i.expect_comma()).is_ok();
         let g = parse_color_component(input)?;
-        input.expect_comma()?;
+        if comma {
+            input.expect_comma()?;
+        }
         let b = parse_color_component(input)?;
-        Ok(Color::rgb(r, g, b))
+
+        // Optional alpha, after a comma (legacy) or a slash (modern).
+        let a = if comma {
+            if input.try_parse(|i| i.expect_comma()).is_ok() {
+                parse_alpha_component(input)?
+            } else {
+                255
+            }
+        } else if input.try_parse(|i| i.expect_delim('/')).is_ok() {
+            parse_alpha_component(input)?
+        } else {
+            255
+        };
+        Ok(Color::rgba(r, g, b, a))
     })
+}
+
+/// Parse an alpha value: a number in `0.0..=1.0` or a percentage, mapped to
+/// `0..=255`.
+fn parse_alpha_component<'i, 't>(input: &mut Parser<'i, 't>) -> Result<u8, ParseError<'i, ()>> {
+    let location = input.current_source_location();
+    match input.next()? {
+        Token::Number { value, .. } => Ok((value * 255.0).round().clamp(0.0, 255.0) as u8),
+        Token::Percentage { unit_value, .. } => {
+            Ok((unit_value * 255.0).round().clamp(0.0, 255.0) as u8)
+        }
+        _ => Err(location.new_custom_error(())),
+    }
 }
 
 fn parse_color_component<'i, 't>(input: &mut Parser<'i, 't>) -> Result<u8, ParseError<'i, ()>> {
@@ -244,4 +317,26 @@ pub(crate) fn parse_text_decoration(input: &mut Parser<'_, '_>) -> Option<TextDe
         found = true;
     }
     if found { Some(result) } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cssparser::{Parser, ParserInput};
+
+    fn color(css: &str) -> Option<Color> {
+        let mut input = ParserInput::new(css);
+        parse_color(&mut Parser::new(&mut input))
+    }
+
+    #[test]
+    fn parses_rgba_and_extended_named_colors() {
+        assert_eq!(color("orange"), Some(Color::rgb(255, 165, 0)));
+        assert_eq!(color("PURPLE"), Some(Color::rgb(128, 0, 128)));
+        assert_eq!(color("rgba(10, 20, 30, 0.5)"), Some(Color::rgba(10, 20, 30, 128)));
+        // Modern space + slash-alpha syntax.
+        assert_eq!(color("rgb(1 2 3 / 50%)"), Some(Color::rgba(1, 2, 3, 128)));
+        // Non-color keywords are not treated as colors.
+        assert_eq!(color("inherit"), None);
+    }
 }

@@ -300,6 +300,28 @@ mod tests {
     use crate::model::Role;
 
     #[test]
+    fn deeply_nested_html_does_not_overflow_stack() {
+        // Deeply nested elements overflowed the stack in compile_html before the
+        // transform gained a depth cap. Run on a small (1 MiB) stack so a modest
+        // nesting depth is enough to blow it if the cap ever regresses — this
+        // keeps the test both sensitive and fast (html5ever's parse is O(depth²),
+        // so we deliberately avoid huge depths).
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let depth = 3000;
+                let mut html = String::from("<html><body>");
+                html.push_str(&"<div>".repeat(depth));
+                html.push_str("deep");
+                html.push_str(&"</div>".repeat(depth));
+                html.push_str("</body></html>");
+                compile_html(&html, &[]).node_count()
+            })
+            .unwrap();
+        assert!(handle.join().unwrap() > 0);
+    }
+
+    #[test]
     fn test_compile_simple_html() {
         let html = "<html><body><p>Test paragraph</p></body></html>";
         let chapter = compile_html(html, &[]);

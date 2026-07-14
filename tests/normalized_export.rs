@@ -156,11 +156,10 @@ fn test_normalize_book_emits_css_for_used_classes() {
     );
 
     for class_name in all_classes {
-        let needle = format!(".{}", class_name);
+        let needle = format!(".{class_name}");
         assert!(
             content.css.contains(&needle),
-            "CSS should contain rule for class {}",
-            class_name
+            "CSS should contain rule for class {class_name}"
         );
     }
 }

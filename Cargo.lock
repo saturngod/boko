@@ -162,6 +162,8 @@ dependencies = [
  "precomputed-hash",
  "proptest",
  "quick-xml",
+ "rayon",
+ "rustc-hash",
  "selectors",
  "serde",
  "serde_json",

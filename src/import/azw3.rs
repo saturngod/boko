@@ -237,7 +237,7 @@ impl Importer for Azw3Importer {
             .first()
             .copied()
             .unwrap_or((0, text.len()));
-        let html_text = &text[html_start..html_end.min(text.len())];
+        let html_text = flow_slice(text, html_start, html_end);
 
         // Build file_starts for find_nearest_id_fast
         let file_starts: Vec<(u32, u32)> = self
@@ -545,7 +545,7 @@ impl Azw3Importer {
             .first()
             .copied()
             .unwrap_or((0, text.len()));
-        let html_text = &text[html_start..html_end.min(text.len())];
+        let html_text = flow_slice(text, html_start, html_end);
 
         // Build all parts and return the requested one
         let parts = build_parts(html_text, &self.kf8.files, &self.kf8.elems);
@@ -657,7 +657,8 @@ fn detect_format(
     }
 
     if let Some(kf8_idx) = exth.as_ref().and_then(|e| e.kf8_boundary) {
-        let boundary_idx = kf8_idx as usize - 1;
+        // `kf8_idx` is an untrusted EXTH field; `- 1` would underflow at 0.
+        let boundary_idx = (kf8_idx as usize).wrapping_sub(1);
         if boundary_idx > 0 && boundary_idx < pdb.num_records as usize {
             let boundary = read_record(boundary_idx)?;
             if boundary.starts_with(b"BOUNDARY") {
@@ -710,6 +711,15 @@ fn build_metadata(
     }
 
     metadata
+}
+
+/// Clamp an FDST flow `(start, end)` range to the text buffer and return the
+/// slice. FDST offsets are untrusted and need not satisfy
+/// `start <= end <= len`, so slicing them directly can panic.
+fn flow_slice(text: &[u8], start: usize, end: usize) -> &[u8] {
+    let start = start.min(text.len());
+    let end = end.min(text.len());
+    if start <= end { &text[start..end] } else { &[] }
 }
 
 /// Build chapter parts by combining skeletons with div content.

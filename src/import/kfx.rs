@@ -483,7 +483,9 @@ impl KfxImporter {
                                     "description" => {
                                         self.metadata.description = Some(value.to_string())
                                     }
-                                    "book_id" => self.metadata.identifier = value.to_string(),
+                                    "book_id" | "content_id" => {
+                                        self.metadata.identifier = value.to_string()
+                                    }
                                     "issue_date" => self.metadata.date = Some(value.to_string()),
                                     "cover_image" => {
                                         let value_elem = get_field(meta_fields, sym!(Value));

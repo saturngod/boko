@@ -478,7 +478,10 @@ impl<'a> IonParser<'a> {
     #[inline]
     fn read_varuint(&mut self) -> io::Result<u32> {
         let mut result: u32 = 0;
-        loop {
+        // A u32 holds at most 5 seven-bit groups; beyond that the value would
+        // silently lose its high bits (aliasing a huge length to a small one).
+        // Cap the byte count and reject overlong encodings instead.
+        for _ in 0..5 {
             if self.pos >= self.data.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -492,6 +495,10 @@ impl<'a> IonParser<'a> {
                 return Ok(result);
             }
         }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VarUInt too large",
+        ))
     }
 
     /// Read unsigned integer (big-endian, up to 8 bytes).

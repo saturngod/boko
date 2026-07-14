@@ -29,6 +29,31 @@ Requires Rust 1.85+.
     cargo install boko        # CLI
     cargo add boko            # library
 
+### Run from source
+
+From the repository root, convert an EPUB directly to KFX with:
+
+    cargo run --release -- convert in.epub out.kfx
+
+To build once and run the compiled binary directly:
+
+    cargo build --release
+    ./target/release/boko convert in.epub out.kfx
+
+### Build the web app
+
+The browser app in `web/index.html` loads the WebAssembly package from
+`web/pkg`. Install the WASM target and `wasm-pack`, then build the package from
+the repository root:
+
+    rustup target add wasm32-unknown-unknown
+    cargo install wasm-pack
+    wasm-pack build --target web --out-dir web/pkg --no-default-features --features wasm
+
+Serve the `web` directory over HTTP and open <http://localhost:8000>:
+
+    python3 -m http.server 8000 --directory web
+
 ## CLI
 
     boko convert in.epub out.kfx

@@ -89,7 +89,7 @@ pub fn extract_section_tree(book: &mut Book) -> io::Result<SectionTree> {
     let mut events = Vec::new();
     for entry in &spine {
         let chapter = book.load_chapter(entry.id)?;
-        collect_events(&chapter, NodeId::ROOT, &mut events);
+        collect_events(&chapter, NodeId::ROOT, &mut events, 0);
     }
 
     let (preamble, sections) = nest_events(&events);
@@ -114,7 +114,10 @@ enum Event {
 
 /// Walk the IR tree, emitting heading and content events.
 /// Containers and Root are transparent — their children are processed directly.
-fn collect_events(chapter: &Chapter, node_id: NodeId, events: &mut Vec<Event>) {
+fn collect_events(chapter: &Chapter, node_id: NodeId, events: &mut Vec<Event>, depth: usize) {
+    if depth > crate::util::MAX_TREE_DEPTH {
+        return;
+    }
     let Some(node) = chapter.node(node_id) else {
         return;
     };
@@ -122,7 +125,7 @@ fn collect_events(chapter: &Chapter, node_id: NodeId, events: &mut Vec<Event>) {
     match node.role {
         Role::Root | Role::Container => {
             for child_id in chapter.children(node_id) {
-                collect_events(chapter, child_id, events);
+                collect_events(chapter, child_id, events, depth + 1);
             }
         }
 
@@ -190,7 +193,7 @@ fn collect_events(chapter: &Chapter, node_id: NodeId, events: &mut Vec<Event>) {
 
         Role::Figure => {
             for child_id in chapter.children(node_id) {
-                collect_events(chapter, child_id, events);
+                collect_events(chapter, child_id, events, depth + 1);
             }
         }
 
@@ -276,11 +279,14 @@ fn parse_siblings(events: &[Event], mut i: usize, min_level: u8) -> (Vec<Section
 
 fn collect_text(chapter: &Chapter, node_id: NodeId) -> String {
     let mut result = String::new();
-    collect_text_recursive(chapter, node_id, &mut result);
+    collect_text_recursive(chapter, node_id, &mut result, 0);
     strip_ebook_chars(&result)
 }
 
-fn collect_text_recursive(chapter: &Chapter, node_id: NodeId, result: &mut String) {
+fn collect_text_recursive(chapter: &Chapter, node_id: NodeId, result: &mut String, depth: usize) {
+    if depth > crate::util::MAX_TREE_DEPTH {
+        return;
+    }
     let Some(node) = chapter.node(node_id) else {
         return;
     };
@@ -316,7 +322,7 @@ fn collect_text_recursive(chapter: &Chapter, node_id: NodeId, result: &mut Strin
     }
 
     for child_id in chapter.children(node_id) {
-        collect_text_recursive(chapter, child_id, result);
+        collect_text_recursive(chapter, child_id, result, depth + 1);
     }
 }
 
@@ -460,7 +466,7 @@ mod tests {
         let mut chapter = Chapter::new();
         build(&mut chapter);
         let mut events = Vec::new();
-        collect_events(&chapter, NodeId::ROOT, &mut events);
+        collect_events(&chapter, NodeId::ROOT, &mut events, 0);
         nest_events(&events)
     }
 

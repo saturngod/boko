@@ -68,7 +68,7 @@ fn synthesize_html_with_resolver<R: StyleResolver>(ir: &Chapter, resolver: &R) -
 
     // Walk children of root (skip the root node itself)
     for child_id in ir.children(NodeId::ROOT) {
-        walk_node(child_id, &mut ctx);
+        walk_node(child_id, &mut ctx, 0);
     }
 
     SynthesisResult {
@@ -116,13 +116,15 @@ fn synthesize_xhtml_from_body(
 ) -> SynthesisResult {
     let mut doc = String::new();
 
-    // XHTML 1.1 DOCTYPE (compatible with EPUB)
+    // EPUB 3 content documents use the HTML5 DOCTYPE and a UTF-8 charset meta;
+    // the XHTML 1.1 DOCTYPE and application/xhtml+xml content-type are rejected
+    // by epubcheck (HTM-004 / RSC-005).
     doc.push_str(
         r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+<!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head>
-  <meta http-equiv="Content-Type" content="application/xhtml+xml; charset=utf-8"/>
+  <meta charset="utf-8"/>
   <title>"#,
     );
     escape_xml_into(&mut doc, title);
@@ -162,7 +164,10 @@ impl<R: StyleResolver> SynthesisContext<'_, R> {
 }
 
 /// Walk a node and emit its HTML.
-fn walk_node<R: StyleResolver>(id: NodeId, ctx: &mut SynthesisContext<'_, R>) {
+fn walk_node<R: StyleResolver>(id: NodeId, ctx: &mut SynthesisContext<'_, R>, depth: usize) {
+    if depth > crate::util::MAX_TREE_DEPTH {
+        return;
+    }
     let Some(node) = ctx.ir.node(id) else {
         return;
     };
@@ -278,7 +283,7 @@ fn walk_node<R: StyleResolver>(id: NodeId, ctx: &mut SynthesisContext<'_, R>) {
 
     // Emit children
     for child_id in ctx.ir.children(id) {
-        walk_node(child_id, ctx);
+        walk_node(child_id, ctx, depth + 1);
     }
 
     // Emit closing tag

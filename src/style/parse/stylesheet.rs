@@ -31,7 +31,10 @@ pub struct CssRule {
     pub declarations: Vec<Declaration>,
     /// Important declarations (those with !important).
     pub important_declarations: Vec<Declaration>,
-    pub specificity: Specificity,
+    /// Specificity of each selector in `selectors`, in the same order. CSS
+    /// assigns specificity per matched selector, not per rule, so the cascade
+    /// uses the specificity of the selector that actually matched.
+    pub selector_specificities: Vec<Specificity>,
 }
 
 /// CSS specificity for cascade ordering.
@@ -164,10 +167,10 @@ impl<'i> QualifiedRuleParser<'i> for TopLevelRuleParser<'_> {
         _start: &cssparser::ParserState,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::QualifiedRule, ParseError<'i, Self::Error>> {
-        let specificity = prelude
-            .first()
+        let selector_specificities = prelude
+            .iter()
             .map(Specificity::from_selector)
-            .unwrap_or_default();
+            .collect();
 
         let mut declarations = Vec::new();
         let mut important_declarations = Vec::new();
@@ -185,7 +188,7 @@ impl<'i> QualifiedRuleParser<'i> for TopLevelRuleParser<'_> {
             selectors: prelude,
             declarations,
             important_declarations,
-            specificity,
+            selector_specificities,
         });
 
         Ok(())

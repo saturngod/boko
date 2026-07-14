@@ -11,7 +11,7 @@ fn sha1_hex(bytes: &[u8]) -> String {
 fn test_azw3_toc_resolution() {
     let path = "tests/fixtures/epictetus.azw3";
     if !std::path::Path::new(path).exists() {
-        eprintln!("Skipping test - fixture not found: {}", path);
+        eprintln!("Skipping test - fixture not found: {path}");
         return;
     }
 
@@ -48,15 +48,13 @@ fn test_azw3_toc_resolution() {
     // At least some TOC entries should have fragments
     assert!(
         with_fragment > 0,
-        "Expected some TOC entries to have fragments, got {}",
-        with_fragment
+        "Expected some TOC entries to have fragments, got {with_fragment}"
     );
 
     // TOC entries should have targets
     assert!(
         with_target > 0,
-        "Expected some TOC entries to have targets, got {}",
-        with_target
+        "Expected some TOC entries to have targets, got {with_target}"
     );
 
     // Every TOC entry should have a unique href (catches insert_pos vs start_pos bug)
@@ -86,8 +84,7 @@ fn assert_unique_toc_hrefs(toc: &[boko::model::TocEntry], format_name: &str) {
     assert_eq!(
         all_hrefs.len(),
         unique_count,
-        "{}: Every TOC entry should have a unique href",
-        format_name
+        "{format_name}: Every TOC entry should have a unique href"
     );
 }
 
@@ -95,7 +92,7 @@ fn assert_unique_toc_hrefs(toc: &[boko::model::TocEntry], format_name: &str) {
 fn test_epub_toc_resolution() {
     let path = "tests/fixtures/epictetus.epub";
     if !std::path::Path::new(path).exists() {
-        eprintln!("Skipping test - fixture not found: {}", path);
+        eprintln!("Skipping test - fixture not found: {path}");
         return;
     }
 
@@ -109,7 +106,7 @@ fn test_epub_toc_resolution() {
 fn test_mobi_toc_resolution() {
     let path = "tests/fixtures/epictetus.mobi";
     if !std::path::Path::new(path).exists() {
-        eprintln!("Skipping test - fixture not found: {}", path);
+        eprintln!("Skipping test - fixture not found: {path}");
         return;
     }
 
@@ -123,7 +120,7 @@ fn test_mobi_toc_resolution() {
 fn test_kfx_toc_resolution() {
     let path = "tests/fixtures/epictetus.kfx";
     if !std::path::Path::new(path).exists() {
-        eprintln!("Skipping test - fixture not found: {}", path);
+        eprintln!("Skipping test - fixture not found: {path}");
         return;
     }
 
@@ -137,7 +134,7 @@ fn test_kfx_toc_resolution() {
 fn test_kfx_named_resource_returns_binary_asset() {
     let path = "tests/fixtures/epictetus.kfx";
     if !Path::new(path).exists() {
-        eprintln!("Skipping test - fixture not found: {}", path);
+        eprintln!("Skipping test - fixture not found: {path}");
         return;
     }
 
@@ -175,8 +172,7 @@ fn test_kfx_named_resource_returns_binary_asset() {
         assert_eq!(
             sha1_hex(bytes.as_slice()),
             expected_sha1,
-            "Unexpected SHA-1 for {} in epictetus fixture",
-            resource_name
+            "Unexpected SHA-1 for {resource_name} in epictetus fixture"
         );
     }
 }
@@ -185,7 +181,7 @@ fn test_kfx_named_resource_returns_binary_asset() {
 fn test_kfx_direct_asset_id_1102_matches_named_resource_and_hash() {
     let path = "tests/fixtures/epictetus.kfx";
     if !Path::new(path).exists() {
-        eprintln!("Skipping test - fixture not found: {}", path);
+        eprintln!("Skipping test - fixture not found: {path}");
         return;
     }
 

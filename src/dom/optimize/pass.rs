@@ -12,18 +12,24 @@ where
     F: FnMut(&mut Chapter, NodeId),
 {
     if chapter.node_count() > 0 {
-        walk_children(chapter, NodeId::ROOT, &mut visitor);
+        walk_children(chapter, NodeId::ROOT, &mut visitor, 0);
     }
 }
 
-fn walk_children<F>(chapter: &mut Chapter, parent_id: NodeId, visitor: &mut F)
+fn walk_children<F>(chapter: &mut Chapter, parent_id: NodeId, visitor: &mut F, depth: usize)
 where
     F: FnMut(&mut Chapter, NodeId),
 {
+    // Cap recursion depth: IR trees can come from importers that don't bound
+    // nesting (e.g. KFX), so guard against a stack overflow on a hostile tree.
+    if depth > crate::util::MAX_TREE_DEPTH {
+        visitor(chapter, parent_id);
+        return;
+    }
     // 1. Recurse into children first (bottom-up)
     let mut child_opt = chapter.node(parent_id).and_then(|n| n.first_child);
     while let Some(child_id) = child_opt {
-        walk_children(chapter, child_id, visitor);
+        walk_children(chapter, child_id, visitor, depth + 1);
         child_opt = chapter.node(child_id).and_then(|n| n.next_sibling);
     }
     // 2. Visit this parent after children

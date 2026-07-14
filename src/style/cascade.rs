@@ -5,7 +5,7 @@
 //! importance, and source order.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use selectors::context::{MatchingContext, SelectorCaches};
 use selectors::parser::{Component, Selector};
@@ -134,9 +134,9 @@ pub struct CascadeScratch {
 /// instead of every rule of every stylesheet (O(elements × rules)).
 pub struct CascadeIndex<'a> {
     stylesheets: &'a [(&'a Stylesheet, Origin)],
-    by_id: HashMap<String, Vec<RuleRef>>,
-    by_class: HashMap<String, Vec<RuleRef>>,
-    by_local: HashMap<String, Vec<RuleRef>>,
+    by_id: FxHashMap<String, Vec<RuleRef>>,
+    by_class: FxHashMap<String, Vec<RuleRef>>,
+    by_local: FxHashMap<String, Vec<RuleRef>>,
     universal: Vec<RuleRef>,
 }
 
@@ -148,9 +148,9 @@ impl<'a> CascadeIndex<'a> {
     pub fn build(stylesheets: &'a [(&'a Stylesheet, Origin)]) -> Self {
         let mut index = CascadeIndex {
             stylesheets,
-            by_id: HashMap::new(),
-            by_class: HashMap::new(),
-            by_local: HashMap::new(),
+            by_id: FxHashMap::default(),
+            by_class: FxHashMap::default(),
+            by_local: FxHashMap::default(),
             universal: Vec::new(),
         };
         for (sheet_idx, (sheet, _origin)) in stylesheets.iter().enumerate() {
@@ -249,13 +249,13 @@ pub fn compute_styles_indexed(
     for &(sheet_idx, rule_idx) in candidates.iter() {
         let (stylesheet, origin) = index.stylesheets[sheet_idx as usize];
         let rule = &stylesheet.rules[rule_idx as usize];
-        if rule_matches_with_caches(elem, rule, caches) {
+        if let Some(specificity) = rule_match_specificity(elem, rule, caches) {
             // Collect normal declarations
             for decl in &rule.declarations {
                 matched.push(MatchedRule {
                     declaration: decl,
                     origin,
-                    specificity: rule.specificity,
+                    specificity,
                     order,
                     important: false,
                 });
@@ -266,7 +266,7 @@ pub fn compute_styles_indexed(
                 matched.push(MatchedRule {
                     declaration: decl,
                     origin,
-                    specificity: rule.specificity,
+                    specificity,
                     order,
                     important: true,
                 });
@@ -279,24 +279,31 @@ pub fn compute_styles_indexed(
     if matched.len() > 1 {
         // Use unstable sort - faster and order of equal elements doesn't matter
         matched.sort_unstable_by(|a, b| {
-            // Important declarations win
+            // Declarations are applied in this order with last-write-wins, so the
+            // winner must sort LAST. `!important` beats normal, so important
+            // declarations sort after normal ones (applied last).
             if a.important != b.important {
-                return b.important.cmp(&a.important);
+                return a.important.cmp(&b.important);
             }
 
-            // Then by origin (author > user-agent)
-            let origin_cmp = a.origin.cmp(&b.origin);
+            // Within the same importance band, order by origin. For normal
+            // declarations author beats user-agent (author sorts last); for
+            // `!important` the precedence reverses (user-agent !important wins),
+            // per the CSS cascade.
+            let origin_cmp = if a.important {
+                b.origin.cmp(&a.origin)
+            } else {
+                a.origin.cmp(&b.origin)
+            };
             if origin_cmp != Ordering::Equal {
                 return origin_cmp;
             }
 
-            // Then by specificity
+            // Then by specificity, then source order (higher/later sorts last).
             let spec_cmp = a.specificity.cmp(&b.specificity);
             if spec_cmp != Ordering::Equal {
                 return spec_cmp;
             }
-
-            // Finally by source order
             a.order.cmp(&b.order)
         });
     }
@@ -316,12 +323,15 @@ pub fn compute_styles_indexed(
     style
 }
 
-/// Check if a rule matches an element (with shared caches for better performance).
-fn rule_matches_with_caches(
+/// Return the specificity of the highest-specificity selector in `rule` that
+/// matches `elem`, or `None` if the rule doesn't match. CSS assigns specificity
+/// per matched selector, so a rule like `.a, p { … }` contributes `.a`'s
+/// specificity to elements matched via `.a` and `p`'s to those matched via `p`.
+fn rule_match_specificity(
     elem: ElementRef<'_>,
     rule: &CssRule,
     caches: &mut SelectorCaches,
-) -> bool {
+) -> Option<Specificity> {
     let mut context = MatchingContext::new(
         selectors::matching::MatchingMode::Normal,
         None,
@@ -331,9 +341,14 @@ fn rule_matches_with_caches(
         selectors::matching::MatchingForInvalidation::No,
     );
 
-    rule.selectors.iter().any(|selector| {
-        selectors::matching::matches_selector(selector, 0, None, &elem, &mut context)
-    })
+    rule.selectors
+        .iter()
+        .zip(&rule.selector_specificities)
+        .filter(|(selector, _)| {
+            selectors::matching::matches_selector(selector, 0, None, &elem, &mut context)
+        })
+        .map(|(_, spec)| *spec)
+        .max()
 }
 
 /// Apply a declaration to a computed style.
@@ -476,5 +491,41 @@ fn apply_declaration(style: &mut ComputedStyle, decl: &Declaration) {
         // Table properties
         Declaration::BorderCollapse(bc) => style.border_collapse = *bc,
         Declaration::BorderSpacing(l) => style.border_spacing = *l,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::style::properties::Color;
+
+    /// Compute the resolved `color` of the first `<p>` for the given author CSS.
+    fn p_color(css: &str) -> Option<Color> {
+        let dom = crate::dom::parse_dom("<p>x</p>");
+        let p = dom.find_by_tag("p").unwrap();
+        let elem = ElementRef::new(&dom, p);
+        let sheet = Stylesheet::parse(css);
+        let mut pool = StylePool::default();
+        compute_styles(elem, &[(sheet, Origin::Author)], None, &mut pool).color
+    }
+
+    #[test]
+    fn important_declaration_beats_later_normal() {
+        // `!important` must win even though the blue rule comes later and
+        // application is last-wins.
+        assert_eq!(
+            p_color("p { color: red !important } p { color: blue }"),
+            Some(Color::rgb(255, 0, 0))
+        );
+    }
+
+    #[test]
+    fn specificity_is_per_selector_not_first_in_list() {
+        // `.never` never matches; the `p` selector sharing its rule must be
+        // scored with `p`'s specificity, so the later `p` rule wins (blue).
+        assert_eq!(
+            p_color(".never, p { color: red } p { color: blue }"),
+            Some(Color::rgb(0, 0, 255))
+        );
     }
 }

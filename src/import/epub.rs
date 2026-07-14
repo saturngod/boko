@@ -1,7 +1,6 @@
 //! EPUB format importer - handles all IO.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -331,11 +330,14 @@ fn read_entry(
     match loc.compression {
         0 => Ok(compressed), // Stored
         8 => {
-            // Deflate
-            let mut decoder = flate2::read::DeflateDecoder::new(&compressed[..]);
-            let cap = usize::try_from(loc.uncompressed_size).unwrap_or(0);
-            let mut out = Vec::with_capacity(cap);
-            decoder.read_to_end(&mut out)?;
+            // Deflate. The uncompressed size is an untrusted central-directory
+            // field, so cap the output to stop decompression bombs rather than
+            // trusting it (see `bounded_inflate`).
+            let out = crate::util::bounded_inflate(
+                &compressed,
+                loc.uncompressed_size,
+                crate::util::MAX_DECOMPRESSED_ENTRY,
+            )?;
             Ok(out)
         }
         method => Err(crate::Error::Malformed {

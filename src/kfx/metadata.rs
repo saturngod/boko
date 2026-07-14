@@ -177,6 +177,14 @@ pub fn metadata_schema() -> Vec<MetadataRule> {
             category: MetadataCategory::KindleTitle,
             source: MetadataSource::Dynamic(MetadataField::BookId),
         },
+        // Kindle's USB library thumbnail uses content_id (falling back to ASIN)
+        // together with cde_content_type. Keep it identical to the stable book_id
+        // so a companion thumbnail can be associated with this publication.
+        MetadataRule {
+            key: "content_id",
+            category: MetadataCategory::KindleTitle,
+            source: MetadataSource::Dynamic(MetadataField::BookId),
+        },
         MetadataRule {
             key: "cde_content_type",
             category: MetadataCategory::KindleTitle,
@@ -615,6 +623,11 @@ mod tests {
             entries
                 .iter()
                 .any(|(k, v)| *k == "book_id" && v == "BtestBookId12345678901")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(k, v)| *k == "content_id" && v == "BtestBookId12345678901")
         );
     }
 }

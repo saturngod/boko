@@ -95,8 +95,7 @@ fn azw3_roundtrip_preserves_structure() {
         let nested_in_source: usize = source.toc().iter().map(|t| t.children.len()).sum();
         assert!(
             nested_in_source == 0,
-            "nested TOC entries collapsed to a single href (pos_fid regression): {:?}",
-            nested_hrefs
+            "nested TOC entries collapsed to a single href (pos_fid regression): {nested_hrefs:?}"
         );
     }
 
@@ -144,15 +143,14 @@ fn azw3_roundtrip_resource_records_are_recognisable() {
         let ext = p
             .extension()
             .and_then(|s| s.to_str())
-            .map(|s| s.to_ascii_lowercase());
+            .map(str::to_ascii_lowercase);
         matches!(
             ext.as_deref(),
-            Some("jpg") | Some("jpeg") | Some("png") | Some("gif")
+            Some("jpg" | "jpeg" | "png" | "gif")
         )
     });
     assert!(
         has_real_image,
-        "expected at least one JPEG/PNG/GIF asset; got {:?}",
-        assets
+        "expected at least one JPEG/PNG/GIF asset; got {assets:?}"
     );
 }

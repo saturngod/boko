@@ -47,7 +47,7 @@ fn build_symbol_table_preamble() -> Vec<u8> {
     build_symbol_table_preamble_with_max_id(KFX_MAX_SYMBOL_ID as i64)
 }
 
-/// Build an Ion binary preamble with a custom max_id for extended symbols.
+/// Build an Ion binary preamble with a custom `max_id` for extended symbols.
 fn build_symbol_table_preamble_with_max_id(max_id: i64) -> Vec<u8> {
     use ion_rs::v1_0::Binary;
     use ion_rs::{
@@ -103,8 +103,7 @@ fn main() -> IonResult<()> {
                 "dependencies" => report_dependencies(&data)?,
                 other => {
                     eprintln!(
-                        "Unknown field report: {}. Supported: anchors, container, content, dependencies, document, features, locations, metadata, navigation, positions, reading_orders, resources, sections, storylines",
-                        other
+                        "Unknown field report: {other}. Supported: anchors, container, content, dependencies, document, features, locations, metadata, navigation, positions, reading_orders, resources, sections, storylines"
                     );
                     std::process::exit(1);
                 }
@@ -131,7 +130,7 @@ fn main() -> IonResult<()> {
     } else {
         eprintln!("Unknown file format. First 16 bytes:");
         for byte in data.iter().take(16) {
-            eprint!("{:02X} ", byte);
+            eprint!("{byte:02X} ");
         }
         eprintln!();
         std::process::exit(1);
@@ -189,11 +188,10 @@ fn dump_kfx_container(data: &[u8], resolve: bool) -> IonResult<()> {
         return Ok(());
     };
 
-    eprintln!("Container version: {}", version);
-    eprintln!("Header length: {}", header_len);
+    eprintln!("Container version: {version}");
+    eprintln!("Header length: {header_len}");
     eprintln!(
-        "Container info: offset={}, length={}",
-        container_info_offset, container_info_length
+        "Container info: offset={container_info_offset}, length={container_info_length}"
     );
     eprintln!();
 
@@ -206,7 +204,7 @@ fn dump_kfx_container(data: &[u8], resolve: bool) -> IonResult<()> {
             &data[container_info_offset..container_info_offset + container_info_length];
         eprintln!("=== Container Info ===");
         if let Err(e) = dump_ion_data(container_info_data) {
-            eprintln!("Error parsing container info: {}", e);
+            eprintln!("Error parsing container info: {e}");
         }
         eprintln!();
 
@@ -215,8 +213,7 @@ fn dump_kfx_container(data: &[u8], resolve: bool) -> IonResult<()> {
             parse_container_info_for_doc_symbols(container_info_data)
         {
             eprintln!(
-                "Document symbols: offset={}, length={}",
-                doc_sym_offset, doc_sym_length
+                "Document symbols: offset={doc_sym_offset}, length={doc_sym_length}"
             );
             if doc_sym_offset + doc_sym_length <= data.len() {
                 let doc_sym_data = &data[doc_sym_offset..doc_sym_offset + doc_sym_length];
@@ -234,14 +231,13 @@ fn dump_kfx_container(data: &[u8], resolve: bool) -> IonResult<()> {
 
         if let Some((index_offset, index_length)) = index_info {
             eprintln!(
-                "Index table: offset={}, length={}",
-                index_offset, index_length
+                "Index table: offset={index_offset}, length={index_length}"
             );
 
             // Parse index table - each entry is 24 bytes
             let entry_size = 24;
             let num_entries = index_length / entry_size;
-            eprintln!("Number of entities: {}", num_entries);
+            eprintln!("Number of entities: {num_entries}");
             eprintln!();
 
             // First pass: build resolution maps if resolving
@@ -297,9 +293,9 @@ fn dump_kfx_container(data: &[u8], resolve: bool) -> IonResult<()> {
                     "?"
                 };
 
-                eprintln!("=== Entity {} ===", i);
+                eprintln!("=== Entity {i} ===");
                 // Show resolved info if available
-                if let Some(info) = maps.entity_map.get(&(id_idnum as u64)) {
+                if let Some(info) = maps.entity_map.get(&u64::from(id_idnum)) {
                     if let Some(name) = &info.name {
                         eprintln!(
                             "  ID: ${} ({}) [{}:{}]",
@@ -309,15 +305,15 @@ fn dump_kfx_container(data: &[u8], resolve: bool) -> IonResult<()> {
                         eprintln!("  ID: ${} ({}) [{}]", id_idnum, id_name, info.entity_type);
                     }
                 } else {
-                    eprintln!("  ID: ${} ({})", id_idnum, id_name);
+                    eprintln!("  ID: ${id_idnum} ({id_name})");
                 }
-                eprintln!("  Type: ${} ({})", type_idnum, type_name);
+                eprintln!("  Type: ${type_idnum} ({type_name})");
                 eprintln!(
                     "  Offset: {} (absolute: {})",
                     entity_offset,
                     header_len + entity_offset
                 );
-                eprintln!("  Length: {}", entity_len);
+                eprintln!("  Length: {entity_len}");
 
                 // Parse the entity
                 let abs_offset = header_len + entity_offset;
@@ -396,7 +392,7 @@ fn dump_kfx_stats(data: &[u8]) -> IonResult<()> {
         let type_name = if (type_idnum as usize) < KFX_SYMBOL_TABLE.len() {
             KFX_SYMBOL_TABLE[type_idnum as usize].to_string()
         } else {
-            format!("${}", type_idnum)
+            format!("${type_idnum}")
         };
 
         let count = type_counts.entry(type_name.clone()).or_insert(0);
@@ -440,8 +436,7 @@ fn dump_kfx_stats(data: &[u8]) -> IonResult<()> {
         let size = total_size_by_type.get(type_name).unwrap_or(&0);
         let details = singleton_details
             .get(type_name)
-            .map(|s| s.as_str())
-            .unwrap_or("");
+            .map_or("", std::string::String::as_str);
         println!(
             "{:<25} {:>8} {:>12}  {}",
             type_name,
@@ -574,7 +569,7 @@ fn extract_singleton_details(entity_data: &[u8], type_name: &str) -> Option<Stri
                                     }
                                 }
                                 if let Some(nt) = nav_type {
-                                    details.push(format!("{}:{}", nt, entry_count));
+                                    details.push(format!("{nt}:{entry_count}"));
                                 }
                             }
                         }
@@ -602,7 +597,7 @@ fn extract_singleton_details(entity_data: &[u8], type_name: &str) -> Option<Stri
                                 }
                             }
                         }
-                        return Some(format!("{} entity refs", total_entities));
+                        return Some(format!("{total_entities} entity refs"));
                     }
                 }
             }
@@ -640,7 +635,7 @@ fn format_size(bytes: usize) -> String {
     } else if bytes >= 1024 {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }
 
@@ -665,7 +660,7 @@ enum AnchorDestination {
     Target, // This anchor is a target (no position/uri - it's pointed TO)
 }
 
-/// Info about a link_to reference in a storyline
+/// Info about a `link_to` reference in a storyline
 #[derive(Debug, Clone)]
 struct LinkToRef {
     anchor_name: String,
@@ -794,7 +789,7 @@ fn report_anchors(data: &[u8]) -> IonResult<()> {
         {
             // Also build concatenated text for destination lookup
             let full_text = texts.join("");
-            content_by_id.insert(id_idnum as i64, full_text);
+            content_by_id.insert(i64::from(id_idnum), full_text);
             content_map.insert(name, texts);
         }
 
@@ -905,8 +900,8 @@ fn report_anchors(data: &[u8]) -> IonResult<()> {
         match &anchor.destination {
             AnchorDestination::Internal { id, offset, text } => {
                 let position = match offset {
-                    Some(off) => format!("{}:{}", id, off),
-                    None => format!("{}", id),
+                    Some(off) => format!("{id}:{off}"),
+                    None => format!("{id}"),
                 };
                 if let Some(dest_text) = text {
                     let dest_preview: String = dest_text.chars().take(40).collect();
@@ -1151,7 +1146,7 @@ fn report_navigation(data: &[u8]) -> IonResult<()> {
     Ok(())
 }
 
-/// Extract navigation entries from book_navigation and print them
+/// Extract navigation entries from `book_navigation` and print them
 fn extract_and_print_navigation(
     value: &boko::kfx::ion::IonValue,
     extended_symbols: &[String],
@@ -1233,12 +1228,12 @@ fn extract_and_print_navigation(
             // Print all nav containers
             if !nav_type.is_empty() {
                 let header = match nav_type.as_str() {
-                    "toc" => format!("Table of Contents ({})", container_name),
-                    "headings" => format!("Headings ({})", container_name),
-                    "landmarks" => format!("Landmarks ({})", container_name),
-                    _ => format!("{} ({})", nav_type, container_name),
+                    "toc" => format!("Table of Contents ({container_name})"),
+                    "headings" => format!("Headings ({container_name})"),
+                    "landmarks" => format!("Landmarks ({container_name})"),
+                    _ => format!("{nav_type} ({container_name})"),
                 };
-                println!("=== {} ===\n", header);
+                println!("=== {header} ===\n");
 
                 if let Some(entry_list) = entries {
                     let mut nav_entries = Vec::new();
@@ -1256,8 +1251,8 @@ fn extract_and_print_navigation(
                     for entry in &nav_entries {
                         let indent = "  ".repeat(entry.depth);
                         let position = match (entry.target_id, entry.target_offset) {
-                            (Some(id), Some(off)) if off != 0 => format!("→ {}:{}", id, off),
-                            (Some(id), _) => format!("→ {}", id),
+                            (Some(id), Some(off)) if off != 0 => format!("→ {id}:{off}"),
+                            (Some(id), _) => format!("→ {id}"),
                             _ => String::new(),
                         };
 
@@ -1265,12 +1260,12 @@ fn extract_and_print_navigation(
                         let landmark_info = entry
                             .landmark_type
                             .as_ref()
-                            .map(|t| format!("[{}] ", t))
+                            .map(|t| format!("[{t}] "))
                             .unwrap_or_default();
 
                         // Show entity type if known
                         let type_info = if let Some(t) = &entry.target_type {
-                            format!(" ({})", t)
+                            format!(" ({t})")
                         } else if entry.target_text.is_some() {
                             String::new()
                         } else {
@@ -1293,19 +1288,11 @@ fn extract_and_print_navigation(
                             let preview: String = text.chars().take(50).collect();
                             let ellipsis = if text.chars().count() > 50 { "..." } else { "" };
                             println!(
-                                "{}{}{:<35} {:>12}{}  \"{}{}\"",
-                                indent,
-                                landmark_info,
-                                display_label,
-                                position,
-                                type_info,
-                                preview,
-                                ellipsis
+                                "{indent}{landmark_info}{display_label:<35} {position:>12}{type_info}  \"{preview}{ellipsis}\""
                             );
                         } else {
                             println!(
-                                "{}{}{:<35} {:>12}{}",
-                                indent, landmark_info, display_label, position, type_info
+                                "{indent}{landmark_info}{display_label:<35} {position:>12}{type_info}"
                             );
                         }
                     }
@@ -1318,7 +1305,7 @@ fn extract_and_print_navigation(
     }
 }
 
-/// Recursively extract navigation entries from nav_unit list
+/// Recursively extract navigation entries from `nav_unit` list
 #[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
 fn extract_nav_entries(
     entries: &[boko::kfx::ion::IonValue],
@@ -1458,19 +1445,17 @@ fn resolve_symbol(sym_id: u64, extended_symbols: &[String], base_symbol_count: u
     let idx = sym_id as usize;
     if idx < base_symbol_count {
         KFX_SYMBOL_TABLE
-            .get(idx)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("${}", sym_id))
+            .get(idx).map_or_else(|| format!("${sym_id}"), std::string::ToString::to_string)
     } else {
         let ext_idx = idx - base_symbol_count;
         extended_symbols
             .get(ext_idx)
             .cloned()
-            .unwrap_or_else(|| format!("${}", sym_id))
+            .unwrap_or_else(|| format!("${sym_id}"))
     }
 }
 
-/// Extract name and content_list texts from a content entity
+/// Extract name and `content_list` texts from a content entity
 fn extract_content_texts(
     value: &boko::kfx::ion::IonValue,
     extended_symbols: &[String],
@@ -1544,7 +1529,7 @@ fn extract_fragment_content_refs(
     }
 }
 
-/// Recursively extract fragment ID → content refs and container types from content_list
+/// Recursively extract fragment ID → content refs and container types from `content_list`
 fn extract_fragment_content_from_list(
     value: &boko::kfx::ion::IonValue,
     extended_symbols: &[String],
@@ -1632,7 +1617,7 @@ fn extract_fragment_content_from_list(
     }
 }
 
-/// Extract link_to references from a storyline
+/// Extract `link_to` references from a storyline
 fn extract_link_to_refs(
     value: &boko::kfx::ion::IonValue,
     extended_symbols: &[String],
@@ -1664,7 +1649,7 @@ fn extract_link_to_refs(
     }
 }
 
-/// Recursively extract link_to refs from storyline content_list
+/// Recursively extract `link_to` refs from storyline `content_list`
 fn extract_link_to_from_content_list(
     value: &boko::kfx::ion::IonValue,
     extended_symbols: &[String],
@@ -1745,7 +1730,7 @@ fn extract_link_to_from_content_list(
     }
 }
 
-/// Extract inline link_to references (offset, length, link_to)
+/// Extract inline `link_to` references (offset, length, `link_to`)
 fn extract_inline_link_to(
     value: &boko::kfx::ion::IonValue,
     extended_symbols: &[String],
@@ -1924,7 +1909,7 @@ fn parse_container_info_for_index(data: &[u8]) -> Option<(usize, usize)> {
         if let Ok(elem) = element
             && let Some(strukt) = elem.as_struct()
         {
-            for field in strukt.iter() {
+            for field in strukt {
                 let (name, value) = field;
                 if let Some(field_name) = name.text() {
                     if field_name == "bcIndexTabOffset"
@@ -1979,7 +1964,7 @@ fn parse_container_info_for_doc_symbols(data: &[u8]) -> Option<(usize, usize)> {
         if let Ok(elem) = element
             && let Some(strukt) = elem.as_struct()
         {
-            for field in strukt.iter() {
+            for field in strukt {
                 let (name, value) = field;
                 if let Some(field_name) = name.text() {
                     if field_name == "bcDocSymbolOffset"
@@ -2007,9 +1992,9 @@ fn parse_container_info_for_doc_symbols(data: &[u8]) -> Option<(usize, usize)> {
 /// First pass through all entities to extract type and name info.
 /// Maps for resolving references in KFX files
 struct ResolutionMaps {
-    /// Entity symbol ID → EntityInfo (for entity header display)
+    /// Entity symbol ID → `EntityInfo` (for entity header display)
     entity_map: HashMap<u64, EntityInfo>,
-    /// Content fragment ID → storyline name (for target_position resolution)
+    /// Content fragment ID → storyline name (for `target_position` resolution)
     fragment_map: HashMap<u64, String>,
 }
 
@@ -2051,7 +2036,7 @@ fn build_maps(
         let entity_type = if (type_idnum as usize) < KFX_SYMBOL_TABLE.len() {
             KFX_SYMBOL_TABLE[type_idnum as usize].to_string()
         } else {
-            format!("${}", type_idnum)
+            format!("${type_idnum}")
         };
 
         // Parse entity to extract name field and fragment IDs
@@ -2083,7 +2068,7 @@ fn build_maps(
             }
         }
 
-        entity_map.insert(id_idnum as u64, EntityInfo { entity_type, name });
+        entity_map.insert(u64::from(id_idnum), EntityInfo { entity_type, name });
     }
 
     ResolutionMaps {
@@ -2092,7 +2077,7 @@ fn build_maps(
     }
 }
 
-/// Extract fragment IDs from storyline content_list and map them to the story name
+/// Extract fragment IDs from storyline `content_list` and map them to the story name
 fn extract_fragment_ids(
     value: &boko::kfx::ion::IonValue,
     story_name: &str,
@@ -2116,7 +2101,7 @@ fn extract_fragment_ids(
     }
 }
 
-/// Recursively extract fragment IDs from a content_list
+/// Recursively extract fragment IDs from a `content_list`
 fn extract_fragment_ids_from_list(
     value: &boko::kfx::ion::IonValue,
     story_name: &str,
@@ -2131,7 +2116,7 @@ fn extract_fragment_ids_from_list(
     }
 }
 
-/// Extract id field from a content_list item struct, and recurse into nested content_lists
+/// Extract id field from a `content_list` item struct, and recurse into nested `content_lists`
 fn extract_id_from_content_item(
     value: &boko::kfx::ion::IonValue,
     story_name: &str,
@@ -2208,7 +2193,7 @@ fn ion_value_to_string(
             } else if id >= base_symbol_count && id - base_symbol_count < extended_symbols.len() {
                 Some(extended_symbols[id - base_symbol_count].clone())
             } else {
-                Some(format!("${}", id))
+                Some(format!("${id}"))
             }
         }
         IonValue::Int(i) => Some(i.to_string()),
@@ -2217,7 +2202,7 @@ fn ion_value_to_string(
 }
 
 /// Extract document-specific symbols from the doc symbols section.
-/// The doc symbols section is Ion binary containing a $ion_symbol_table struct.
+/// The doc symbols section is Ion binary containing a $`ion_symbol_table` struct.
 /// We extract the "symbols" list which contains the local symbol names.
 fn extract_doc_symbols(data: &[u8]) -> Vec<String> {
     use boko::kfx::ion::{IonParser, IonValue};
@@ -2227,7 +2212,7 @@ fn extract_doc_symbols(data: &[u8]) -> Vec<String> {
     let value = match parser.parse() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("DEBUG: Failed to parse Ion: {}", e);
+            eprintln!("DEBUG: Failed to parse Ion: {e}");
             return Vec::new();
         }
     };
@@ -2294,8 +2279,8 @@ fn dump_entity(
         return Ok(());
     };
 
-    eprintln!("  ENTY version: {}", version);
-    eprintln!("  ENTY header length: {}", entity_header_len);
+    eprintln!("  ENTY version: {version}");
+    eprintln!("  ENTY header length: {entity_header_len}");
 
     // The entity info (compression, drm) is between offset 10 and entity_header_len
     // The actual Ion data starts at entity_header_len
@@ -2371,12 +2356,12 @@ fn dump_ion_data_extended(
             Ok(elem) => {
                 // Convert to Ion text format
                 let text = element_to_ion_text(&elem, &all_symbols, maps, resolve);
-                println!("{}", text);
+                println!("{text}");
                 count += 1;
             }
             Err(e) => {
                 if count == 0 {
-                    eprintln!("  Error reading first element: {}", e);
+                    eprintln!("  Error reading first element: {e}");
                 }
                 break;
             }
@@ -2384,7 +2369,7 @@ fn dump_ion_data_extended(
     }
 
     if count > 0 {
-        eprintln!("  ({} top-level elements)", count);
+        eprintln!("  ({count} top-level elements)");
     }
     Ok(())
 }
@@ -2399,8 +2384,8 @@ fn element_to_ion_text(
     element_to_ion_text_inner(elem, maps, resolve, 0, None)
 }
 
-/// Check if this is an integer entity reference field (for reading_order bounds)
-/// Note: story_name/section_name are typically symbols, not integers
+/// Check if this is an integer entity reference field (for `reading_order` bounds)
+/// Note: `story_name/section_name` are typically symbols, not integers
 fn is_int_entity_ref_field(field_name: &str) -> bool {
     matches!(field_name, "reading_order_start" | "reading_order_end")
 }
@@ -2410,7 +2395,7 @@ fn is_int_entity_ref_field(field_name: &str) -> bool {
 struct FieldContext<'a> {
     /// Current field name (e.g., "id")
     field_name: Option<&'a str>,
-    /// Whether we're inside a target_position struct
+    /// Whether we're inside a `target_position` struct
     in_target_position: bool,
 }
 
@@ -2472,7 +2457,7 @@ fn element_to_ion_text_inner(
                     // Only resolve "id" fields inside target_position structs
                     if field == "id" && ctx.in_target_position {
                         if let Some(story_name) = maps.fragment_map.get(&(i as u64)) {
-                            result.push_str(&format!(" /* {} */", story_name));
+                            result.push_str(&format!(" /* {story_name} */"));
                         }
                     }
                     // Resolve integer entity references (reading_order bounds)
@@ -2487,28 +2472,28 @@ fn element_to_ion_text_inner(
                     }
                 }
             } else if let Some(i) = elem.as_int() {
-                result.push_str(&format!("{}", i));
+                result.push_str(&format!("{i}"));
             } else {
                 result.push_str("null.int");
             }
         }
         IonType::Float => {
             if let Some(f) = elem.as_float() {
-                result.push_str(&format!("{}", f));
+                result.push_str(&format!("{f}"));
             } else {
                 result.push_str("null.float");
             }
         }
         IonType::Decimal => {
             if let Some(d) = elem.as_decimal() {
-                result.push_str(&format!("{}", d));
+                result.push_str(&format!("{d}"));
             } else {
                 result.push_str("null.decimal");
             }
         }
         IonType::Timestamp => {
             if let Some(t) = elem.as_timestamp() {
-                result.push_str(&format!("{}", t));
+                result.push_str(&format!("{t}"));
             } else {
                 result.push_str("null.timestamp");
             }
@@ -2553,7 +2538,7 @@ fn element_to_ion_text_inner(
                 if b64.len() > 60 {
                     result.push_str(&format!("{{{{{}...}}}}", &b64[..60]));
                 } else {
-                    result.push_str(&format!("{{{{{}}}}}", b64));
+                    result.push_str(&format!("{{{{{b64}}}}}"));
                 }
             } else {
                 result.push_str("null.blob");
@@ -2689,10 +2674,10 @@ fn report_container(data: &[u8]) -> IonResult<()> {
 
     println!("=== Container Header (Binary) ===\n");
     println!("magic:                 CONT");
-    println!("version:               {}", version);
-    println!("header_len:            {}", header_len);
-    println!("container_info_offset: {}", container_info_offset);
-    println!("container_info_length: {}", container_info_length);
+    println!("version:               {version}");
+    println!("header_len:            {header_len}");
+    println!("container_info_offset: {container_info_offset}");
+    println!("container_info_length: {container_info_length}");
     println!();
 
     if container_info_offset + container_info_length > data.len() {
@@ -2732,15 +2717,15 @@ fn report_container(data: &[u8]) -> IonResult<()> {
         if let Ok(elem) = element
             && let Some(strukt) = elem.as_struct()
         {
-            for field in strukt.iter() {
+            for field in strukt {
                 let (name, value) = field;
                 let field_name = name.text().unwrap_or("?");
 
                 // Format value based on type
                 let value_str = if let Some(i) = value.as_i64() {
-                    format!("{}", i)
+                    format!("{i}")
                 } else if let Some(s) = value.as_string() {
-                    format!("\"{}\"", s)
+                    format!("\"{s}\"")
                 } else if let Some(b) = value.as_blob() {
                     format!("<blob {} bytes>", b.len())
                 } else if value.is_null() {
@@ -2758,7 +2743,7 @@ fn report_container(data: &[u8]) -> IonResult<()> {
     Ok(())
 }
 
-/// Report features (content_features entity) from a KFX file
+/// Report features (`content_features` entity) from a KFX file
 fn report_features(data: &[u8]) -> IonResult<()> {
     use boko::kfx::ion::IonParser;
     use boko::kfx::symbols::KfxSymbol;
@@ -2869,8 +2854,7 @@ fn report_features(data: &[u8]) -> IonResult<()> {
                     let ext_idx = (id as usize) - (base_symbol_count as usize);
                     extended_symbols
                         .get(ext_idx)
-                        .map(|s| s.as_str())
-                        .unwrap_or("?")
+                        .map_or("?", std::string::String::as_str)
                 }
             };
 
@@ -2959,7 +2943,7 @@ fn report_features(data: &[u8]) -> IonResult<()> {
     Ok(())
 }
 
-/// Report metadata (book_metadata entity) from a KFX file
+/// Report metadata (`book_metadata` entity) from a KFX file
 fn report_metadata(data: &[u8]) -> IonResult<()> {
     use boko::kfx::ion::IonParser;
     use boko::kfx::symbols::KfxSymbol;
@@ -3068,8 +3052,7 @@ fn report_metadata(data: &[u8]) -> IonResult<()> {
                     let ext_idx = (id as usize) - (base_symbol_count as usize);
                     extended_symbols
                         .get(ext_idx)
-                        .map(|s| s.as_str())
-                        .unwrap_or("?")
+                        .map_or("?", std::string::String::as_str)
                 }
             };
 
@@ -3117,7 +3100,7 @@ fn report_metadata(data: &[u8]) -> IonResult<()> {
                                                                             boko::kfx::ion::IonValue::String(s) => s.clone(),
                                                                             boko::kfx::ion::IonValue::Int(i) => i.to_string(),
                                                                             boko::kfx::ion::IonValue::Bool(b) => b.to_string(),
-                                                                            _ => format!("{:?}", ival),
+                                                                            _ => format!("{ival:?}"),
                                                                         };
                                                                     }
                                                                     _ => {}
@@ -3137,7 +3120,7 @@ fn report_metadata(data: &[u8]) -> IonResult<()> {
 
                                 // Print category header and metadata
                                 if !cat_name.is_empty() {
-                                    println!("=== {} ===\n", cat_name);
+                                    println!("=== {cat_name} ===\n");
                                     for (key, val) in &metadata_list {
                                         // Truncate long values
                                         let display_val = if val.len() > 60 {
@@ -3272,8 +3255,7 @@ fn report_reading_orders(data: &[u8]) -> IonResult<()> {
                     let ext_idx = (id as usize) - (base_symbol_count as usize);
                     extended_symbols
                         .get(ext_idx)
-                        .map(|s| s.as_str())
-                        .unwrap_or("?")
+                        .map_or("?", std::string::String::as_str)
                 }
             };
 
@@ -3484,7 +3466,7 @@ fn report_document(data: &[u8]) -> IonResult<()> {
     Ok(())
 }
 
-/// Format an IonValue simply for display
+/// Format an `IonValue` simply for display
 fn format_ion_value_simple<F>(value: &boko::kfx::ion::IonValue, resolve_sym: &F) -> String
 where
     F: Fn(u64) -> String,
@@ -3494,10 +3476,10 @@ where
         IonValue::Null => "null".to_string(),
         IonValue::Bool(b) => b.to_string(),
         IonValue::Int(i) => i.to_string(),
-        IonValue::Float(f) => format!("{}", f),
+        IonValue::Float(f) => format!("{f}"),
         IonValue::Decimal(d) => d.clone(),
-        IonValue::String(s) => format!("\"{}\"", s),
-        IonValue::Symbol(s) => resolve_sym(*s).to_string(),
+        IonValue::String(s) => format!("\"{s}\""),
+        IonValue::Symbol(s) => resolve_sym(*s).clone(),
         IonValue::Blob(b) => format!("<blob {} bytes>", b.len()),
         IonValue::List(items) => {
             let parts: Vec<String> = items
@@ -3693,22 +3675,22 @@ fn report_sections(data: &[u8]) -> IonResult<()> {
                                                 }
                                                 "fixed_width" => {
                                                     if let boko::kfx::ion::IonValue::Int(w) = tval {
-                                                        dims = format!("{}x", w);
+                                                        dims = format!("{w}x");
                                                     }
                                                 }
                                                 "fixed_height" => {
                                                     if let boko::kfx::ion::IonValue::Int(h) = tval {
-                                                        dims = format!("{}{}", dims, h);
+                                                        dims = format!("{dims}{h}");
                                                     }
                                                 }
                                                 _ => {}
                                             }
                                         }
 
-                                        let tpl_desc = if !dims.is_empty() {
-                                            format!("{} ({}, {})", story_name, tpl_type, dims)
+                                        let tpl_desc = if dims.is_empty() {
+                                            format!("{story_name} ({tpl_type})")
                                         } else {
-                                            format!("{} ({})", story_name, tpl_type)
+                                            format!("{story_name} ({tpl_type}, {dims})")
                                         };
                                         templates.push(tpl_desc);
                                     }
@@ -3726,13 +3708,13 @@ fn report_sections(data: &[u8]) -> IonResult<()> {
                     } else {
                         format!(" → {}", templates.join(", "))
                     };
-                    println!("{:<15}{}", section_name, templates_str);
+                    println!("{section_name:<15}{templates_str}");
                 }
             }
         }
     }
 
-    println!("\nTotal sections: {}", section_count);
+    println!("\nTotal sections: {section_count}");
     Ok(())
 }
 
@@ -3899,16 +3881,16 @@ fn report_resources(data: &[u8]) -> IonResult<()> {
                 if !resource_name.is_empty() {
                     resource_count += 1;
                     let dims = match (width, height) {
-                        (Some(w), Some(h)) => format!(" {}x{}", w, h),
+                        (Some(w), Some(h)) => format!(" {w}x{h}"),
                         _ => String::new(),
                     };
-                    println!("{:<10} {:<6}{} → {}", resource_name, format, dims, location);
+                    println!("{resource_name:<10} {format:<6}{dims} → {location}");
                 }
             }
         }
     }
 
-    println!("\nTotal resources: {}", resource_count);
+    println!("\nTotal resources: {resource_count}");
     Ok(())
 }
 
@@ -4049,7 +4031,7 @@ fn report_storylines(data: &[u8]) -> IonResult<()> {
 
                 if !story_name.is_empty() {
                     storyline_count += 1;
-                    println!("--- {} ---", story_name);
+                    println!("--- {story_name} ---");
 
                     // Content type summary
                     let mut type_parts = Vec::new();
@@ -4089,7 +4071,7 @@ fn report_storylines(data: &[u8]) -> IonResult<()> {
                     // Sample text
                     if let Some(ref text) = stats.first_text {
                         let display = if text.len() >= 55 {
-                            format!("{}...", text)
+                            format!("{text}...")
                         } else {
                             text.clone()
                         };
@@ -4102,7 +4084,7 @@ fn report_storylines(data: &[u8]) -> IonResult<()> {
         }
     }
 
-    println!("\nTotal storylines: {}", storyline_count);
+    println!("\nTotal storylines: {storyline_count}");
     Ok(())
 }
 
@@ -4118,7 +4100,7 @@ struct ContentStats {
     first_text: Option<String>,
 }
 
-/// Collect content stats recursively from a content_list
+/// Collect content stats recursively from a `content_list`
 fn collect_content_stats<F>(
     items: &[boko::kfx::ion::IonValue],
     resolve_sym: &F,
@@ -4634,7 +4616,7 @@ fn report_locations(data: &[u8]) -> IonResult<()> {
             if !all_locations.is_empty() {
                 let min_id = all_locations.iter().map(|e| e.id).min().unwrap_or(0);
                 let max_id = all_locations.iter().map(|e| e.id).max().unwrap_or(0);
-                println!("Position ID range: {}..{}", min_id, max_id);
+                println!("Position ID range: {min_id}..{max_id}");
                 println!();
 
                 // Helper to format location entry with resolved content
@@ -4644,7 +4626,7 @@ fn report_locations(data: &[u8]) -> IonResult<()> {
                         result.push_str(&format!(":{}", entry.offset));
                     }
                     if let Some(sec_name) = position_to_section.get(&entry.id) {
-                        result.push_str(&format!(" [{}]", sec_name));
+                        result.push_str(&format!(" [{sec_name}]"));
                     }
                     if let Some(info) = position_to_content.get(&entry.id) {
                         result.push_str(&format!(" {}", info.content_type));
@@ -4727,7 +4709,7 @@ fn report_locations(data: &[u8]) -> IonResult<()> {
                 let mut section_list: Vec<_> = section_counts.iter().collect();
                 section_list.sort_by_key(|(name, _)| name.as_str());
                 for (sec_name, count) in section_list {
-                    println!("  {}: {} locations", sec_name, count);
+                    println!("  {sec_name}: {count} locations");
                 }
 
                 // Show content type breakdown
@@ -4741,7 +4723,7 @@ fn report_locations(data: &[u8]) -> IonResult<()> {
                 let mut type_list: Vec<_> = type_counts.iter().collect();
                 type_list.sort_by(|(_, a), (_, b)| b.cmp(a)); // Sort by count descending
                 for (content_type, count) in type_list {
-                    println!("  {}: {} locations", content_type, count);
+                    println!("  {content_type}: {count} locations");
                 }
             }
         }
@@ -4881,7 +4863,7 @@ fn report_positions(data: &[u8]) -> IonResult<()> {
                 // position_map is a List of section structs: { section_name: symbol, contains: [eid, ...] }
                 if let boko::kfx::ion::IonValue::List(sections) = inner {
                     let mut total_refs = 0usize;
-                    for section in sections.iter() {
+                    for section in sections {
                         if let boko::kfx::ion::IonValue::Struct(sec_fields) = section {
                             let mut section_name = String::new();
                             let mut contains: Vec<i64> = Vec::new();
@@ -4920,7 +4902,7 @@ fn report_positions(data: &[u8]) -> IonResult<()> {
                                 );
                                 // Show first few and last few EIDs
                                 if contains.len() <= 10 {
-                                    println!("  EIDs: {:?}", contains);
+                                    println!("  EIDs: {contains:?}");
                                 } else {
                                     println!("  first 5: {:?}", &contains[..5]);
                                     println!("  last 5:  {:?}", &contains[contains.len() - 5..]);
@@ -4930,7 +4912,7 @@ fn report_positions(data: &[u8]) -> IonResult<()> {
                         }
                     }
                     println!("Total sections: {}", sections.len());
-                    println!("Total EID refs: {}", total_refs);
+                    println!("Total EID refs: {total_refs}");
                 }
                 println!();
             } else if is_position_id_map {
@@ -4976,17 +4958,17 @@ fn report_positions(data: &[u8]) -> IonResult<()> {
                         let min_eid = mappings.iter().map(|(_, e, _)| *e).min().unwrap_or(0);
                         let max_eid = mappings.iter().map(|(_, e, _)| *e).max().unwrap_or(0);
                         let nonzero_offsets = mappings.iter().filter(|(_, _, o)| *o != 0).count();
-                        println!("PID range: {}..{}", min_pid, max_pid);
-                        println!("EID range: {}..{}", min_eid, max_eid);
-                        println!("Entries with non-zero offset: {}", nonzero_offsets);
+                        println!("PID range: {min_pid}..{max_pid}");
+                        println!("EID range: {min_eid}..{max_eid}");
+                        println!("Entries with non-zero offset: {nonzero_offsets}");
                         println!();
                         // Show sample mappings
                         println!("Sample mappings (first 15):");
                         for (pid, eid, offset) in mappings.iter().take(15) {
                             if *offset == 0 {
-                                println!("  pid {:>6} → eid {}", pid, eid);
+                                println!("  pid {pid:>6} → eid {eid}");
                             } else {
-                                println!("  pid {:>6} → eid {}:{}", pid, eid, offset);
+                                println!("  pid {pid:>6} → eid {eid}:{offset}");
                             }
                         }
                         if mappings.len() > 15 {
@@ -5106,7 +5088,7 @@ fn report_content(data: &[u8]) -> IonResult<()> {
         let mut parser = IonParser::new(payload_data);
 
         // Get entity name from symbol table
-        let entity_name = if (entity_id as u64) < base_symbol_count {
+        let entity_name = if u64::from(entity_id) < base_symbol_count {
             KFX_SYMBOL_TABLE
                 .get(entity_id as usize)
                 .copied()
@@ -5117,7 +5099,7 @@ fn report_content(data: &[u8]) -> IonResult<()> {
             extended_symbols
                 .get(ext_idx)
                 .cloned()
-                .unwrap_or_else(|| format!("${}", entity_id))
+                .unwrap_or_else(|| format!("${entity_id}"))
         };
 
         content_count += 1;
@@ -5172,8 +5154,7 @@ fn report_content(data: &[u8]) -> IonResult<()> {
                 }
 
                 println!(
-                    "{:<20} {:<12} {} bytes",
-                    entity_name, content_type_str, content_len
+                    "{entity_name:<20} {content_type_str:<12} {content_len} bytes"
                 );
             } else {
                 println!("{:<20} {:<12} {} bytes (raw)", entity_name, "", payload_len);
@@ -5183,7 +5164,7 @@ fn report_content(data: &[u8]) -> IonResult<()> {
         }
     }
 
-    println!("\nTotal content chunks: {}", content_count);
+    println!("\nTotal content chunks: {content_count}");
     Ok(())
 }
 
@@ -5347,7 +5328,7 @@ fn report_dependencies(data: &[u8]) -> IonResult<()> {
                                 total_entities += entity_names.len();
 
                                 if !entity_names.is_empty() {
-                                    println!("Container: {}", container_name);
+                                    println!("Container: {container_name}");
                                     println!("Entities ({}):", entity_names.len());
 
                                     // Group entities by type prefix
@@ -5364,8 +5345,7 @@ fn report_dependencies(data: &[u8]) -> IonResult<()> {
                                                 && name
                                                     .chars()
                                                     .nth(1)
-                                                    .map(|c| c.is_ascii_digit())
-                                                    .unwrap_or(false)
+                                                    .is_some_and(|c| c.is_ascii_digit())
                                         {
                                             "style"
                                         } else if name.starts_with("anchor_")
@@ -5415,7 +5395,7 @@ fn report_dependencies(data: &[u8]) -> IonResult<()> {
                         }
 
                         println!("Total containers: {}", containers.len());
-                        println!("Total entity refs: {}", total_entities);
+                        println!("Total entity refs: {total_entities}");
                     }
                 }
             }
