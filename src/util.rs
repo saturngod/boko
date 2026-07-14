@@ -1,6 +1,50 @@
 //! Utility functions with platform-specific implementations.
 
 use std::borrow::Cow;
+use std::io::{self, Read};
+
+/// Maximum depth for recursive tree walks over parsed (untrusted) document
+/// trees. Mirrors the format-parser depth caps (`MAX_ION_DEPTH`,
+/// `MAX_HUFF_DEPTH`): a hostile ebook can nest elements/navPoints arbitrarily
+/// deep, and every recursive walker would otherwise overflow the stack. 512 is
+/// far beyond any legitimate ebook nesting while staying safe on the small
+/// stacks of the wasm32 target.
+pub const MAX_TREE_DEPTH: usize = 512;
+
+/// Absolute ceiling on the decompressed size of a single archive entry, used to
+/// stop deflate "zip bombs" (a few KB expanding to gigabytes). No legitimate
+/// ebook resource approaches this; a bomb hits the cap and errors cleanly.
+pub const MAX_DECOMPRESSED_ENTRY: usize = 512 * 1024 * 1024;
+
+/// Inflate raw DEFLATE `compressed` bytes with a hard cap on output size.
+///
+/// The archive's claimed uncompressed size is untrusted, so it is only used
+/// (clamped) to size the initial reservation — never to bound the read. The
+/// `hard_cap` (via [`Read::take`]) is what actually stops a decompression bomb:
+/// output is limited to `hard_cap` bytes and an entry that would exceed it
+/// fails with [`io::ErrorKind::InvalidData`] instead of exhausting memory.
+pub fn bounded_inflate(
+    compressed: &[u8],
+    claimed_len: u64,
+    hard_cap: usize,
+) -> io::Result<Vec<u8>> {
+    // Clamp the up-front reservation: never trust `claimed_len`, and never
+    // reserve more than the cap or a modest multiple of the input.
+    let reserve = claimed_len
+        .min(hard_cap as u64)
+        .min(compressed.len().saturating_mul(8) as u64) as usize;
+    let mut out = Vec::with_capacity(reserve);
+    let mut reader =
+        flate2::read::DeflateDecoder::new(compressed).take(hard_cap as u64 + 1);
+    reader.read_to_end(&mut out)?;
+    if out.len() > hard_cap {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decompressed entry exceeds size limit",
+        ));
+    }
+    Ok(out)
+}
 
 /// Get a time-based seed value for pseudo-random number generation.
 ///
@@ -411,6 +455,27 @@ pub fn extract_xml_encoding(bytes: &[u8]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_inflate_rejects_oversize_output() {
+        // Deflate a highly compressible payload, then inflate it with a cap far
+        // below its true size: it must error instead of allocating unbounded.
+        use std::io::Write;
+        let raw = vec![0u8; 1 << 20]; // 1 MiB of zeros -> tiny deflate stream
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&raw).unwrap();
+        let compressed = enc.finish().unwrap();
+        assert!(compressed.len() < 4096, "payload should compress tiny");
+
+        // Lying about the size must not matter: the hard cap is what bounds it.
+        let err = bounded_inflate(&compressed, u64::MAX, 4096).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // A cap above the true size succeeds and round-trips.
+        let out = bounded_inflate(&compressed, 0, 1 << 21).unwrap();
+        assert_eq!(out, raw);
+    }
 
     #[test]
     fn test_detect_media_format_by_extension() {

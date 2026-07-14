@@ -249,12 +249,14 @@ pub(super) fn parse_style_events(events: &[IonValue], ctx: &TokenizeContext) -> 
         .iter()
         .filter_map(|event| {
             let fields = event.as_struct()?;
+            // Reject negative offsets/lengths: `as usize` would wrap a negative
+            // i64 to a near-`usize::MAX` value and corrupt the span tree.
             let offset = get_field(fields, sym!(Offset))
                 .and_then(|v| v.as_int())
-                .map(|n| n as usize)?;
+                .and_then(|n| usize::try_from(n).ok())?;
             let length = get_field(fields, sym!(Length))
                 .and_then(|v| v.as_int())
-                .map(|n| n as usize)?;
+                .and_then(|n| usize::try_from(n).ok())?;
 
             // Get style symbol ID for later lookup
             let style_symbol = get_field(fields, sym!(Style)).and_then(|v| v.as_symbol());
@@ -507,7 +509,9 @@ pub(super) fn build_text_with_spans(
 
     for span in sorted_spans {
         let span_start = span.offset;
-        let span_end = span.offset + span.length;
+        // Saturate: offset/length are bounded-but-untrusted, and out-of-range
+        // char offsets are clamped to the text length by `char_to_byte_offset`.
+        let span_end = span.offset.saturating_add(span.length);
 
         // Pop any spans that have ended before this span starts
         while span_stack.len() > 1 {

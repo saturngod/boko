@@ -255,15 +255,21 @@ impl Cncx {
             let mut pos = 0;
             while pos < raw.len() {
                 let (length, consumed) = decint(&raw[pos..]);
-                if length > 0 && pos + consumed + length as usize <= raw.len() {
-                    let bytes = &raw[pos + consumed..pos + consumed + length as usize];
-                    let s = match codec {
-                        "utf-8" | "UTF-8" => String::from_utf8_lossy(bytes).to_string(),
-                        _ => String::from_utf8_lossy(bytes).to_string(),
-                    };
+                // Guard against a non-advancing loop on malformed input: without
+                // this a zero-length varint would spin forever.
+                if consumed == 0 {
+                    break;
+                }
+                let length = length as usize;
+                let start = pos + consumed;
+                if length > 0
+                    && let Some(end) = start.checked_add(length)
+                    && end <= raw.len()
+                {
+                    let s = crate::util::decode_text(&raw[start..end], Some(codec)).into_owned();
                     strings.insert((pos as u32) + record_offset, s);
                 }
-                pos += consumed + length as usize;
+                pos = start.saturating_add(length);
             }
             record_offset += 0x10000;
         }

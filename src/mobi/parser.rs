@@ -170,7 +170,11 @@ pub fn parse_fdst(data: &[u8]) -> io::Result<Vec<(usize, usize)>> {
     let sec_start = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
     let num_sections = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
 
-    let mut flows = Vec::with_capacity(num_sections);
+    // `num_sections` is untrusted; each entry needs 8 bytes, so it can't exceed
+    // the record size. Clamp the reservation so a bogus count (e.g. 0xFFFFFFFF)
+    // can't request a multi-gigabyte allocation before the per-entry bounds
+    // check runs.
+    let mut flows = Vec::with_capacity(num_sections.min(data.len() / 8));
     for i in 0..num_sections {
         let offset = sec_start + i * 8;
         if offset + 8 > data.len() {
@@ -342,7 +346,12 @@ pub fn decode_font_record(data: &[u8]) -> io::Result<Vec<u8>> {
 
     // Deobfuscate: XOR the first 1040 bytes with the key (Amazon's chosen window).
     if is_obfuscated && xor_key_len > 0 {
-        let key_end = xor_key_offset + xor_key_len;
+        let Some(key_end) = xor_key_offset.checked_add(xor_key_len) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FONT XOR key offset overflow",
+            ));
+        };
         if key_end > data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -486,6 +495,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_fdst_ignores_bogus_section_count() {
+        // Header claims 0xFFFF_FFFF sections but the record is tiny. The old
+        // eager `Vec::with_capacity(num_sections)` would try to reserve ~64 GiB;
+        // now it must return a small result without panicking or OOM.
+        let mut data = Vec::new();
+        data.extend_from_slice(b"FDST");
+        data.extend_from_slice(&12u32.to_be_bytes()); // sec_start
+        data.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // num_sections (lie)
+        let flows = parse_fdst(&data).unwrap();
+        assert!(flows.is_empty());
+    }
 
     fn make_pdb_header(name: &str, num_records: u16, offsets: &[u32]) -> Vec<u8> {
         let mut data = vec![0u8; 78 + num_records as usize * 8];

@@ -68,7 +68,7 @@ fn synthesize_html_with_resolver<R: StyleResolver>(ir: &Chapter, resolver: &R) -
 
     // Walk children of root (skip the root node itself)
     for child_id in ir.children(NodeId::ROOT) {
-        walk_node(child_id, &mut ctx);
+        walk_node(child_id, &mut ctx, 0);
     }
 
     SynthesisResult {
@@ -162,7 +162,10 @@ impl<R: StyleResolver> SynthesisContext<'_, R> {
 }
 
 /// Walk a node and emit its HTML.
-fn walk_node<R: StyleResolver>(id: NodeId, ctx: &mut SynthesisContext<'_, R>) {
+fn walk_node<R: StyleResolver>(id: NodeId, ctx: &mut SynthesisContext<'_, R>, depth: usize) {
+    if depth > crate::util::MAX_TREE_DEPTH {
+        return;
+    }
     let Some(node) = ctx.ir.node(id) else {
         return;
     };
@@ -278,7 +281,7 @@ fn walk_node<R: StyleResolver>(id: NodeId, ctx: &mut SynthesisContext<'_, R>) {
 
     // Emit children
     for child_id in ctx.ir.children(id) {
-        walk_node(child_id, ctx);
+        walk_node(child_id, ctx, depth + 1);
     }
 
     // Emit closing tag

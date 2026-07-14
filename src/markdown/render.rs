@@ -59,6 +59,8 @@ pub struct RenderContext<'a> {
     has_line_content: bool,
     pending_newline: bool,
     last_block_role: Option<Role>,
+    // Current recursion depth, to bound stack usage on hostile trees.
+    depth: usize,
 }
 
 impl<'a> RenderContext<'a> {
@@ -82,6 +84,7 @@ impl<'a> RenderContext<'a> {
             has_line_content: false,
             pending_newline: false,
             last_block_role: None,
+            depth: 0,
         }
     }
 
@@ -571,9 +574,16 @@ impl<'a> RenderContext<'a> {
     }
 
     fn walk_children(&mut self, id: NodeId) {
+        // Bound recursion depth: a hostile chapter can nest arbitrarily deep.
+        // All descent flows through here, so guarding this one site suffices.
+        if self.depth > crate::util::MAX_TREE_DEPTH {
+            return;
+        }
+        self.depth += 1;
         for child_id in self.chapter.children(id) {
             self.walk_node(child_id);
         }
+        self.depth -= 1;
     }
 
     fn write_text(&mut self, text: &str) {

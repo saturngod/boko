@@ -588,6 +588,15 @@ pub fn parse_ncx(content: &str) -> io::Result<Vec<TocEntry>> {
                 let local = local_name(name.as_ref());
                 match local {
                     b"navPoint" => {
+                        // Reject pathologically deep nesting: the resulting
+                        // TocEntry tree is consumed (and dropped) recursively, so
+                        // an unbounded-depth NCX would overflow the stack later.
+                        if stack.len() > crate::util::MAX_TREE_DEPTH {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "NCX navPoint nesting too deep",
+                            ));
+                        }
                         let mut play_order = None;
                         for attr in e.attributes().flatten() {
                             if attr.key.as_ref() == b"playOrder"
@@ -864,6 +873,23 @@ fn resolve_entity(entity: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_ncx_rejects_pathological_nesting() {
+        // ~5000 nested navPoints: without a depth cap the resulting TocEntry
+        // tree would overflow the stack on its recursive Drop / consumers.
+        let depth = 5000;
+        let mut ncx = String::from("<ncx><navMap>");
+        for _ in 0..depth {
+            ncx.push_str("<navPoint><navLabel><text>x</text></navLabel><content src=\"a\"/>");
+        }
+        for _ in 0..depth {
+            ncx.push_str("</navPoint>");
+        }
+        ncx.push_str("</navMap></ncx>");
+        let err = parse_ncx(&ncx).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn test_strip_bom() {

@@ -62,6 +62,20 @@ impl ComputedStyle {
         self.properties.iter()
     }
 
+    /// Order-independent equality of the property sets. Used to confirm a
+    /// [`compute_hash`](Self::compute_hash) match is genuine rather than a
+    /// 64-bit collision between two distinct styles.
+    fn same_properties(&self, other: &ComputedStyle) -> bool {
+        if self.properties.len() != other.properties.len() {
+            return false;
+        }
+        let mut a = self.properties.clone();
+        let mut b = other.properties.clone();
+        a.sort_by_key(|(s, _)| *s as u64);
+        b.sort_by_key(|(s, _)| *s as u64);
+        a == b
+    }
+
     /// Check if this style contains any block-only properties.
     pub fn has_block_properties(&self, schema: &StyleSchema) -> bool {
         for (symbol, _) in &self.properties {
@@ -181,8 +195,11 @@ fn hash_kfx_value<H: Hasher>(value: &KfxValue, hasher: &mut H) {
 
 /// Registry for collecting and deduplicating styles during export.
 pub struct StyleRegistry {
-    /// Hash -> (style_id, style_name_symbol, computed_style)
-    styles: HashMap<u64, (u64, u64, ComputedStyle)>,
+    /// Hash -> bucket of (style_id, style_name_symbol, computed_style).
+    /// Bucketed so a 64-bit hash collision between two *different* styles is
+    /// resolved by comparing the actual properties, rather than silently
+    /// merging them.
+    styles: HashMap<u64, Vec<(u64, u64, ComputedStyle)>>,
 
     /// Next style ID to assign
     next_style_id: u64,
@@ -233,7 +250,11 @@ impl StyleRegistry {
 
         let hash = style.compute_hash();
 
-        if let Some((_, name_symbol, _)) = self.styles.get(&hash) {
+        let bucket = self.styles.entry(hash).or_default();
+        // Confirm a hash hit is a real match, not a collision.
+        if let Some((_, name_symbol, _)) =
+            bucket.iter().find(|(_, _, existing)| existing.same_properties(&style))
+        {
             return *name_symbol;
         }
 
@@ -244,14 +265,14 @@ impl StyleRegistry {
         let style_name = format!("s{:X}", style_id);
         let name_symbol = symbols.get_or_intern(&style_name);
 
-        self.styles.insert(hash, (style_id, name_symbol, style));
+        bucket.push((style_id, name_symbol, style));
 
         name_symbol
     }
 
     /// Get the number of unique styles.
     pub fn len(&self) -> usize {
-        self.styles.len()
+        self.styles.values().map(Vec::len).sum()
     }
 
     /// Check if the registry is empty.
@@ -273,8 +294,8 @@ impl StyleRegistry {
         result.push(("s0".to_string(), default_ion));
 
         // Then all registered styles
-        // Tuple is (style_id, name_symbol, computed_style)
-        for (_, (style_id, name_symbol, style)) in self.styles.drain() {
+        // Each bucket holds one or more (style_id, name_symbol, computed_style).
+        for (style_id, name_symbol, style) in self.styles.drain().flat_map(|(_, v)| v) {
             let ion = style.to_ion(name_symbol);
             // Use style_id for the fragment name (e.g., "s1", "s2", "sA")
             let name = format!("s{:X}", style_id);
@@ -286,7 +307,10 @@ impl StyleRegistry {
 
     /// Get all styles without draining.
     pub fn styles(&self) -> impl Iterator<Item = (&u64, &ComputedStyle)> {
-        self.styles.values().map(|(id, _, style)| (id, style))
+        self.styles
+            .values()
+            .flatten()
+            .map(|(id, _, style)| (id, style))
     }
 }
 

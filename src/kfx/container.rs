@@ -186,11 +186,21 @@ pub fn parse_index_table(data: &[u8], header_len: usize) -> Vec<EntityLoc> {
             break;
         }
 
+        // Offsets/lengths are untrusted u64s. Do the arithmetic in u64 (so the
+        // `as usize` truncation on 32-bit/wasm targets can't turn a >4 GiB value
+        // into a small in-bounds one) and saturate on overflow; an out-of-range
+        // offset/length is rejected by the bounds-checked `read_at` downstream.
+        let raw_offset = read_u64_le(data, entry_offset + 8);
+        let offset = (header_len as u64)
+            .checked_add(raw_offset)
+            .and_then(|o| usize::try_from(o).ok())
+            .unwrap_or(usize::MAX);
+        let length = usize::try_from(read_u64_le(data, entry_offset + 16)).unwrap_or(usize::MAX);
         entities.push(EntityLoc {
             id: read_u32_le(data, entry_offset),
             type_id: read_u32_le(data, entry_offset + 4),
-            offset: header_len + read_u64_le(data, entry_offset + 8) as usize,
-            length: read_u64_le(data, entry_offset + 16) as usize,
+            offset,
+            length,
         });
     }
 

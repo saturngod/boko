@@ -92,7 +92,7 @@ impl<'a> TransformContext<'a> {
         }
 
         // Process body's children as children of IR root, inheriting body's style
-        self.process_children(body, NodeId::ROOT, Some(&body_style));
+        self.process_children(body, NodeId::ROOT, Some(&body_style), 0);
 
         self.chapter
     }
@@ -103,13 +103,14 @@ impl<'a> TransformContext<'a> {
         dom_parent: ArenaNodeId,
         ir_parent: NodeId,
         parent_style: Option<&ComputedStyle>,
+        depth: usize,
     ) {
         // Copy the &'a ArenaDom out of self so the child iterator borrows the
         // DOM (immutable for the whole transform), not `self` — avoids
         // collecting children into a Vec for every element.
         let dom = self.dom;
         for child_id in dom.children(dom_parent) {
-            self.process_node(child_id, ir_parent, parent_style);
+            self.process_node(child_id, ir_parent, parent_style, depth);
         }
     }
 
@@ -119,7 +120,13 @@ impl<'a> TransformContext<'a> {
         dom_id: ArenaNodeId,
         ir_parent: NodeId,
         parent_style: Option<&ComputedStyle>,
+        depth: usize,
     ) {
+        // A hostile document can nest elements arbitrarily deep; cap the
+        // recursion so it degrades gracefully instead of overflowing the stack.
+        if depth > crate::util::MAX_TREE_DEPTH {
+            return;
+        }
         let node = match self.dom.get(dom_id) {
             Some(n) => n,
             None => return,
@@ -293,7 +300,7 @@ impl<'a> TransformContext<'a> {
                 }
 
                 // Process children
-                self.process_children(dom_id, ir_id, Some(&computed));
+                self.process_children(dom_id, ir_id, Some(&computed), depth + 1);
             }
 
             // Skip other node types

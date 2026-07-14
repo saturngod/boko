@@ -628,6 +628,11 @@ fn generate_ncx(metadata: &crate::model::Metadata, toc: &[TocEntry]) -> String {
 
 /// Recursively write navPoint elements.
 fn write_nav_points(ncx: &mut String, entries: &[TocEntry], play_order: &mut usize, indent: usize) {
+    // `indent` grows one per nesting level; cap it so a pathologically deep TOC
+    // can't overflow the stack during export.
+    if indent > crate::util::MAX_TREE_DEPTH {
+        return;
+    }
     let indent_str = "  ".repeat(indent);
 
     for entry in entries {

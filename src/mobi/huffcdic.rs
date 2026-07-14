@@ -9,6 +9,27 @@ use std::io;
 /// only a handful of levels; this guards against a crafted CDIC record.
 const MAX_HUFF_DEPTH: usize = 32;
 
+/// Maximum bytes a single text record may decompress to. HUFF/CDIC can amplify
+/// hugely (a small Huffman record referencing deeply-nested dictionary nodes),
+/// so bound the output per record to stop a decompression bomb. Real records
+/// decompress to at most tens of KB; this ceiling is far above that.
+const MAX_DECOMPRESSED_RECORD: usize = 16 * 1024 * 1024;
+
+/// Charge `n` bytes against the remaining decompression budget, erroring if the
+/// record would exceed [`MAX_DECOMPRESSED_RECORD`].
+fn take_budget(budget: &mut usize, n: usize) -> io::Result<()> {
+    match budget.checked_sub(n) {
+        Some(rem) => {
+            *budget = rem;
+            Ok(())
+        }
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HUFF/CDIC record exceeds decompressed size limit",
+        )),
+    }
+}
+
 /// Dictionary entry: (slice data, is_leaf flag)
 #[derive(Clone)]
 enum DictEntry {
@@ -60,7 +81,7 @@ impl HuffCdicReader {
         let off2 = u32::from_be_bytes([huff[12], huff[13], huff[14], huff[15]]) as usize;
 
         // Load dict1: 256 entries at off1
-        if huff.len() < off1 + 256 * 4 {
+        if off1.checked_add(256 * 4).is_none_or(|end| huff.len() < end) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "HUFF dict1 truncated",
@@ -86,7 +107,7 @@ impl HuffCdicReader {
         }
 
         // Load dict2: 64 entries at off2 (32 mincode/maxcode pairs)
-        if huff.len() < off2 + 64 * 4 {
+        if off2.checked_add(64 * 4).is_none_or(|end| huff.len() < end) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "HUFF dict2 truncated",
@@ -106,8 +127,11 @@ impl HuffCdicReader {
 
             let codelen = i + 1;
             self.mincode.push(mincode_raw << (32 - codelen));
+            // `maxcode_raw` is a full 32-bit field here, so `+ 1` can overflow;
+            // wrap it (matches the intended modular arithmetic) instead of
+            // panicking under overflow-checks.
             self.maxcode
-                .push(((maxcode_raw + 1) << (32 - codelen)).wrapping_sub(1));
+                .push((maxcode_raw.wrapping_add(1) << (32 - codelen)).wrapping_sub(1));
         }
 
         Ok(())
@@ -125,10 +149,21 @@ impl HuffCdicReader {
         let phrases = u32::from_be_bytes([cdic[8], cdic[9], cdic[10], cdic[11]]) as usize;
         let bits = u32::from_be_bytes([cdic[12], cdic[13], cdic[14], cdic[15]]) as usize;
 
-        let n = std::cmp::min(1 << bits, phrases.saturating_sub(self.dictionary.len()));
+        // `bits` is untrusted; `1 << bits` overflows (panics under
+        // overflow-checks) for `bits >= usize::BITS`. Saturate instead — the
+        // count is bounded by the phrase count and the offset-table check below.
+        let entry_cap = u32::try_from(bits)
+            .ok()
+            .and_then(|b| 1usize.checked_shl(b))
+            .unwrap_or(usize::MAX);
+        let n = std::cmp::min(entry_cap, phrases.saturating_sub(self.dictionary.len()));
 
         // Read offset table
-        if cdic.len() < 16 + n * 2 {
+        if n
+            .checked_mul(2)
+            .and_then(|b| b.checked_add(16))
+            .is_none_or(|end| cdic.len() < end)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "CDIC offset table truncated",
@@ -167,11 +202,18 @@ impl HuffCdicReader {
     /// Decompress a text record
     pub fn decompress(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
         let mut result = Vec::new();
-        self.unpack_into(data, &mut result, 0)?;
+        let mut budget = MAX_DECOMPRESSED_RECORD;
+        self.unpack_into(data, &mut result, 0, &mut budget)?;
         Ok(result)
     }
 
-    fn unpack_into(&mut self, data: &[u8], output: &mut Vec<u8>, depth: usize) -> io::Result<()> {
+    fn unpack_into(
+        &mut self,
+        data: &[u8],
+        output: &mut Vec<u8>,
+        depth: usize,
+        budget: &mut usize,
+    ) -> io::Result<()> {
         // Node entries unpack recursively; cap the depth so a crafted CDIC
         // dictionary can't drive unbounded recursion into a stack overflow.
         if depth > MAX_HUFF_DEPTH {
@@ -242,17 +284,21 @@ impl HuffCdicReader {
             // Get the slice, unpacking recursively if needed
             match &self.dictionary[r] {
                 DictEntry::Leaf(slice) => {
+                    take_budget(budget, slice.len())?;
                     output.extend_from_slice(slice);
                 }
                 DictEntry::Node(slice) => {
-                    // Need to recursively unpack
+                    // Need to recursively unpack. The recursive call charges the
+                    // shared budget for every leaf byte it emits, so copying the
+                    // result into `output` afterwards is not double-counted.
                     let slice_copy = slice.clone();
                     let mut unpacked = Vec::new();
-                    self.unpack_into(&slice_copy, &mut unpacked, depth + 1)?;
+                    self.unpack_into(&slice_copy, &mut unpacked, depth + 1, budget)?;
                     output.extend_from_slice(&unpacked);
                     self.dictionary[r] = DictEntry::Unpacked(unpacked);
                 }
                 DictEntry::Unpacked(slice) => {
+                    take_budget(budget, slice.len())?;
                     output.extend_from_slice(slice);
                 }
             }
@@ -282,6 +328,23 @@ fn read_u64_be(data: &[u8], pos: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_cdic_survives_huge_bits_field() {
+        // A crafted CDIC with `bits = 0xFFFF_FFFF` used to panic on `1 << bits`
+        // (shift overflow). It must now be handled without panicking.
+        let mut reader = HuffCdicReader {
+            dict1: Vec::new(),
+            mincode: Vec::new(),
+            maxcode: Vec::new(),
+            dictionary: Vec::new(),
+        };
+        let mut cdic = Vec::new();
+        cdic.extend_from_slice(b"CDIC\x00\x00\x00\x10");
+        cdic.extend_from_slice(&0u32.to_be_bytes()); // phrases = 0
+        cdic.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // bits (hostile)
+        assert!(reader.load_cdic(&cdic).is_ok());
+    }
 
     #[test]
     fn test_read_u64_be() {
