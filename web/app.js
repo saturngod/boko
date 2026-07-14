@@ -84,8 +84,8 @@ function updateOutputOptions(inputFormat) {
 
     if (inputFormat === 'epub') {
         outputFormat.innerHTML = `
+            <option value="kfx" selected>KFX</option>
             <option value="azw3">AZW3</option>
-            <option value="kfx">KFX</option>
             <option value="markdown">Markdown</option>
         `;
     } else if (inputFormat === 'azw3') {
