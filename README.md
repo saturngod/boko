@@ -41,7 +41,10 @@ Requires Rust 1.85+.
     boko dump in.epub
     boko dump -c 0 in.epub
 
-`kfx-dump` is installed alongside `boko`.
+KFX/KDF/Ion internals can be inspected with the `kfx-dump` subcommand:
+
+    boko kfx-dump book.kfx
+    boko kfx-dump -f metadata -f sections book.kfx
 
 ## Library
 

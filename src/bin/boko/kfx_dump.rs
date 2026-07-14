@@ -1,6 +1,5 @@
 use boko::kfx::container::{extract_doc_symbols, read_u16_le, read_u32_le, read_u64_le};
 use boko::kfx::symbols::KFX_SYMBOL_TABLE;
-use clap::Parser;
 use ion_rs::{
     AnyEncoding, Decoder, ElementReader, IonResult, MapCatalog, Reader, SharedSymbolTable,
 };
@@ -10,13 +9,9 @@ use std::fs;
 /// Ion 1.0 Binary Version Marker
 const ION_BVM: [u8; 4] = [0xE0, 0x01, 0x00, 0xEA];
 
-/// Dump KFX/KDF/Ion files for debugging
-#[derive(Parser, Debug)]
-#[command(name = "kfx-dump")]
-#[command(
-    about = "Dumps KFX/KDF/Ion files. Supports KFX container files (.kfx) and raw Ion binary files (.kdf, .ion)"
-)]
-struct Args {
+/// Arguments for the `boko kfx-dump` subcommand.
+#[derive(clap::Args, Debug)]
+pub struct KfxDumpArgs {
     /// KFX file to dump
     file: String,
 
@@ -32,6 +27,11 @@ struct Args {
     /// Supported: anchors, toc
     #[arg(short = 'f', long = "field")]
     field: Vec<String>,
+}
+
+/// Entry point for the `boko kfx-dump` subcommand.
+pub fn run(args: &KfxDumpArgs) -> Result<(), String> {
+    dump(args).map_err(|e| e.to_string())
 }
 
 /// Resolved entity information for better output
@@ -74,10 +74,8 @@ fn build_symbol_table_preamble_with_max_id(max_id: i64) -> Vec<u8> {
     writer.close().unwrap()
 }
 
-fn main() -> IonResult<()> {
-    let args = Args::parse();
-
-    let data = fs::read(&args.file).expect("Failed to read file");
+fn dump(args: &KfxDumpArgs) -> IonResult<()> {
+    let data = fs::read(&args.file).map_err(ion_rs::IonError::from)?;
 
     // Handle field reports
     if !args.field.is_empty() {

@@ -86,11 +86,7 @@ criterion = "0.8"
 
 [[bin]]
 name = "boko"
-required-features = ["cli"]
-
-[[bin]]
-name = "kfx-dump"
-path = "src/bin/kfx-dump.rs"
+path = "src/bin/boko/main.rs"
 required-features = ["cli"]
 
 [[bench]]

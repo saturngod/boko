@@ -3,6 +3,8 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+
+mod kfx_dump;
 use serde::Serialize;
 
 use boko::{Book, Chapter, ChapterId, Format, NodeId, Role, ToCss, TocEntry, extract_section_tree};
@@ -47,6 +49,9 @@ enum Command {
         #[arg(short, long)]
         quiet: bool,
     },
+
+    /// Dump KFX/KDF/Ion files for debugging (KFX containers and raw Ion binary)
+    KfxDump(kfx_dump::KfxDumpArgs),
 
     /// Extract hierarchical section tree (JSON)
     Sections {
@@ -94,6 +99,7 @@ fn main() -> ExitCode {
 
     let result = match cli.command {
         Command::Info { file, json } => show_info(&file, json),
+        Command::KfxDump(args) => kfx_dump::run(&args),
         Command::Sections { file } => show_sections(&file),
         Command::Convert {
             input,
