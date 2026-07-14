@@ -1,222 +1,7 @@
-//! AZW3/KF8 exporter.
-//!
-//! Creates KF8 (Kindle Format 8) files from Book structures.
+use super::*;
+use super::guide::*;
 
-use std::collections::{HashMap, HashSet};
-use std::io::{self, Seek, Write};
-use std::path::Path;
-
-use flate2::Compression;
-use flate2::write::ZlibEncoder;
-
-use crate::mobi::index::{
-    GuideBuildEntry, NcxBuildEntry, build_chunk_indx, build_cncx, build_guide_indx, build_ncx_indx,
-    build_skel_indx, calculate_cncx_offsets,
-};
-use crate::mobi::skeleton::{Chunker, ChunkerResult};
-use crate::mobi::writer_transform::{
-    rewrite_css_references_fast, rewrite_html_references_fast, write_base32_4, write_base32_10,
-};
-use crate::model::{Book, Resource, TocEntry};
-
-use super::Exporter;
-
-// Constants
-const RECORD_SIZE: usize = 4096;
-const NULL_INDEX: u32 = 0xFFFF_FFFF;
-const XOR_KEY_LEN: usize = 20;
-
-/// Configuration for AZW3 export.
-#[derive(Debug, Clone, Default)]
-pub struct Azw3Config {
-    /// If true, normalize content through IR pipeline for clean, consistent output.
-    /// Default is false (passthrough mode preserves original HTML/CSS).
-    pub normalize: bool,
-}
-
-/// AZW3/KF8 format exporter.
-///
-/// Creates KF8 files compatible with modern Kindle devices.
-pub struct Azw3Exporter {
-    config: Azw3Config,
-}
-
-impl Azw3Exporter {
-    /// Create a new exporter with default configuration.
-    pub fn new() -> Self {
-        Self {
-            config: Azw3Config::default(),
-        }
-    }
-
-    /// Configure the exporter with custom settings.
-    pub fn with_config(mut self, config: Azw3Config) -> Self {
-        self.config = config;
-        self
-    }
-}
-
-impl Default for Azw3Exporter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Exporter for Azw3Exporter {
-    fn export<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> crate::Result<()> {
-        let builder = Kf8Builder::new(book, self.config.normalize)?;
-        Ok(builder.write(writer)?)
-    }
-}
-
-/// Internal context for collecting book data.
-struct BookContext {
-    /// Maps href -> Resource (data + media_type)
-    resources: HashMap<String, Resource>,
-    /// Spine items as (href, data) pairs
-    spine: Vec<SpineItem>,
-    /// TOC entries
-    toc: Vec<TocEntry>,
-    /// Metadata
-    metadata: crate::model::Metadata,
-    /// Landmarks (used to build the K8 guide index).
-    landmarks: Vec<crate::model::Landmark>,
-}
-
-impl BookContext {
-    fn landmarks(&self) -> &[crate::model::Landmark] {
-        &self.landmarks
-    }
-}
-
-struct SpineItem {
-    href: String,
-    data: Vec<u8>,
-}
-
-impl BookContext {
-    /// Collect all data from a Book into internal structures.
-    fn from_book(book: &mut Book, normalize: bool) -> io::Result<Self> {
-        if normalize {
-            Self::from_normalized(book)
-        } else {
-            Self::from_raw(book)
-        }
-    }
-
-    /// Collect raw (passthrough) content from the book.
-    fn from_raw(book: &mut Book) -> io::Result<Self> {
-        // Collect metadata and TOC (these are borrowed, so clone)
-        let metadata = book.metadata().clone();
-        let toc = book.toc().to_vec();
-
-        // Collect spine items
-        let spine_entries: Vec<_> = book.spine().to_vec();
-        let mut spine = Vec::with_capacity(spine_entries.len());
-
-        for entry in &spine_entries {
-            let href = book
-                .source_id(entry.id)
-                .unwrap_or("unknown.xhtml")
-                .to_string();
-            let data = book.load_raw(entry.id)?;
-            spine.push(SpineItem { href, data });
-        }
-
-        // Collect assets
-        let asset_paths: Vec<_> = book.list_assets().to_vec();
-        let mut resources = HashMap::new();
-
-        for path in asset_paths {
-            let path_str = path.to_string_lossy().to_string();
-            let data = book.load_asset(&path)?;
-            let media_type = guess_media_type(&path_str);
-
-            resources.insert(path_str, Resource { data, media_type });
-        }
-
-        // Also add spine items as resources (needed for internal lookups)
-        for item in &spine {
-            if !resources.contains_key(&item.href) {
-                resources.insert(
-                    item.href.clone(),
-                    Resource {
-                        data: item.data.clone(),
-                        media_type: "application/xhtml+xml".to_string(),
-                    },
-                );
-            }
-        }
-
-        Ok(Self {
-            resources,
-            spine,
-            toc,
-            metadata,
-            landmarks: book.landmarks().to_vec(),
-        })
-    }
-
-    /// Collect normalized content from the book through IR pipeline.
-    fn from_normalized(book: &mut Book) -> io::Result<Self> {
-        use super::normalize::normalize_book;
-
-        let normalized = normalize_book(book)?;
-
-        // Collect metadata and TOC
-        let metadata = book.metadata().clone();
-        let toc = book.toc().to_vec();
-
-        let mut resources = HashMap::new();
-
-        // Add unified CSS as a resource
-        if !normalized.css.is_empty() {
-            resources.insert(
-                "style.css".to_string(),
-                Resource {
-                    data: normalized.css.into_bytes(),
-                    media_type: "text/css".to_string(),
-                },
-            );
-        }
-
-        // Build spine from normalized chapters
-        let mut spine = Vec::with_capacity(normalized.chapters.len());
-        for (i, chapter) in normalized.chapters.iter().enumerate() {
-            let href = format!("chapter_{}.xhtml", i);
-            let data = chapter.document.as_bytes().to_vec();
-
-            // Add as resource
-            resources.insert(
-                href.clone(),
-                Resource {
-                    data: data.clone(),
-                    media_type: "application/xhtml+xml".to_string(),
-                },
-            );
-
-            spine.push(SpineItem { href, data });
-        }
-
-        // Add referenced assets
-        for asset_path in &normalized.assets {
-            if let Ok(data) = book.load_asset(std::path::Path::new(asset_path)) {
-                let media_type = guess_media_type(asset_path);
-                resources.insert(asset_path.clone(), Resource { data, media_type });
-            }
-        }
-
-        Ok(Self {
-            resources,
-            spine,
-            toc,
-            metadata,
-            landmarks: book.landmarks().to_vec(),
-        })
-    }
-}
-
-struct Kf8Builder {
+pub(super) struct Kf8Builder {
     ctx: BookContext,
     records: Vec<Vec<u8>>,
     text_length: usize,
@@ -247,7 +32,7 @@ struct Kf8Builder {
 }
 
 impl Kf8Builder {
-    fn new(book: &mut Book, normalize: bool) -> io::Result<Self> {
+    pub(super) fn new(book: &mut Book, normalize: bool) -> io::Result<Self> {
         let ctx = BookContext::from_book(book, normalize)?;
 
         let mut builder = Self {
@@ -284,7 +69,7 @@ impl Kf8Builder {
         Ok(builder)
     }
 
-    fn collect_resources(&mut self) -> io::Result<()> {
+    pub(super) fn collect_resources(&mut self) -> io::Result<()> {
         // Collect images
         self.image_hrefs = self
             .ctx
@@ -346,7 +131,7 @@ impl Kf8Builder {
         Ok(())
     }
 
-    fn build_text_records(&mut self) -> io::Result<()> {
+    pub(super) fn build_text_records(&mut self) -> io::Result<()> {
         // Build CSS href -> flow index map
         let mut css_hrefs: Vec<_> = self
             .ctx
@@ -465,7 +250,7 @@ impl Kf8Builder {
         Ok(())
     }
 
-    fn resolve_link_placeholders(
+    pub(super) fn resolve_link_placeholders(
         &self,
         text: &[u8],
         id_map: &HashMap<(String, String), String>,
@@ -548,7 +333,7 @@ impl Kf8Builder {
         result
     }
 
-    fn write_resource_records(&mut self) -> io::Result<()> {
+    pub(super) fn write_resource_records(&mut self) -> io::Result<()> {
         if !self.image_hrefs.is_empty() || !self.font_hrefs.is_empty() {
             self.first_resource_record = self.records.len() as u32;
         }
@@ -571,7 +356,7 @@ impl Kf8Builder {
         Ok(())
     }
 
-    fn build_kf8_indices(&mut self) -> io::Result<()> {
+    pub(super) fn build_kf8_indices(&mut self) -> io::Result<()> {
         if let Some(ref chunker_result) = self.chunker_result {
             // Build SKEL index
             if !chunker_result.skel_table.is_empty() {
@@ -659,7 +444,7 @@ impl Kf8Builder {
     /// since at least Paperwhite 3 refuse to open books that declare TBS-style
     /// `extra_data_flags` (0x02) but omit the actual trailers, or that declare
     /// no TBS at all on multi-chapter books.
-    fn apply_trailing_byte_sequences(&mut self) {
+    pub(super) fn apply_trailing_byte_sequences(&mut self) {
         if self.ncx_entries.is_empty() || self.last_text_record == 0 {
             return;
         }
@@ -703,7 +488,7 @@ impl Kf8Builder {
         }
     }
 
-    fn build_fdst_record(&mut self) -> io::Result<()> {
+    pub(super) fn build_fdst_record(&mut self) -> io::Result<()> {
         let num_flows = 1 + self.css_flows.len();
 
         let mut fdst = Vec::new();
@@ -729,7 +514,7 @@ impl Kf8Builder {
         Ok(())
     }
 
-    fn build_flis_fcis_eof(&mut self) -> io::Result<()> {
+    pub(super) fn build_flis_fcis_eof(&mut self) -> io::Result<()> {
         // FLIS
         let flis = b"FLIS\0\0\0\x08\0\x41\0\0\0\0\0\0\xff\xff\xff\xff\0\x01\0\x03\0\0\0\x03\0\0\0\x01\xff\xff\xff\xff";
         self.records.push(flis.to_vec());
@@ -750,7 +535,7 @@ impl Kf8Builder {
         Ok(())
     }
 
-    fn build_record0(&mut self) -> io::Result<()> {
+    pub(super) fn build_record0(&mut self) -> io::Result<()> {
         let title = &self.ctx.metadata.title;
         let title_bytes = title.as_bytes();
 
@@ -895,7 +680,7 @@ impl Kf8Builder {
         Ok(())
     }
 
-    fn build_exth(&self) -> Vec<u8> {
+    pub(super) fn build_exth(&self) -> Vec<u8> {
         let mut records: Vec<(u32, Vec<u8>)> = Vec::new();
 
         // Authors
@@ -1041,7 +826,7 @@ impl Kf8Builder {
         exth
     }
 
-    fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+    pub(super) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         // Calculate offsets
         let mut offsets = Vec::new();
         let pdb_header_size = 78 + 8 * self.records.len() + 2;
@@ -1101,7 +886,7 @@ impl Kf8Builder {
 }
 
 /// Create a FONT record from raw font data.
-fn write_font_record(data: &[u8]) -> io::Result<Vec<u8>> {
+pub(super) fn write_font_record(data: &[u8]) -> io::Result<Vec<u8>> {
     let usize_val = data.len() as u32;
     let mut flags: u32 = 0;
 
@@ -1150,326 +935,17 @@ fn write_font_record(data: &[u8]) -> io::Result<Vec<u8>> {
     Ok(record)
 }
 
-fn rand_uid() -> u32 {
+pub(super) fn rand_uid() -> u32 {
     let seed = crate::util::time_seed_nanos() as u32;
     seed.wrapping_mul(1103515245).wrapping_add(12345)
 }
 
-fn sanitize_title(title: &str) -> String {
+pub(super) fn sanitize_title(title: &str) -> String {
     title
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == ' ' || *c == '_' || *c == '-')
         .collect::<String>()
         .replace(' ', "_")
-}
-
-/// Flatten hierarchical TOC into linear list.
-fn flatten_toc(
-    entries: &[TocEntry],
-    text_length: u32,
-    id_map: &HashMap<(String, String), String>,
-    aid_offset_map: &HashMap<String, (usize, usize, usize)>,
-    filepos_map: &HashMap<String, Vec<(usize, String)>>,
-) -> Vec<NcxBuildEntry> {
-    struct TempEntry {
-        pos: u32,
-        length: u32,
-        label: String,
-        depth: u32,
-        parent: i32,
-        children: Vec<usize>,
-        pos_fid: (u32, u32),
-    }
-
-    let mut result: Vec<TempEntry> = Vec::new();
-
-    #[allow(clippy::too_many_arguments)]
-    fn flatten_recursive(
-        entries: &[TocEntry],
-        depth: u32,
-        parent_idx: i32,
-        text_length: u32,
-        id_map: &HashMap<(String, String), String>,
-        aid_offset_map: &HashMap<String, (usize, usize, usize)>,
-        filepos_map: &HashMap<String, Vec<(usize, String)>>,
-        result: &mut Vec<TempEntry>,
-    ) {
-        for entry in entries {
-            let current_idx = result.len();
-
-            let (file, fragment) = if let Some(hash_pos) = entry.href.find('#') {
-                (
-                    entry.href[..hash_pos].to_string(),
-                    entry.href[hash_pos + 1..].to_string(),
-                )
-            } else {
-                (entry.href.clone(), String::new())
-            };
-
-            // Look up the aid's (chunk_seq, offset_in_chunk, offset_in_text) for this TOC entry
-            let aid_entry = if fragment.starts_with("filepos") {
-                resolve_filepos_entry(&file, &fragment, filepos_map, aid_offset_map)
-            } else {
-                id_map
-                    .get(&(file.clone(), fragment.clone()))
-                    .or_else(|| id_map.get(&(file.clone(), String::new())))
-                    .and_then(|aid| aid_offset_map.get(aid))
-                    .copied()
-            };
-
-            let (fid, off_in_chunk, pos) = aid_entry
-                .map(|(seq, off_in_chunk, off_text)| {
-                    (seq as u32, off_in_chunk as u32, off_text as u32)
-                })
-                .unwrap_or((0, 0, 0));
-
-            result.push(TempEntry {
-                pos,
-                length: text_length.saturating_sub(pos),
-                label: entry.title.clone(),
-                depth,
-                parent: parent_idx,
-                children: Vec::new(),
-                pos_fid: (fid, off_in_chunk),
-            });
-
-            if parent_idx >= 0 {
-                result[parent_idx as usize].children.push(current_idx);
-            }
-
-            flatten_recursive(
-                &entry.children,
-                depth + 1,
-                current_idx as i32,
-                text_length,
-                id_map,
-                aid_offset_map,
-                filepos_map,
-                result,
-            );
-        }
-    }
-
-    flatten_recursive(
-        entries,
-        0,
-        -1,
-        text_length,
-        id_map,
-        aid_offset_map,
-        filepos_map,
-        &mut result,
-    );
-
-    // Recompute lengths from the hierarchy: each entry covers up to the next
-    // entry at the same or shallower depth (matches calibre's writer8/main.py).
-    // The old default of `text_length - pos` made every entry span the whole
-    // book, which breaks TBS strand classification and Kindle navigation.
-    let n = result.len();
-    let mut new_lengths = vec![0u32; n];
-    for i in 0..n {
-        let pos_i = result[i].pos;
-        let depth_i = result[i].depth;
-        let next_start = result
-            .iter()
-            .filter(|e| e.depth <= depth_i && e.pos > pos_i)
-            .map(|e| e.pos)
-            .min()
-            .unwrap_or(text_length);
-        new_lengths[i] = next_start.saturating_sub(pos_i);
-    }
-    for (i, len) in new_lengths.into_iter().enumerate() {
-        result[i].length = len;
-    }
-
-    result
-        .into_iter()
-        .map(|e| NcxBuildEntry {
-            pos: e.pos,
-            length: e.length,
-            label: e.label,
-            depth: e.depth,
-            parent: e.parent,
-            first_child: e.children.first().map(|&i| i as i32).unwrap_or(-1),
-            last_child: e.children.last().map(|&i| i as i32).unwrap_or(-1),
-            pos_fid: Some(e.pos_fid),
-        })
-        .collect()
-}
-
-/// Map a boko `LandmarkType` to the KF8 guide reference type string Kindle
-/// expects ("cover", "start", "toc", "notes", etc.). Returning `None` means
-/// the landmark won't be emitted as a guide entry.
-fn landmark_to_guide_type(lt: crate::model::LandmarkType) -> Option<&'static str> {
-    use crate::model::LandmarkType::*;
-    Some(match lt {
-        Cover => "cover",
-        TitlePage => "title-page",
-        Toc => "toc",
-        StartReading => "start",
-        BodyMatter => "text",
-        FrontMatter => "preface",
-        BackMatter => "backmatter",
-        Acknowledgements => "acknowledgements",
-        Bibliography => "bibliography",
-        Glossary => "glossary",
-        Index => "index",
-        Preface => "preface",
-        Endnotes => "notes",
-        Loi => "loi",
-        Lot => "lot",
-    })
-}
-
-/// Build K8 guide entries from book landmarks. Each landmark resolves to a
-/// `(fid, offset)` pair via the chunker's `id_map`/`aid_offset_map`.
-fn collect_guide_entries(
-    landmarks: &[crate::model::Landmark],
-    cover_image: Option<&str>,
-    id_map: &HashMap<(String, String), String>,
-    aid_offset_map: &HashMap<String, (usize, usize, usize)>,
-) -> Vec<GuideBuildEntry> {
-    let mut entries: Vec<GuideBuildEntry> = Vec::new();
-    let mut seen_types: HashSet<String> = HashSet::new();
-
-    for landmark in landmarks {
-        let Some(guide_type) = landmark_to_guide_type(landmark.landmark_type) else {
-            continue;
-        };
-        if !seen_types.insert(guide_type.to_string()) {
-            continue;
-        }
-
-        let (file, fragment) = match landmark.href.find('#') {
-            Some(i) => (
-                landmark.href[..i].to_string(),
-                landmark.href[i + 1..].to_string(),
-            ),
-            None => (landmark.href.clone(), String::new()),
-        };
-
-        let pos_fid = id_map
-            .get(&(file.clone(), fragment.clone()))
-            .or_else(|| id_map.get(&(file.clone(), String::new())))
-            .and_then(|aid| aid_offset_map.get(aid))
-            .map(|&(seq, off_in_chunk, _)| (seq as u32, off_in_chunk as u32));
-
-        if let Some(pf) = pos_fid {
-            entries.push(GuideBuildEntry {
-                guide_type: guide_type.to_string(),
-                title: if landmark.label.is_empty() {
-                    guide_type.to_string()
-                } else {
-                    landmark.label.clone()
-                },
-                pos_fid: pf,
-            });
-        }
-    }
-
-    // Synthesize a "start" entry pointing to the first spine file if none was
-    // declared — Kindle uses this to decide where to open the book.
-    if !seen_types.contains("start")
-        && let Some((_, (seq, off, _))) = aid_offset_map.iter().min_by_key(|(_, (_, _, abs))| *abs)
-    {
-        entries.push(GuideBuildEntry {
-            guide_type: "start".to_string(),
-            title: "Beginning".to_string(),
-            pos_fid: (*seq as u32, *off as u32),
-        });
-    }
-
-    // Guide entries should be sorted by type — Kindle's binary search of the
-    // index depends on it (calibre comments: "Needed by the Kindle").
-    entries.sort_by(|a, b| a.guide_type.cmp(&b.guide_type));
-    let _ = cover_image; // currently unused; reserved for future cover-page synthesis
-    entries
-}
-
-/// Resolve MOBI filepos anchor to the full (seq_num, offset_in_chunk, offset_in_text)
-/// entry from the aid_offset_map.
-///
-/// MOBI files use `#fileposNNN` anchors where NNN is a byte position in the
-/// original HTML content. We use the filepos_map to find the aid that was
-/// closest to that position, then return its full entry.
-fn resolve_filepos_entry(
-    file: &str,
-    fragment: &str,
-    filepos_map: &HashMap<String, Vec<(usize, String)>>,
-    aid_offset_map: &HashMap<String, (usize, usize, usize)>,
-) -> Option<(usize, usize, usize)> {
-    let filepos_str = fragment.strip_prefix("filepos")?;
-    let target_pos: usize = filepos_str.parse().ok()?;
-
-    let positions = filepos_map.get(file)?;
-    if positions.is_empty() {
-        return None;
-    }
-
-    let idx = match positions.binary_search_by_key(&target_pos, |(pos, _)| *pos) {
-        Ok(i) => i,
-        Err(i) => i.saturating_sub(1),
-    };
-
-    let (_, aid) = &positions[idx];
-    aid_offset_map.get(aid).copied()
-}
-
-/// Resolve MOBI filepos anchor to (fid, offset) for link resolution.
-///
-/// Similar to resolve_filepos but returns the seq_num and offset_in_chunk
-/// needed for kindle:pos:fid:XXXX:off:YYYYYY link format.
-fn resolve_filepos_to_offset(
-    file: &str,
-    fragment: &str,
-    filepos_map: &HashMap<String, Vec<(usize, String)>>,
-    aid_offset_map: &HashMap<String, (usize, usize, usize)>,
-) -> Option<(usize, usize)> {
-    // Parse the filepos number
-    let filepos_str = fragment.strip_prefix("filepos")?;
-    let target_pos: usize = filepos_str.parse().ok()?;
-
-    // Get the position map for this file
-    let positions = filepos_map.get(file)?;
-    if positions.is_empty() {
-        return None;
-    }
-
-    // Find the aid at or before target_pos using binary search
-    let idx = match positions.binary_search_by_key(&target_pos, |(pos, _)| *pos) {
-        Ok(i) => i,
-        Err(i) => i.saturating_sub(1),
-    };
-
-    let (_, aid) = &positions[idx];
-
-    // Look up the aid's position - return (seq_num, offset_in_chunk)
-    aid_offset_map
-        .get(aid)
-        .map(|&(seq_num, offset_in_chunk, _)| (seq_num, offset_in_chunk))
-}
-
-/// Guess media type from file extension.
-fn guess_media_type(path: &str) -> String {
-    let ext = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    match ext.as_str() {
-        "xhtml" | "html" | "htm" => "application/xhtml+xml".to_string(),
-        "css" => "text/css".to_string(),
-        "jpg" | "jpeg" => "image/jpeg".to_string(),
-        "png" => "image/png".to_string(),
-        "gif" => "image/gif".to_string(),
-        "svg" => "image/svg+xml".to_string(),
-        "ttf" => "font/ttf".to_string(),
-        "otf" => "font/otf".to_string(),
-        "woff" => "font/woff".to_string(),
-        "woff2" => "font/woff2".to_string(),
-        _ => "application/octet-stream".to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -1480,82 +956,5 @@ mod tests {
     fn test_sanitize_title() {
         assert_eq!(sanitize_title("Hello World"), "Hello_World");
         assert_eq!(sanitize_title("Test <Book>"), "Test_Book");
-    }
-
-    #[test]
-    fn test_resolve_filepos_entry_exact_match() {
-        let mut filepos_map = HashMap::new();
-        filepos_map.insert(
-            "content.html".to_string(),
-            vec![
-                (100, "0001".to_string()),
-                (200, "0002".to_string()),
-                (300, "0003".to_string()),
-            ],
-        );
-
-        let mut aid_offset_map = HashMap::new();
-        aid_offset_map.insert("0001".to_string(), (0, 50, 100));
-        aid_offset_map.insert("0002".to_string(), (0, 150, 200));
-        aid_offset_map.insert("0003".to_string(), (0, 250, 300));
-
-        let result =
-            resolve_filepos_entry("content.html", "filepos200", &filepos_map, &aid_offset_map);
-        assert_eq!(result, Some((0, 150, 200)));
-    }
-
-    #[test]
-    fn test_resolve_filepos_entry_nearest_before() {
-        let mut filepos_map = HashMap::new();
-        filepos_map.insert(
-            "content.html".to_string(),
-            vec![(100, "0001".to_string()), (200, "0002".to_string())],
-        );
-
-        let mut aid_offset_map = HashMap::new();
-        aid_offset_map.insert("0001".to_string(), (0, 50, 100));
-        aid_offset_map.insert("0002".to_string(), (1, 25, 200));
-
-        let result =
-            resolve_filepos_entry("content.html", "filepos250", &filepos_map, &aid_offset_map);
-        assert_eq!(result, Some((1, 25, 200)));
-    }
-
-    #[test]
-    fn test_resolve_filepos_entry_invalid_fragment() {
-        let filepos_map = HashMap::new();
-        let aid_offset_map = HashMap::new();
-
-        assert_eq!(
-            resolve_filepos_entry("content.html", "anchor123", &filepos_map, &aid_offset_map),
-            None
-        );
-        assert_eq!(
-            resolve_filepos_entry("content.html", "fileposXYZ", &filepos_map, &aid_offset_map),
-            None
-        );
-    }
-
-    #[test]
-    fn test_resolve_filepos_to_offset() {
-        let mut filepos_map = HashMap::new();
-        filepos_map.insert(
-            "content.html".to_string(),
-            vec![(100, "0001".to_string()), (500, "0002".to_string())],
-        );
-
-        let mut aid_offset_map = HashMap::new();
-        aid_offset_map.insert("0001".to_string(), (0, 50, 100));
-        aid_offset_map.insert("0002".to_string(), (1, 25, 500));
-
-        // Position 450 should resolve to aid at 100 (nearest before)
-        let result =
-            resolve_filepos_to_offset("content.html", "filepos450", &filepos_map, &aid_offset_map);
-        assert_eq!(result, Some((0, 50))); // seq_num=0, offset_in_chunk=50
-
-        // Exact match at 500
-        let result =
-            resolve_filepos_to_offset("content.html", "filepos500", &filepos_map, &aid_offset_map);
-        assert_eq!(result, Some((1, 25))); // seq_num=1, offset_in_chunk=25
     }
 }
