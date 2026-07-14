@@ -11,11 +11,13 @@
 //!
 //! ## Supported Formats
 //!
-//! | Format | Read | Write |
-//! |--------|------|-------|
-//! | EPUB   | ✓    | ✓     |
-//! | AZW3   | ✓    | ✓     |
-//! | MOBI   | ✓    | -     |
+//! | Format   | Read | Write |
+//! |----------|------|-------|
+//! | KFX      | ✓    | ✓     |
+//! | AZW3     | ✓    | ✓     |
+//! | EPUB     | ✓    | ✓     |
+//! | MOBI     | ✓    | -     |
+//! | Markdown | -    | ✓     |
 //!
 //! ## Quick Start
 //!
@@ -31,10 +33,11 @@
 //!     let content = book.load_raw(entry.id)?;
 //!     println!("Chapter: {} bytes", content.len());
 //! }
-//! # Ok::<(), std::io::Error>(())
+//! # Ok::<(), boko::Error>(())
 //! ```
 
 pub mod dom;
+pub mod error;
 pub mod export;
 pub mod import;
 pub mod io;
@@ -51,6 +54,9 @@ pub(crate) mod util;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
+// Error handling
+pub use error::{Error, Result};
+
 // Primary exports from model
 pub use model::{
     Book, Chapter, ContentBlock, Format, Metadata, Node, NodeId, Resource, Role, SectionNode,
@@ -64,6 +70,9 @@ pub use style::{ComputedStyle, ListStyleType, Origin, StyleId, StylePool, Styles
 pub use dom::compile_html;
 
 // Primary exports from other modules
-pub use export::{Azw3Exporter, EpubExporter, Exporter, MarkdownConfig, MarkdownExporter};
+pub use export::{
+    Azw3Config, Azw3Exporter, EpubConfig, EpubExporter, Exporter, KfxExporter, MarkdownConfig,
+    MarkdownExporter,
+};
 pub use import::{ChapterId, Importer, SpineEntry};
 pub use io::{ByteSource, FileSource};

@@ -68,7 +68,7 @@ pub struct Azw3Importer {
     assets: Vec<PathBuf>,
 
     /// Cached parsed stylesheets.
-    css_cache: HashMap<String, Stylesheet>,
+    css_cache: HashMap<String, Arc<Stylesheet>>,
 
     // --- Link resolution ---
     /// Maps "path#id" -> GlobalNodeId (built during index_anchors)
@@ -99,7 +99,7 @@ struct Kf8Structure {
 }
 
 impl Importer for Azw3Importer {
-    fn open(path: &Path) -> io::Result<Self> {
+    fn open(path: &Path) -> crate::Result<Self> {
         let file = std::fs::File::open(path)?;
         let source = Arc::new(FileSource::new(file)?);
         Self::from_source(source)
@@ -129,7 +129,7 @@ impl Importer for Azw3Importer {
         self.chapter_paths.get(id.0 as usize).map(|s| s.as_str())
     }
 
-    fn load_raw(&mut self, id: ChapterId) -> io::Result<Vec<u8>> {
+    fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
         // Check chapter cache first
         if let Some(content) = self.chapter_cache.get(&id.0) {
             return Ok(content.clone());
@@ -152,7 +152,7 @@ impl Importer for Azw3Importer {
         &self.assets
     }
 
-    fn load_asset(&mut self, path: &Path) -> io::Result<Vec<u8>> {
+    fn load_asset(&mut self, path: &Path) -> crate::Result<Vec<u8>> {
         let key = path.to_string_lossy();
 
         // Parse index from path (images/image_XXXX.ext or fonts/font_XXXX.ext).
@@ -163,25 +163,22 @@ impl Importer for Azw3Importer {
             .or_else(|| key.strip_prefix("fonts/font_"))
             .and_then(|s| s.split('.').next())
             .and_then(|s| s.parse().ok())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("Invalid asset path: {}", key),
-                )
+            .ok_or_else(|| crate::Error::NotFound {
+                what: format!("asset {}", key),
             })?;
 
-        self.load_image_record(idx)
+        Ok(self.load_image_record(idx)?)
     }
 
-    fn load_stylesheet(&mut self, path: &Path) -> Option<Stylesheet> {
+    fn load_stylesheet(&mut self, path: &Path) -> Option<Arc<Stylesheet>> {
         let key = path.to_string_lossy().replace('\\', "/");
         if let Some(sheet) = self.css_cache.get(&key) {
-            return Some(sheet.clone());
+            return Some(Arc::clone(sheet));
         }
         let css_bytes = self.load_asset(path).ok()?;
         let css_str = String::from_utf8_lossy(&css_bytes);
-        let sheet = Stylesheet::parse(&css_str);
-        self.css_cache.insert(key, sheet.clone());
+        let sheet = Arc::new(Stylesheet::parse(&css_str));
+        self.css_cache.insert(key, Arc::clone(&sheet));
         Some(sheet)
     }
 
@@ -289,16 +286,16 @@ fn resolve_toc_with_positions(
 
 impl Azw3Importer {
     /// Create an importer from a ByteSource (metadata only, text deferred).
-    pub fn from_source(source: Arc<dyn ByteSource>) -> io::Result<Self> {
+    pub fn from_source(source: Arc<dyn ByteSource>) -> crate::Result<Self> {
         let file_len = source.len();
 
         // Read PDB header
         let header_start = source.read_at(0, 78)?;
         if header_start.len() < 78 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "File too short for PDB header",
-            ));
+            return Err(crate::Error::Malformed {
+                format: crate::Format::Azw3,
+                context: "file too short for PDB header".into(),
+            });
         }
 
         let num_records = u16::from_be_bytes([header_start[76], header_start[77]]) as usize;
@@ -307,10 +304,10 @@ impl Azw3Importer {
         let (pdb, _) = PdbInfo::parse(&header_bytes)?;
 
         if pdb.num_records < 2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Not enough records",
-            ));
+            return Err(crate::Error::Malformed {
+                format: crate::Format::Azw3,
+                context: "not enough PDB records".into(),
+            });
         }
 
         // Helper to read a record
@@ -324,10 +321,7 @@ impl Azw3Importer {
         let mobi = MobiHeader::parse(&record0)?;
 
         if mobi.encryption != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Encrypted files are not supported",
-            ));
+            return Err(crate::Error::DrmProtected(crate::Format::Azw3));
         }
 
         // Parse EXTH metadata
@@ -347,10 +341,9 @@ impl Azw3Importer {
 
         // Verify this is KF8
         if !format.is_kf8() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Not a KF8/AZW3 file - use MobiImporter for MOBI6 files",
-            ));
+            return Err(crate::Error::UnsupportedFormat {
+                detail: "not a KF8/AZW3 file - use MobiImporter for MOBI6 files".into(),
+            });
         }
 
         // Build metadata

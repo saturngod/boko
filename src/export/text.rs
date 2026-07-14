@@ -37,7 +37,7 @@ impl MarkdownExporter {
 }
 
 impl Exporter for MarkdownExporter {
-    fn export<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> io::Result<()> {
+    fn export<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> crate::Result<()> {
         let _ = self.config; // Reserved for future use (line wrapping)
 
         // 1. Resolve all links (I/O: loads chapters internally)

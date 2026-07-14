@@ -1,7 +1,7 @@
 //! EPUB format importer - handles all IO.
 
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -12,6 +12,21 @@ use crate::epub::{parse_container_xml, parse_nav_landmarks, parse_ncx, parse_opf
 use crate::import::{ChapterId, Importer, SpineEntry, resolve_path_based_href};
 use crate::io::{ByteSource, ByteSourceCursor, FileSource};
 use crate::model::{AnchorTarget, Chapter, GlobalNodeId, Landmark, Metadata, TocEntry};
+
+impl From<zip::result::ZipError> for crate::Error {
+    fn from(e: zip::result::ZipError) -> Self {
+        // A genuine I/O failure while reading the archive is not a malformed
+        // book — preserve it (and its ErrorKind) as Error::Io. Only structural
+        // ZIP problems become Malformed.
+        match e {
+            zip::result::ZipError::Io(io) => crate::Error::Io(io),
+            other => crate::Error::Malformed {
+                format: crate::Format::Epub,
+                context: other.to_string(),
+            },
+        }
+    }
+}
 
 /// EPUB format importer with random-access ZIP reading.
 pub struct EpubImporter {
@@ -40,7 +55,7 @@ pub struct EpubImporter {
     assets: Vec<PathBuf>,
 
     /// Cached parsed stylesheets.
-    css_cache: HashMap<String, Stylesheet>,
+    css_cache: HashMap<String, Arc<Stylesheet>>,
 
     // --- Link resolution ---
     /// Maps path (without fragment) -> ChapterId
@@ -59,7 +74,7 @@ struct ZipEntryLoc {
 }
 
 impl Importer for EpubImporter {
-    fn open(path: &Path) -> io::Result<Self> {
+    fn open(path: &Path) -> crate::Result<Self> {
         let file = std::fs::File::open(path)?;
         let source = Arc::new(FileSource::new(file)?);
         Self::from_source(source)
@@ -89,13 +104,13 @@ impl Importer for EpubImporter {
         self.spine_paths.get(id.0 as usize).map(|s| s.as_str())
     }
 
-    fn load_raw(&mut self, id: ChapterId) -> io::Result<Vec<u8>> {
-        let path = self.spine_paths.get(id.0 as usize).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Chapter ID {} not found", id.0),
-            )
-        })?;
+    fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
+        let path = self
+            .spine_paths
+            .get(id.0 as usize)
+            .ok_or_else(|| crate::Error::NotFound {
+                what: format!("chapter {}", id.0),
+            })?;
         self.read_entry(path)
     }
 
@@ -103,20 +118,20 @@ impl Importer for EpubImporter {
         &self.assets
     }
 
-    fn load_asset(&mut self, path: &Path) -> io::Result<Vec<u8>> {
+    fn load_asset(&mut self, path: &Path) -> crate::Result<Vec<u8>> {
         let key = path.to_string_lossy().replace('\\', "/");
         self.read_entry(&key)
     }
 
-    fn load_stylesheet(&mut self, path: &Path) -> Option<Stylesheet> {
+    fn load_stylesheet(&mut self, path: &Path) -> Option<Arc<Stylesheet>> {
         let key = path.to_string_lossy().replace('\\', "/");
         if let Some(sheet) = self.css_cache.get(&key) {
-            return Some(sheet.clone());
+            return Some(Arc::clone(sheet));
         }
         let css_bytes = self.load_asset(path).ok()?;
         let css_str = String::from_utf8_lossy(&css_bytes);
-        let sheet = Stylesheet::parse(&css_str);
-        self.css_cache.insert(key, sheet.clone());
+        let sheet = Arc::new(Stylesheet::parse(&css_str));
+        self.css_cache.insert(key, Arc::clone(&sheet));
         Some(sheet)
     }
 
@@ -154,7 +169,7 @@ impl Importer for EpubImporter {
 
 impl EpubImporter {
     /// Create an importer from a ByteSource.
-    pub fn from_source(source: Arc<dyn ByteSource>) -> io::Result<Self> {
+    pub fn from_source(source: Arc<dyn ByteSource>) -> crate::Result<Self> {
         // 1. Scan ZIP central directory and cache entry locations
         let cursor = ByteSourceCursor::new(source.clone());
         let mut archive = ZipArchive::new(cursor)?;
@@ -291,7 +306,7 @@ impl EpubImporter {
     }
 
     /// Read and decompress a ZIP entry by path.
-    fn read_entry(&self, path: &str) -> io::Result<Vec<u8>> {
+    fn read_entry(&self, path: &str) -> crate::Result<Vec<u8>> {
         read_entry(&self.source, &self.zip_index, path)
     }
 }
@@ -304,12 +319,9 @@ fn read_entry(
     source: &Arc<dyn ByteSource>,
     index: &HashMap<String, ZipEntryLoc>,
     path: &str,
-) -> io::Result<Vec<u8>> {
-    let loc = index.get(path).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("File not found in ZIP: {}", path),
-        )
+) -> crate::Result<Vec<u8>> {
+    let loc = index.get(path).ok_or_else(|| crate::Error::NotFound {
+        what: format!("{} (in EPUB archive)", path),
     })?;
 
     // Read compressed data via random access
@@ -326,10 +338,10 @@ fn read_entry(
             decoder.read_to_end(&mut out)?;
             Ok(out)
         }
-        method => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("Unsupported compression method: {}", method),
-        )),
+        method => Err(crate::Error::Malformed {
+            format: crate::Format::Epub,
+            context: format!("unsupported compression method: {}", method),
+        }),
     }
 }
 

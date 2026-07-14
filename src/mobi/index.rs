@@ -1376,21 +1376,18 @@ mod tests {
 
         let entries = vec![
             SkelEntry {
-                file_number: 0,
                 name: "SKEL0000000000".to_string(),
                 chunk_count: 1,
                 start_pos: 0,
                 length: 1000,
             },
             SkelEntry {
-                file_number: 1,
                 name: "SKEL0000000001".to_string(),
                 chunk_count: 2,
                 start_pos: 1000,
                 length: 2500,
             },
             SkelEntry {
-                file_number: 2,
                 name: "SKEL0000000002".to_string(),
                 chunk_count: 1,
                 start_pos: 3500,

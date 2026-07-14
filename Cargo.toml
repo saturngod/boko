@@ -1,6 +1,6 @@
 [package]
 name = "boko"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Fast ebook conversion library for EPUB and Kindle formats"
 license = "GPL-3.0-or-later"
@@ -10,13 +10,16 @@ documentation = "https://docs.rs/boko"
 readme = "README.md"
 keywords = ["ebook", "epub", "mobi", "azw3", "kindle"]
 categories = ["parsing", "encoding"]
+# Test fixtures (binary ebooks) and the fuzz harness are only needed to develop
+# boko, not to build it — keep them out of the published crate.
+exclude = ["/tests/fixtures", "/fuzz"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["cli"]
-cli = ["dep:clap", "dep:serde", "dep:serde_json"]
+cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:ion-rs"]
 wasm = ["wasm-bindgen", "console_error_panic_hook"]
 
 [dependencies]
@@ -41,8 +44,9 @@ encoding_rs = "0.8"
 # Base64 encoding for KFX raw media
 base64 = "0.22"
 
-# Ion binary format parsing for KFX dump tool
-ion-rs = { version = "1.0.0-rc.11", features = ["experimental-reader-writer"] }
+# Ion binary format parsing for KFX dump tool (CLI only; the library uses
+# its own hand-rolled reader/writer in src/kfx/ion.rs)
+ion-rs = { version = "1.0.0-rc.11", features = ["experimental-reader-writer"], optional = true }
 
 # SHA1 hashing for KFX content hashes (minimal, WASM-compatible)
 sha1_smol = { version = "1.0", features = ["std"] }

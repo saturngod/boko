@@ -4,29 +4,50 @@ use super::arena::{ArenaDom, ArenaNodeData, ArenaNodeId};
 use super::element_ref::ElementRef;
 use super::role_map::element_to_role;
 use crate::model::{Chapter, Node, NodeId, Role};
-use crate::style::{ComputedStyle, Display, Origin, Stylesheet, WhiteSpace, compute_styles};
+use crate::style::{
+    CascadeIndex, CascadeScratch, ComputedStyle, Display, Origin, Stylesheet, WhiteSpace,
+    compute_styles_indexed,
+};
 
 /// User agent stylesheet (browser defaults).
 const UA_CSS: &str = include_str!("data/styles.css");
 
 pub fn user_agent_stylesheet() -> Stylesheet {
-    Stylesheet::parse(UA_CSS)
+    (*user_agent_stylesheet_arc()).clone()
+}
+
+/// Shared handle to the per-thread UA stylesheet. Cloning the `Arc` is a
+/// refcount bump; use this instead of [`user_agent_stylesheet`] anywhere the
+/// per-chapter hot path would otherwise deep-clone the parsed rules.
+pub(crate) fn user_agent_stylesheet_arc() -> std::sync::Arc<Stylesheet> {
+    // The UA stylesheet is a constant, but `compile_html` is called once per
+    // chapter, so parsing UA_CSS every time is pure redundant work. Parse it
+    // once per thread and share it behind an Arc.
+    thread_local! {
+        static UA_STYLESHEET: std::sync::Arc<Stylesheet> =
+            std::sync::Arc::new(Stylesheet::parse(UA_CSS));
+    }
+    UA_STYLESHEET.with(|ua| ua.clone())
 }
 
 /// Context for the transform operation.
 struct TransformContext<'a> {
     dom: &'a ArenaDom,
-    stylesheets: &'a [(Stylesheet, Origin)],
+    /// Selector-bucketed view of `stylesheets`, built once for the whole chapter.
+    cascade_index: CascadeIndex<'a>,
+    /// Reused across every element of the chapter (candidate buffer + selector caches).
+    cascade_scratch: CascadeScratch,
     chapter: Chapter,
     /// Map from ArenaNodeId to Chapter NodeId
     node_map: std::collections::HashMap<ArenaNodeId, NodeId>,
 }
 
 impl<'a> TransformContext<'a> {
-    fn new(dom: &'a ArenaDom, stylesheets: &'a [(Stylesheet, Origin)]) -> Self {
+    fn new(dom: &'a ArenaDom, stylesheets: &'a [(&'a Stylesheet, Origin)]) -> Self {
         Self {
             dom,
-            stylesheets,
+            cascade_index: CascadeIndex::build(stylesheets),
+            cascade_scratch: CascadeScratch::default(),
             chapter: Chapter::new(),
             node_map: std::collections::HashMap::new(),
         }
@@ -54,7 +75,13 @@ impl<'a> TransformContext<'a> {
         // Compute body's style so its properties (like hyphens: auto) are inherited
         let mut body_style = {
             let elem_ref = ElementRef::new(self.dom, body);
-            compute_styles(elem_ref, self.stylesheets, None, &mut self.chapter.styles)
+            compute_styles_indexed(
+                elem_ref,
+                &self.cascade_index,
+                None,
+                &mut self.chapter.styles,
+                &mut self.cascade_scratch,
+            )
         };
 
         // Add html lang to body style if present (so it's inherited by all content)
@@ -77,7 +104,11 @@ impl<'a> TransformContext<'a> {
         ir_parent: NodeId,
         parent_style: Option<&ComputedStyle>,
     ) {
-        for child_id in self.dom.children(dom_parent).collect::<Vec<_>>() {
+        // Copy the &'a ArenaDom out of self so the child iterator borrows the
+        // DOM (immutable for the whole transform), not `self` — avoids
+        // collecting children into a Vec for every element.
+        let dom = self.dom;
+        for child_id in dom.children(dom_parent) {
             self.process_node(child_id, ir_parent, parent_style);
         }
     }
@@ -157,11 +188,12 @@ impl<'a> TransformContext<'a> {
             ArenaNodeData::Element { name, attrs, .. } => {
                 // Compute style for this element
                 let elem_ref = ElementRef::new(self.dom, dom_id);
-                let mut computed = compute_styles(
+                let mut computed = compute_styles_indexed(
                     elem_ref,
-                    self.stylesheets,
+                    &self.cascade_index,
                     parent_style,
                     &mut self.chapter.styles,
+                    &mut self.cascade_scratch,
                 );
 
                 // Merge lang attribute into style (for KFX language property)
@@ -185,7 +217,7 @@ impl<'a> TransformContext<'a> {
 
                 // Create IR node
                 let mut ir_node = Node::new(role);
-                ir_node.style = self.chapter.styles.intern(computed.clone());
+                ir_node.style = self.chapter.styles.intern_ref(&computed);
 
                 let ir_id = self.chapter.alloc_node(ir_node);
                 self.chapter.append_child(ir_parent, ir_id);
@@ -272,7 +304,7 @@ impl<'a> TransformContext<'a> {
 }
 
 /// Transform an ArenaDom to Chapter.
-pub fn transform(dom: &ArenaDom, stylesheets: &[(Stylesheet, Origin)]) -> Chapter {
+pub fn transform(dom: &ArenaDom, stylesheets: &[(&Stylesheet, Origin)]) -> Chapter {
     let ctx = TransformContext::new(dom, stylesheets);
     ctx.transform()
 }
@@ -322,7 +354,7 @@ mod tests {
     fn test_basic_transform() {
         let dom = parse_html("<html><body><p>Hello, World!</p></body></html>");
         let ua = user_agent_stylesheet();
-        let stylesheets = vec![(ua, Origin::UserAgent)];
+        let stylesheets = vec![(&ua, Origin::UserAgent)];
 
         let chapter = transform(&dom, &stylesheets);
 
@@ -346,7 +378,7 @@ mod tests {
     fn test_heading_levels() {
         let dom = parse_html("<html><body><h1>Title</h1><h2>Subtitle</h2></body></html>");
         let ua = user_agent_stylesheet();
-        let stylesheets = vec![(ua, Origin::UserAgent)];
+        let stylesheets = vec![(&ua, Origin::UserAgent)];
 
         let chapter = transform(&dom, &stylesheets);
 
@@ -367,7 +399,7 @@ mod tests {
     fn test_link_semantics() {
         let dom = parse_html(r#"<a href="https://example.com">Link</a>"#);
         let ua = user_agent_stylesheet();
-        let stylesheets = vec![(ua, Origin::UserAgent)];
+        let stylesheets = vec![(&ua, Origin::UserAgent)];
 
         let chapter = transform(&dom, &stylesheets);
 
@@ -390,7 +422,7 @@ mod tests {
         );
         let ua = user_agent_stylesheet();
         let author = Stylesheet::parse("div { color: red; }");
-        let stylesheets = vec![(ua, Origin::UserAgent), (author, Origin::Author)];
+        let stylesheets = vec![(&ua, Origin::UserAgent), (&author, Origin::Author)];
 
         let chapter = transform(&dom, &stylesheets);
 
@@ -405,7 +437,7 @@ mod tests {
             r#"<html><head><title>Test</title></head><body><p>Visible</p></body></html>"#,
         );
         let ua = user_agent_stylesheet();
-        let stylesheets = vec![(ua, Origin::UserAgent)];
+        let stylesheets = vec![(&ua, Origin::UserAgent)];
 
         let chapter = transform(&dom, &stylesheets);
 
@@ -423,7 +455,7 @@ mod tests {
     fn test_br_element() {
         let dom = parse_html(r#"<html><body><p>Line one<br/>Line two</p></body></html>"#);
         let ua = user_agent_stylesheet();
-        let stylesheets = vec![(ua, Origin::UserAgent)];
+        let stylesheets = vec![(&ua, Origin::UserAgent)];
 
         let chapter = transform(&dom, &stylesheets);
 
@@ -447,7 +479,7 @@ mod tests {
             <body><p><span>Line one</span><br/><span>Line two</span></p></body></html>"#,
         );
         let ua = user_agent_stylesheet();
-        let stylesheets = vec![(ua, Origin::UserAgent)];
+        let stylesheets = vec![(&ua, Origin::UserAgent)];
 
         let chapter = transform(&dom, &stylesheets);
 
@@ -478,7 +510,7 @@ mod tests {
             </body></html>"#,
         );
         let ua = user_agent_stylesheet();
-        let stylesheets = vec![(ua, Origin::UserAgent)];
+        let stylesheets = vec![(&ua, Origin::UserAgent)];
 
         let chapter = transform(&dom, &stylesheets);
 

@@ -21,7 +21,7 @@
 //! // content.css contains the unified stylesheet
 //! // content.chapters contains synthesized XHTML documents
 //! // content.assets contains all referenced asset paths
-//! # Ok::<(), std::io::Error>(())
+//! # Ok::<(), boko::Error>(())
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -83,7 +83,7 @@ impl GlobalStylePool {
 
         // Merge each style from the chapter's pool
         for (local_id, style) in chapter.styles.iter() {
-            let global_id = self.pool.intern(style.clone());
+            let global_id = self.pool.intern_ref(style);
             remap.insert(local_id, global_id);
         }
     }

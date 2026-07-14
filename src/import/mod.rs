@@ -17,7 +17,7 @@ pub use mobi::MobiImporter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::dom::{Origin, Stylesheet, compile_html_bytes, extract_stylesheets};
+use crate::dom::{Origin, Stylesheet};
 use crate::model::{AnchorTarget, Chapter, FontFace, GlobalNodeId, Landmark, Metadata, TocEntry};
 
 /// Unique identifier for a chapter/spine item within a book.
@@ -42,7 +42,7 @@ pub trait Importer: Send + Sync {
     // --- Lifecycle ---
 
     /// Open a file and parse structure (metadata, TOC, spine).
-    fn open(path: &Path) -> std::io::Result<Self>
+    fn open(path: &Path) -> crate::Result<Self>
     where
         Self: Sized;
 
@@ -64,22 +64,24 @@ pub trait Importer: Send + Sync {
     ///
     /// The default implementation:
     /// 1. Loads raw HTML via `load_raw()`
-    /// 2. Extracts linked stylesheets and inline styles
+    /// 2. Parses the DOM once and extracts linked/inline stylesheets from it
     /// 3. Loads and parses linked CSS via `load_asset()`
-    /// 4. Compiles HTML + CSS to IR via `compile_html()`
+    /// 4. Compiles the parsed DOM + CSS to IR via `compile_dom()`
     ///
     /// Implementations may override for format-specific optimizations.
-    fn load_chapter(&mut self, id: ChapterId) -> std::io::Result<Chapter> {
-        // Load raw HTML
+    fn load_chapter(&mut self, id: ChapterId) -> crate::Result<Chapter> {
+        // Load raw HTML, decode, and parse the DOM exactly once: the same
+        // parse serves stylesheet discovery and IR compilation below.
         let html_bytes = self.load_raw(id)?;
         let hint_encoding = crate::util::extract_xml_encoding(&html_bytes);
         let html_str = crate::util::decode_text(&html_bytes, hint_encoding);
+        let dom = crate::dom::parse_dom(&html_str);
 
         // Extract stylesheet references
-        let (linked, inline) = extract_stylesheets(&html_str);
+        let (linked, inline) = crate::dom::extract_stylesheets_from_dom(&dom);
 
-        // Build stylesheets list
-        let mut stylesheets = Vec::new();
+        // Build stylesheets list (Arc-shared: cached sheets are not cloned)
+        let mut stylesheets: Vec<(Arc<Stylesheet>, Origin)> = Vec::new();
 
         // Load linked stylesheets
         for href in linked {
@@ -97,11 +99,13 @@ pub trait Importer: Send + Sync {
 
         // Parse inline styles
         for css in inline {
-            stylesheets.push((Stylesheet::parse(&css), Origin::Author));
+            stylesheets.push((Arc::new(Stylesheet::parse(&css)), Origin::Author));
         }
 
-        // Compile to IR
-        let mut chapter = compile_html_bytes(&html_bytes, &stylesheets);
+        // Compile to IR from the DOM parsed above
+        let sheet_refs: Vec<(&Stylesheet, Origin)> =
+            stylesheets.iter().map(|(s, o)| (s.as_ref(), *o)).collect();
+        let mut chapter = crate::dom::compile_dom(&dom, &sheet_refs);
 
         // Post-process: Resolve relative paths in semantic attributes (src, href)
         // This canonicalizes paths like "../images/photo.jpg" to "OEBPS/images/photo.jpg"
@@ -118,7 +122,7 @@ pub trait Importer: Send + Sync {
     fn source_id(&self, id: ChapterId) -> Option<&str>;
 
     /// Returns the raw bytes of a chapter.
-    fn load_raw(&mut self, id: ChapterId) -> std::io::Result<Vec<u8>>;
+    fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>>;
 
     // --- Assets ---
 
@@ -126,15 +130,17 @@ pub trait Importer: Send + Sync {
     fn list_assets(&self) -> &[PathBuf];
 
     /// Load an asset by path.
-    fn load_asset(&mut self, path: &Path) -> std::io::Result<Vec<u8>>;
+    fn load_asset(&mut self, path: &Path) -> crate::Result<Vec<u8>>;
 
     /// Load and parse a stylesheet, optionally using a cache.
     ///
     /// The default implementation loads the asset bytes and parses CSS.
-    fn load_stylesheet(&mut self, path: &Path) -> Option<Stylesheet> {
+    /// Returns an `Arc` so cached sheets are shared across chapters instead
+    /// of deep-cloning the parsed rules per chapter.
+    fn load_stylesheet(&mut self, path: &Path) -> Option<Arc<Stylesheet>> {
         if let Ok(css_bytes) = self.load_asset(path) {
             let css_str = String::from_utf8_lossy(&css_bytes);
-            return Some(Stylesheet::parse(&css_str));
+            return Some(Arc::new(Stylesheet::parse(&css_str)));
         }
         None
     }
@@ -165,7 +171,8 @@ pub trait Importer: Send + Sync {
         for css_path in css_paths {
             if let Some(stylesheet) = self.load_stylesheet(&css_path) {
                 // Resolve relative font paths to canonical paths
-                for mut font_face in stylesheet.font_faces {
+                for font_face in &stylesheet.font_faces {
+                    let mut font_face = font_face.clone();
                     // Resolve the src path relative to the CSS file location
                     let resolved =
                         resolve_relative_path(css_path.to_string_lossy().as_ref(), &font_face.src);
@@ -408,7 +415,7 @@ mod tests {
             chapters: HashMap<u32, String>,
             assets: HashMap<String, Vec<u8>>,
             asset_list: Vec<PathBuf>,
-            css_cache: HashMap<String, Stylesheet>,
+            css_cache: HashMap<String, Arc<Stylesheet>>,
             css_loads: usize,
             metadata: Metadata,
             toc: Vec<TocEntry>,
@@ -418,7 +425,7 @@ mod tests {
         }
 
         impl Importer for TestImporter {
-            fn open(_path: &Path) -> io::Result<Self> {
+            fn open(_path: &Path) -> crate::Result<Self> {
                 unreachable!()
             }
 
@@ -446,33 +453,34 @@ mod tests {
                 self.source_ids.get(id.0 as usize).map(|s| s.as_str())
             }
 
-            fn load_raw(&mut self, id: ChapterId) -> io::Result<Vec<u8>> {
+            fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
                 self.chapters
                     .get(&id.0)
                     .map(|s| s.as_bytes().to_vec())
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "chapter not found"))
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "chapter not found").into()
+                    })
             }
 
             fn list_assets(&self) -> &[PathBuf] {
                 &self.asset_list
             }
 
-            fn load_asset(&mut self, path: &Path) -> io::Result<Vec<u8>> {
+            fn load_asset(&mut self, path: &Path) -> crate::Result<Vec<u8>> {
                 let key = path.to_string_lossy().replace('\\', "/");
-                self.assets
-                    .get(&key)
-                    .cloned()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "asset not found"))
+                self.assets.get(&key).cloned().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "asset not found").into()
+                })
             }
 
-            fn load_stylesheet(&mut self, path: &Path) -> Option<Stylesheet> {
+            fn load_stylesheet(&mut self, path: &Path) -> Option<Arc<Stylesheet>> {
                 let key = path.to_string_lossy().replace('\\', "/");
                 if let Some(sheet) = self.css_cache.get(&key) {
-                    return Some(sheet.clone());
+                    return Some(Arc::clone(sheet));
                 }
                 let css_bytes = self.load_asset(path).ok()?;
                 let css_str = String::from_utf8_lossy(&css_bytes);
-                let sheet = Stylesheet::parse(&css_str);
+                let sheet = Arc::new(Stylesheet::parse(&css_str));
                 self.css_cache.insert(key, sheet.clone());
                 self.css_loads += 1;
                 Some(sheet)
@@ -532,7 +540,7 @@ mod tests {
         }
 
         impl Importer for TestImporter {
-            fn open(_path: &Path) -> io::Result<Self> {
+            fn open(_path: &Path) -> crate::Result<Self> {
                 unreachable!()
             }
 
@@ -560,24 +568,21 @@ mod tests {
                 None
             }
 
-            fn load_raw(&mut self, _id: ChapterId) -> io::Result<Vec<u8>> {
-                Err(io::Error::new(io::ErrorKind::Other, "unused"))
+            fn load_raw(&mut self, _id: ChapterId) -> crate::Result<Vec<u8>> {
+                Err(io::Error::other("unused").into())
             }
 
             fn list_assets(&self) -> &[PathBuf] {
                 &self.asset_list
             }
 
-            fn load_asset(&mut self, _path: &Path) -> io::Result<Vec<u8>> {
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "load_asset should not be called",
-                ))
+            fn load_asset(&mut self, _path: &Path) -> crate::Result<Vec<u8>> {
+                Err(io::Error::other("load_asset should not be called").into())
             }
 
-            fn load_stylesheet(&mut self, _path: &Path) -> Option<Stylesheet> {
+            fn load_stylesheet(&mut self, _path: &Path) -> Option<Arc<Stylesheet>> {
                 let css = "@font-face { font-family: Test; src: url(../fonts/test.woff); }";
-                Some(Stylesheet::parse(css))
+                Some(Arc::new(Stylesheet::parse(css)))
             }
         }
 
