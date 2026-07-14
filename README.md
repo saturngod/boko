@@ -75,6 +75,13 @@ Bug reports with sample files welcome, especially KFX and AZW3 edge cases.
     cargo clippy -- -D warnings
     cargo fmt --check
 
+Fuzzing the import parsers (requires nightly and [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz)):
+
+    cargo +nightly fuzz run from_bytes
+
+Drop minimized crashers into `tests/fixtures/crashes/` — the crash-corpus
+test replays them on every `cargo test`.
+
 ## License
 
 [GPL-3.0-or-later](LICENSE).
