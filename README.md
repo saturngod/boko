@@ -33,7 +33,7 @@ Requires Rust 1.85+.
 
 From the repository root, convert an EPUB directly to KFX with:
 
-    cargo run --release -- convert in.epub out.kfx
+    cargo run --release --bin boko -- convert in.epub out.kfx
 
 To build once and run the compiled binary directly:
 
