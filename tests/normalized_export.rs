@@ -136,9 +136,9 @@ fn extract_style_classes(document: &str) -> Vec<String> {
 
 #[test]
 fn test_normalize_book_emits_css_for_used_classes() {
-    let mut book = Book::open("tests/fixtures/epictetus.epub").expect("Failed to open test book");
+    let book = Book::open("tests/fixtures/epictetus.epub").expect("Failed to open test book");
 
-    let content = normalize_book(&mut book).expect("normalize_book failed");
+    let content = normalize_book(&book).expect("normalize_book failed");
 
     // Ensure chapters reference the unified stylesheet and CSS matches class usage.
     let mut all_classes = Vec::new();
@@ -166,7 +166,7 @@ fn test_normalize_book_emits_css_for_used_classes() {
 
 #[test]
 fn test_normalized_export_contains_css_and_numbered_chapters() {
-    let mut book = Book::open("tests/fixtures/epictetus.epub").expect("Failed to open test book");
+    let book = Book::open("tests/fixtures/epictetus.epub").expect("Failed to open test book");
 
     let mut output = Cursor::new(Vec::new());
 
@@ -176,7 +176,7 @@ fn test_normalized_export_contains_css_and_numbered_chapters() {
     });
 
     exporter
-        .export(&mut book, &mut output)
+        .export(&book, &mut output)
         .expect("Normalized export failed");
 
     let data = output.into_inner();
@@ -204,7 +204,7 @@ fn test_normalized_export_contains_css_and_numbered_chapters() {
 
 #[test]
 fn test_load_chapter_cached_returns_same_arc() {
-    let mut book = Book::open("tests/fixtures/epictetus.epub").expect("Failed to open test book");
+    let book = Book::open("tests/fixtures/epictetus.epub").expect("Failed to open test book");
 
     let spine: Vec<_> = book.spine().to_vec();
     assert!(!spine.is_empty(), "Book should have spine entries");

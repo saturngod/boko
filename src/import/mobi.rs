@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::dom::Stylesheet;
 use crate::import::{ChapterId, Importer, SpineEntry, resolve_path_based_href};
@@ -61,11 +61,11 @@ pub struct MobiImporter {
     assets: Vec<String>,
 
     /// Cached parsed stylesheets.
-    css_cache: HashMap<String, Arc<Stylesheet>>,
+    css_cache: RwLock<HashMap<String, Arc<Stylesheet>>>,
 
     // --- Link resolution ---
     /// Maps "path#id" -> GlobalNodeId (built during index_anchors)
-    element_id_map: HashMap<String, GlobalNodeId>,
+    element_id_map: RwLock<HashMap<String, GlobalNodeId>>,
 }
 
 impl Importer for MobiImporter {
@@ -83,10 +83,6 @@ impl Importer for MobiImporter {
         &self.toc
     }
 
-    fn toc_mut(&mut self) -> &mut [TocEntry] {
-        &mut self.toc
-    }
-
     fn landmarks(&self) -> &[Landmark] {
         &self.landmarks
     }
@@ -99,7 +95,7 @@ impl Importer for MobiImporter {
         self.chapter_paths.get(id.0 as usize).map(|s| s.as_str())
     }
 
-    fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
+    fn load_raw(&self, id: ChapterId) -> crate::Result<Vec<u8>> {
         self.chapter_cache
             .get(id.0 as usize)
             .cloned()
@@ -112,7 +108,7 @@ impl Importer for MobiImporter {
         &self.assets
     }
 
-    fn load_asset(&mut self, path: &str) -> crate::Result<Vec<u8>> {
+    fn load_asset(&self, path: &str) -> crate::Result<Vec<u8>> {
         // Parse index from path (images/image_XXXX.ext or fonts/font_XXXX.ext).
         // Images and fonts share the same record-index space, so the prefix
         // selects naming but the underlying lookup is the same.
@@ -128,19 +124,25 @@ impl Importer for MobiImporter {
         Ok(self.load_image_record(idx)?)
     }
 
-    fn load_stylesheet(&mut self, path: &str) -> Option<Arc<Stylesheet>> {
-        if let Some(sheet) = self.css_cache.get(path) {
+    fn load_stylesheet(&self, path: &str) -> Option<Arc<Stylesheet>> {
+        if let Ok(cache) = self.css_cache.read()
+            && let Some(sheet) = cache.get(path)
+        {
             return Some(Arc::clone(sheet));
         }
         let css_bytes = self.load_asset(path).ok()?;
         let css_str = String::from_utf8_lossy(&css_bytes);
         let sheet = Arc::new(Stylesheet::parse(&css_str));
-        self.css_cache.insert(path.to_string(), Arc::clone(&sheet));
-        Some(sheet)
+        match self.css_cache.write() {
+            Ok(mut cache) => Some(Arc::clone(
+                cache.entry(path.to_string()).or_insert(sheet),
+            )),
+            Err(_) => Some(sheet),
+        }
     }
 
-    fn index_anchors(&mut self, chapters: &[(ChapterId, Arc<Chapter>)]) {
-        self.element_id_map.clear();
+    fn index_anchors(&self, chapters: &[(ChapterId, Arc<Chapter>)]) {
+        let mut element_id_map = HashMap::new();
 
         for (chapter_id, chapter) in chapters {
             let chapter_path = match self.chapter_paths.get(chapter_id.0 as usize) {
@@ -151,10 +153,13 @@ impl Importer for MobiImporter {
             for node_id in chapter.iter_dfs() {
                 if let Some(id) = chapter.semantics.id(node_id) {
                     let key = format!("{}#{}", chapter_path, id);
-                    self.element_id_map
-                        .insert(key, GlobalNodeId::new(*chapter_id, node_id));
+                    element_id_map.insert(key, GlobalNodeId::new(*chapter_id, node_id));
                 }
             }
+        }
+
+        if let Ok(mut map) = self.element_id_map.write() {
+            *map = element_id_map;
         }
     }
 
@@ -169,7 +174,12 @@ impl Importer for MobiImporter {
                     .position(|cp| cp == p)
                     .map(|i| ChapterId(i as u32))
             },
-            |k| self.element_id_map.get(k).copied(),
+            |k| {
+                self.element_id_map
+                    .read()
+                    .ok()
+                    .and_then(|m| m.get(k).copied())
+            },
         )
     }
 }
@@ -328,8 +338,8 @@ impl MobiImporter {
             chapter_cache: split.chapters,
             chapter_paths: split.chapter_paths,
             assets: Vec::new(),
-            css_cache: HashMap::new(),
-            element_id_map: HashMap::new(),
+            css_cache: RwLock::new(HashMap::new()),
+            element_id_map: RwLock::new(HashMap::new()),
         };
 
         importer.assets = importer.discover_assets();

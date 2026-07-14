@@ -68,7 +68,7 @@ impl Default for Azw3Exporter {
 }
 
 impl Exporter for Azw3Exporter {
-    fn export<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> crate::Result<()> {
+    fn export<W: Write + Seek>(&self, book: &Book, writer: &mut W) -> crate::Result<()> {
         // Normalize when explicitly requested OR when the source format requires
         // it (e.g. KFX raw content is binary Ion, not HTML) — otherwise the
         // builder would chunk and compress that binary as if it were XHTML.
@@ -107,7 +107,7 @@ struct SpineItem {
 
 impl BookContext {
     /// Collect all data from a Book into internal structures.
-    fn from_book(book: &mut Book, normalize: bool) -> crate::Result<Self> {
+    fn from_book(book: &Book, normalize: bool) -> crate::Result<Self> {
         if normalize {
             Self::from_normalized(book)
         } else {
@@ -116,17 +116,17 @@ impl BookContext {
     }
 
     /// Collect raw (passthrough) content from the book.
-    fn from_raw(book: &mut Book) -> crate::Result<Self> {
+    fn from_raw(book: &Book) -> crate::Result<Self> {
         // Collect metadata and TOC (these are borrowed, so clone)
         let metadata = book.metadata().clone();
         let toc = book.toc().to_vec();
 
         // Collect spine items; their bytes go straight into `resources`.
-        let spine_entries: Vec<_> = book.spine().to_vec();
+        let spine_entries = book.spine();
         let mut spine = Vec::with_capacity(spine_entries.len());
         let mut resources = HashMap::new();
 
-        for entry in &spine_entries {
+        for entry in spine_entries {
             let href = book
                 .source_id(entry.id)
                 .unwrap_or("unknown.xhtml")
@@ -143,15 +143,15 @@ impl BookContext {
         }
 
         // Collect assets, skipping spine documents already loaded above.
-        let asset_paths: Vec<_> = book.list_assets().to_vec();
+        let asset_paths = book.list_assets();
         for path in asset_paths {
-            if resources.contains_key(&path) {
+            if resources.contains_key(path) {
                 continue;
             }
-            let data = book.load_asset(&path)?;
-            let media_type = guess_media_type(&path);
+            let data = book.load_asset(path)?;
+            let media_type = guess_media_type(path);
 
-            resources.insert(path, Resource { data, media_type });
+            resources.insert(path.clone(), Resource { data, media_type });
         }
 
         Ok(Self {
@@ -164,7 +164,7 @@ impl BookContext {
     }
 
     /// Collect normalized content from the book through IR pipeline.
-    fn from_normalized(book: &mut Book) -> crate::Result<Self> {
+    fn from_normalized(book: &Book) -> crate::Result<Self> {
         use super::normalize::normalize_book;
 
         let normalized = normalize_book(book)?;

@@ -538,7 +538,7 @@ mod tests {
     fn test_book_navigation_structure() {
         // Test that navigation has correct wrapper structure:
         // [{reading_order_name: default, nav_containers: [nav_container::{}...]}]
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
         let mut ctx = ExportContext::new();
 
         // Collect spine info first to avoid borrow issues

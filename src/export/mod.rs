@@ -62,5 +62,5 @@ pub trait Exporter {
     /// - `Vec<u8>` for in-memory output
     /// - `std::io::Cursor<Vec<u8>>` for seekable in-memory output
     /// - Any other type implementing `Write + Seek`
-    fn export<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> crate::Result<()>;
+    fn export<W: Write + Seek>(&self, book: &Book, writer: &mut W) -> crate::Result<()>;
 }

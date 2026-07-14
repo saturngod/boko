@@ -73,7 +73,7 @@ fn test_kfx_font_assets_loadable() {
         return;
     };
 
-    let mut book = Book::open(tmp.path()).expect("Should open stripped KFX");
+    let book = Book::open(tmp.path()).expect("Should open stripped KFX");
 
     // Load each font and verify it contains real font data (not Ion metadata)
     let font_paths = [
@@ -122,7 +122,7 @@ fn test_kfx_font_stable_hashes() {
         return;
     };
 
-    let mut book = Book::open(tmp.path()).expect("Should open stripped KFX");
+    let book = Book::open(tmp.path()).expect("Should open stripped KFX");
 
     // Verify stable SHA-1 hashes for fixture fonts (regression test)
     let expected = [

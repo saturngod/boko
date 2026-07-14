@@ -253,8 +253,8 @@ fn show_sections(path: &str) -> Result<(), String> {
 }
 
 fn print_json(book: &mut Book, path: &str) -> Result<(), String> {
-    let meta = book.metadata().clone();
-    let asset_paths: Vec<_> = book.list_assets().to_vec();
+    let meta = book.metadata();
+    let asset_paths = book.list_assets();
 
     let assets: Vec<AssetInfo> = asset_paths
         .iter()
@@ -429,9 +429,9 @@ fn print_human(book: &mut Book, path: &str) -> Result<(), String> {
     }
 
     // Assets
-    let assets: Vec<_> = book.list_assets().to_vec();
+    let assets = book.list_assets();
     println!("\nAssets ({}):", assets.len());
-    for asset in &assets {
+    for asset in assets {
         let size = book
             .load_asset(asset).map_or_else(|_| "?".to_string(), |data| format_bytes(data.len()));
         println!("  {} ({})", asset, size);
@@ -533,7 +533,7 @@ fn convert(
     }
 
     // Open the book (from file or stdin)
-    let mut book = if from_stdin {
+    let book = if from_stdin {
         use std::io::Read;
         let mut data = Vec::new();
         std::io::stdin()

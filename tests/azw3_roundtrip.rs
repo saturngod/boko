@@ -16,10 +16,10 @@ use boko::model::{Format, TocEntry};
 use boko::{Book, export::Exporter};
 
 fn export_epub_to_azw3_bytes(epub_path: &str) -> Vec<u8> {
-    let mut book = Book::open(epub_path).expect("opening source epub");
+    let book = Book::open(epub_path).expect("opening source epub");
     let mut buf = Cursor::new(Vec::new());
     boko::export::Azw3Exporter::new()
-        .export(&mut book, &mut buf)
+        .export(&book, &mut buf)
         .expect("azw3 export");
     buf.into_inner()
 }
@@ -48,7 +48,7 @@ fn azw3_roundtrip_preserves_structure() {
     assert!(src_toc_depth >= 2, "fixture must have nested TOC");
 
     let bytes = export_epub_to_azw3_bytes(src_path);
-    let mut book = Book::from_bytes(&bytes, Format::Azw3).expect("reopen azw3");
+    let book = Book::from_bytes(&bytes, Format::Azw3).expect("reopen azw3");
 
     // Metadata survives the EXTH round-trip.
     assert_eq!(book.metadata().title, src_title);

@@ -15,7 +15,7 @@ const KFX_BYTES: &[u8] = include_bytes!("../tests/fixtures/epictetus.kfx");
 
 /// Load sample HTML and CSS from the epub fixture for IR benchmarks.
 fn load_sample_content() -> (String, Stylesheet) {
-    let mut book = Book::from_bytes(EPUB_BYTES, Format::Epub).unwrap();
+    let book = Book::from_bytes(EPUB_BYTES, Format::Epub).unwrap();
 
     // Find the enchiridion chapter (largest content chapter)
     let spine: Vec<_> = book.spine().to_vec();
@@ -160,34 +160,34 @@ fn bench_read_kfx(c: &mut Criterion) {
 }
 
 fn bench_write_epub(c: &mut Criterion) {
-    let mut book = Book::from_bytes(AZW3_BYTES, Format::Azw3).unwrap();
+    let book = Book::from_bytes(AZW3_BYTES, Format::Azw3).unwrap();
 
     c.bench_function("write_epub", |b| {
         b.iter(|| {
             let mut output = Cursor::new(Vec::new());
-            EpubExporter::new().export(&mut book, &mut output).unwrap();
+            EpubExporter::new().export(&book, &mut output).unwrap();
         });
     });
 }
 
 fn bench_write_azw3(c: &mut Criterion) {
-    let mut book = Book::from_bytes(EPUB_BYTES, Format::Epub).unwrap();
+    let book = Book::from_bytes(EPUB_BYTES, Format::Epub).unwrap();
 
     c.bench_function("write_azw3", |b| {
         b.iter(|| {
             let mut output = Cursor::new(Vec::new());
-            Azw3Exporter::new().export(&mut book, &mut output).unwrap();
+            Azw3Exporter::new().export(&book, &mut output).unwrap();
         });
     });
 }
 
 fn bench_write_kfx(c: &mut Criterion) {
-    let mut book = Book::from_bytes(EPUB_BYTES, Format::Epub).unwrap();
+    let book = Book::from_bytes(EPUB_BYTES, Format::Epub).unwrap();
 
     c.bench_function("write_kfx", |b| {
         b.iter(|| {
             let mut output = Cursor::new(Vec::new());
-            KfxExporter::new().export(&mut book, &mut output).unwrap();
+            KfxExporter::new().export(&book, &mut output).unwrap();
         });
     });
 }
@@ -204,9 +204,9 @@ fn bench_write_kfx(c: &mut Criterion) {
 fn bench_convert_epub_to_kfx_cold(c: &mut Criterion) {
     c.bench_function("convert_epub_to_kfx_cold", |b| {
         b.iter(|| {
-            let mut book = Book::from_bytes(EPUB_BYTES, Format::Epub).unwrap();
+            let book = Book::from_bytes(EPUB_BYTES, Format::Epub).unwrap();
             let mut output = Cursor::new(Vec::new());
-            KfxExporter::new().export(&mut book, &mut output).unwrap();
+            KfxExporter::new().export(&book, &mut output).unwrap();
         });
     });
 }
@@ -214,9 +214,9 @@ fn bench_convert_epub_to_kfx_cold(c: &mut Criterion) {
 fn bench_convert_epub_to_azw3_cold(c: &mut Criterion) {
     c.bench_function("convert_epub_to_azw3_cold", |b| {
         b.iter(|| {
-            let mut book = Book::from_bytes(EPUB_BYTES, Format::Epub).unwrap();
+            let book = Book::from_bytes(EPUB_BYTES, Format::Epub).unwrap();
             let mut output = Cursor::new(Vec::new());
-            Azw3Exporter::new().export(&mut book, &mut output).unwrap();
+            Azw3Exporter::new().export(&book, &mut output).unwrap();
         });
     });
 }
@@ -231,9 +231,9 @@ fn bench_large_book_to_kfx_cold(c: &mut Criterion) {
     group.sample_size(10);
     group.bench_function("to_kfx_cold", |b| {
         b.iter(|| {
-            let mut book = Book::from_bytes(&epub, Format::Epub).unwrap();
+            let book = Book::from_bytes(&epub, Format::Epub).unwrap();
             let mut output = Cursor::new(Vec::new());
-            KfxExporter::new().export(&mut book, &mut output).unwrap();
+            KfxExporter::new().export(&book, &mut output).unwrap();
         });
     });
     group.finish();
@@ -245,9 +245,9 @@ fn bench_large_book_to_azw3_cold(c: &mut Criterion) {
     group.sample_size(10);
     group.bench_function("to_azw3_cold", |b| {
         b.iter(|| {
-            let mut book = Book::from_bytes(&epub, Format::Epub).unwrap();
+            let book = Book::from_bytes(&epub, Format::Epub).unwrap();
             let mut output = Cursor::new(Vec::new());
-            Azw3Exporter::new().export(&mut book, &mut output).unwrap();
+            Azw3Exporter::new().export(&book, &mut output).unwrap();
         });
     });
     group.finish();
@@ -312,13 +312,13 @@ fn bench_compile_html_heavy_css(c: &mut Criterion) {
 // ============================================================================
 
 fn bench_write_markdown(c: &mut Criterion) {
-    let mut book = Book::from_bytes(EPUB_BYTES, Format::Epub).unwrap();
+    let book = Book::from_bytes(EPUB_BYTES, Format::Epub).unwrap();
 
     c.bench_function("write_markdown", |b| {
         b.iter(|| {
             let mut output = Vec::new();
             MarkdownExporter::new()
-                .export(&mut book, &mut Cursor::new(&mut output))
+                .export(&book, &mut Cursor::new(&mut output))
                 .unwrap();
         });
     });

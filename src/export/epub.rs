@@ -68,7 +68,7 @@ impl Default for EpubExporter {
 }
 
 impl Exporter for EpubExporter {
-    fn export<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> crate::Result<()> {
+    fn export<W: Write + Seek>(&self, book: &Book, writer: &mut W) -> crate::Result<()> {
         // Use normalized mode if explicitly requested OR if the source format requires it
         // (e.g., KFX raw content is binary Ion, not HTML)
         if self.config.normalize || book.requires_normalized_export() {
@@ -81,7 +81,7 @@ impl Exporter for EpubExporter {
 
 impl EpubExporter {
     /// Export with passthrough mode (preserves original HTML/CSS).
-    fn export_raw<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> crate::Result<()> {
+    fn export_raw<W: Write + Seek>(&self, book: &Book, writer: &mut W) -> crate::Result<()> {
         // Resolve TOC fragments before we generate the NCX. AZW3 and MOBI
         // importers leave TOC entries with bare chapter hrefs until
         // `resolve_toc()` populates the `#fileposN` / `#id` suffix from the
@@ -108,7 +108,7 @@ impl EpubExporter {
         zip.write_all(CONTAINER_XML)?;
 
         // 3. Collect content info for manifest
-        let spine: Vec<_> = book.spine().to_vec();
+        let spine = book.spine();
         let mut manifest_items: Vec<ManifestItem> = Vec::new();
         let mut spine_refs: Vec<String> = Vec::new();
 
@@ -147,7 +147,7 @@ impl EpubExporter {
         }
 
         // Add assets to manifest
-        let assets: Vec<_> = book.list_assets().to_vec();
+        let assets = book.list_assets();
         let mut asset_map: HashMap<String, String> = HashMap::new();
 
         for (i, asset_path) in assets.iter().enumerate() {
@@ -181,7 +181,7 @@ impl EpubExporter {
         zip.write_all(ncx.as_bytes())?;
 
         // 6. Write chapters
-        for entry in &spine {
+        for entry in spine {
             let source_path = book
                 .source_id(entry.id)
                 .unwrap_or("unknown.xhtml")
@@ -194,7 +194,7 @@ impl EpubExporter {
         }
 
         // 7. Write assets (skipping spine documents already written as chapters).
-        for asset_path in &assets {
+        for asset_path in assets {
             let zip_path = format!("OEBPS/{}", sanitize_path(asset_path));
             if chapter_paths.contains(&zip_path) {
                 continue;
@@ -213,7 +213,7 @@ impl EpubExporter {
     /// Export with normalized content (IR pipeline produces clean, consistent output).
     fn export_normalized<W: Write + Seek>(
         &self,
-        book: &mut Book,
+        book: &Book,
         writer: &mut W,
     ) -> io::Result<()> {
         use super::normalize::normalize_book;
@@ -228,7 +228,7 @@ impl EpubExporter {
         // resources like embedded fonts that are referenced from CSS rather
         // than from the IR DOM. We add those back into the manifest and ZIP
         // below.
-        let all_assets: Vec<_> = book.list_assets().to_vec();
+        let all_assets = book.list_assets();
 
         // Normalize the book content
         let content = normalize_book(book)?;
@@ -306,7 +306,7 @@ impl EpubExporter {
         // `content.assets`. Without this we'd emit `@font-face` rules whose
         // `src:` URLs point at files we never wrote into the ZIP.
         let mut extra_font_idx = 0;
-        for asset_path in &all_assets {
+        for asset_path in all_assets {
             if !asset_path.starts_with("fonts/") {
                 continue;
             }
@@ -370,7 +370,7 @@ impl EpubExporter {
 
         // 9. Write font assets not already covered by normalized content.
         // Matches the manifest entries added above.
-        for asset_path in &all_assets {
+        for asset_path in all_assets {
             if !asset_path.starts_with("fonts/") {
                 continue;
             }

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::dom::Stylesheet;
 use crate::import::{ChapterId, Importer, SpineEntry, resolve_path_based_href};
@@ -59,20 +59,20 @@ pub struct Azw3Importer {
     kf8: Kf8Structure,
 
     /// Cached decompressed text (loaded on first chapter request).
-    text_cache: Option<Vec<u8>>,
+    text_cache: OnceLock<Vec<u8>>,
 
     /// Cached chapter content.
-    chapter_cache: HashMap<u32, Vec<u8>>,
+    chapter_cache: RwLock<HashMap<u32, Vec<u8>>>,
 
     /// Discovered asset paths.
     assets: Vec<String>,
 
     /// Cached parsed stylesheets.
-    css_cache: HashMap<String, Arc<Stylesheet>>,
+    css_cache: RwLock<HashMap<String, Arc<Stylesheet>>>,
 
     // --- Link resolution ---
     /// Maps "path#id" -> GlobalNodeId (built during index_anchors)
-    element_id_map: HashMap<String, GlobalNodeId>,
+    element_id_map: RwLock<HashMap<String, GlobalNodeId>>,
 
     // --- TOC resolution ---
     /// NCX positions for TOC entries, keyed by (title, chapter_path).
@@ -113,10 +113,6 @@ impl Importer for Azw3Importer {
         &self.toc
     }
 
-    fn toc_mut(&mut self) -> &mut [TocEntry] {
-        &mut self.toc
-    }
-
     fn landmarks(&self) -> &[Landmark] {
         &self.landmarks
     }
@@ -129,22 +125,20 @@ impl Importer for Azw3Importer {
         self.chapter_paths.get(id.0 as usize).map(|s| s.as_str())
     }
 
-    fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
+    fn load_raw(&self, id: ChapterId) -> crate::Result<Vec<u8>> {
         // Check chapter cache first
-        if let Some(content) = self.chapter_cache.get(&id.0) {
+        if let Ok(cache) = self.chapter_cache.read()
+            && let Some(content) = cache.get(&id.0)
+        {
             return Ok(content.clone());
         }
 
-        // Ensure text is loaded
-        if self.text_cache.is_none() {
-            self.text_cache = Some(self.extract_text()?);
+        // Build the requested chapter from the (lazily decompressed) text
+        let content = self.build_chapter(id.0, self.cached_text()?)?;
+
+        if let Ok(mut cache) = self.chapter_cache.write() {
+            cache.insert(id.0, content.clone());
         }
-
-        // Build the requested chapter
-        let text = self.text_cache.as_ref().unwrap();
-        let content = self.build_chapter(id.0, text)?;
-
-        self.chapter_cache.insert(id.0, content.clone());
         Ok(content)
     }
 
@@ -152,7 +146,7 @@ impl Importer for Azw3Importer {
         &self.assets
     }
 
-    fn load_asset(&mut self, path: &str) -> crate::Result<Vec<u8>> {
+    fn load_asset(&self, path: &str) -> crate::Result<Vec<u8>> {
         // Parse index from path (images/image_XXXX.ext or fonts/font_XXXX.ext).
         // Images and fonts share the same record-index space, so the prefix
         // selects naming but the underlying lookup is the same.
@@ -168,19 +162,25 @@ impl Importer for Azw3Importer {
         Ok(self.load_image_record(idx)?)
     }
 
-    fn load_stylesheet(&mut self, path: &str) -> Option<Arc<Stylesheet>> {
-        if let Some(sheet) = self.css_cache.get(path) {
+    fn load_stylesheet(&self, path: &str) -> Option<Arc<Stylesheet>> {
+        if let Ok(cache) = self.css_cache.read()
+            && let Some(sheet) = cache.get(path)
+        {
             return Some(Arc::clone(sheet));
         }
         let css_bytes = self.load_asset(path).ok()?;
         let css_str = String::from_utf8_lossy(&css_bytes);
         let sheet = Arc::new(Stylesheet::parse(&css_str));
-        self.css_cache.insert(path.to_string(), Arc::clone(&sheet));
-        Some(sheet)
+        match self.css_cache.write() {
+            Ok(mut cache) => Some(Arc::clone(
+                cache.entry(path.to_string()).or_insert(sheet),
+            )),
+            Err(_) => Some(sheet),
+        }
     }
 
-    fn index_anchors(&mut self, chapters: &[(ChapterId, Arc<Chapter>)]) {
-        self.element_id_map.clear();
+    fn index_anchors(&self, chapters: &[(ChapterId, Arc<Chapter>)]) {
+        let mut element_id_map = HashMap::new();
 
         // Build path#id → GlobalNodeId map from chapters (same format as EPUB)
         for (chapter_id, chapter) in chapters {
@@ -193,10 +193,13 @@ impl Importer for Azw3Importer {
             for node_id in chapter.iter_dfs() {
                 if let Some(id) = chapter.semantics.id(node_id) {
                     let key = format!("{}#{}", chapter_path, id);
-                    self.element_id_map
-                        .insert(key, GlobalNodeId::new(*chapter_id, node_id));
+                    element_id_map.insert(key, GlobalNodeId::new(*chapter_id, node_id));
                 }
             }
+        }
+
+        if let Ok(mut map) = self.element_id_map.write() {
+            *map = element_id_map;
         }
     }
 
@@ -211,21 +214,17 @@ impl Importer for Azw3Importer {
                     .position(|cp| cp == p)
                     .map(|i| ChapterId(i as u32))
             },
-            |k| self.element_id_map.get(k).copied(),
+            |k| {
+                self.element_id_map
+                    .read()
+                    .ok()
+                    .and_then(|m| m.get(k).copied())
+            },
         )
     }
 
-    fn resolve_toc(&mut self) {
-        // Load text if not cached
-        if self.text_cache.is_none() {
-            if let Ok(text) = self.extract_text() {
-                self.text_cache = Some(text);
-            } else {
-                return;
-            }
-        }
-
-        let text = self.text_cache.as_ref().unwrap();
+    fn resolve_toc(&self) -> Option<Vec<TocEntry>> {
+        let text = self.cached_text().ok()?;
 
         // Get HTML flow (flow 0)
         let (html_start, html_end) = self
@@ -244,8 +243,24 @@ impl Importer for Azw3Importer {
             .map(|f| (f.start_pos, f.file_number as u32))
             .collect();
 
-        // Resolve TOC entries using stored positions
-        resolve_toc_with_positions(&mut self.toc, &self.toc_positions, html_text, &file_starts);
+        // Resolve TOC entries using stored positions, into a copy — the
+        // importer's own entries stay untouched (Book caches the result).
+        let mut toc = self.toc.clone();
+        resolve_toc_with_positions(&mut toc, &self.toc_positions, html_text, &file_starts);
+        Some(toc)
+    }
+}
+
+impl Azw3Importer {
+    /// The decompressed text stream, extracted on first use.
+    fn cached_text(&self) -> crate::Result<&Vec<u8>> {
+        if let Some(text) = self.text_cache.get() {
+            return Ok(text);
+        }
+        let text = self.extract_text()?;
+        // A concurrent extraction may have won the race; either value is
+        // identical, so whichever landed first is used.
+        Ok(self.text_cache.get_or_init(|| text))
     }
 }
 
@@ -472,11 +487,11 @@ impl Azw3Importer {
                 files,
                 elems,
             },
-            text_cache: None,
-            chapter_cache: HashMap::new(),
+            text_cache: OnceLock::new(),
+            chapter_cache: RwLock::new(HashMap::new()),
             assets: Vec::new(),
-            css_cache: HashMap::new(),
-            element_id_map: HashMap::new(),
+            css_cache: RwLock::new(HashMap::new()),
+            element_id_map: RwLock::new(HashMap::new()),
             toc_positions,
         };
 

@@ -73,7 +73,7 @@ pub(super) fn survey_node(chapter: &Chapter, node_id: NodeId, ctx: &mut ExportCo
 /// anchor registry, mapping hrefs to their resolved targets (GlobalNodeId,
 /// ChapterId, or external URL).
 pub(super) fn register_link_targets(
-    book: &mut Book,
+    book: &Book,
     spine_info: &[(ChapterId, String)],
     resolved: &ResolvedLinks,
     ctx: &mut ExportContext,

@@ -32,7 +32,7 @@ pub(super) struct Kf8Builder {
 }
 
 impl Kf8Builder {
-    pub(super) fn new(book: &mut Book, normalize: bool) -> crate::Result<Self> {
+    pub(super) fn new(book: &Book, normalize: bool) -> crate::Result<Self> {
         let ctx = BookContext::from_book(book, normalize)?;
 
         let mut builder = Self {

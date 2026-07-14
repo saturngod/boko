@@ -58,7 +58,7 @@ impl KfxExporter {
 }
 
 impl Exporter for KfxExporter {
-    fn export<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> crate::Result<()> {
+    fn export<W: Write + Seek>(&self, book: &Book, writer: &mut W) -> crate::Result<()> {
         // Build the KFX container
         let data = build_kfx_container(book)?;
         writer.write_all(&data)?;
@@ -71,7 +71,7 @@ impl Exporter for KfxExporter {
 /// This follows a strict Two-Pass architecture:
 /// - Pass 1 (Survey): Walk IR, build position map, intern symbols - NO ION GENERATION
 /// - Pass 2 (Synthesis): Generate Ion using pre-computed positions
-fn build_kfx_container(book: &mut Book) -> crate::Result<Vec<u8>> {
+fn build_kfx_container(book: &Book) -> crate::Result<Vec<u8>> {
     let container_id = generate_container_id();
     let mut ctx = ExportContext::new();
 
@@ -83,13 +83,13 @@ fn build_kfx_container(book: &mut Book) -> crate::Result<Vec<u8>> {
 
     // Check if we need a standalone cover section
     // This happens when the EPUB cover image differs from the first spine chapter's image
-    let asset_paths: Vec<_> = book.list_assets().to_vec();
+    let asset_paths = book.list_assets();
     let cover_image = book.metadata().cover_image.clone();
     let first_chapter_id = book.spine().first().map(|e| e.id);
 
     let standalone_cover_path: Option<String> = match (cover_image, first_chapter_id) {
         (Some(cover_img), Some(first_id)) => {
-            let normalized = normalize_cover_path(&cover_img, &asset_paths);
+            let normalized = normalize_cover_path(&cover_img, asset_paths);
             book.load_chapter_cached(first_id)
                 .ok()
                 .and_then(|first_chapter| {
@@ -235,8 +235,8 @@ fn build_kfx_container(book: &mut Book) -> crate::Result<Vec<u8>> {
     // 1e. Register resource paths and create short names
     // IMPORTANT: Short names must be interned during Pass 1 to ensure
     // consistent symbol IDs when they're referenced later in storylines
-    let asset_paths: Vec<_> = book.list_assets().to_vec();
-    for asset_path in &asset_paths {
+    let asset_paths = book.list_assets();
+    for asset_path in asset_paths {
         if is_media_asset(asset_path) {
             ctx.resource_registry.register(asset_path, &mut ctx.symbols);
             // Create and intern the short name (e.g., "e0")
@@ -365,7 +365,7 @@ fn build_kfx_container(book: &mut Book) -> crate::Result<Vec<u8>> {
 
     // 2j. Resource fragments (images, fonts, etc.)
     // Each resource gets two entities: external_resource (metadata) + bcRawMedia (bytes)
-    for asset_path in &asset_paths {
+    for asset_path in asset_paths {
         if is_media_asset(asset_path)
             && let Ok(data) = book.load_asset(asset_path)
         {

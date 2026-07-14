@@ -69,7 +69,7 @@ pub(super) fn build_resource_fragment(
 ///
 /// Font entities link font_family names (e.g., "cover-Ubuntu") to resource locations.
 /// This enables Kindle to properly render custom fonts.
-pub(super) fn build_font_fragments(book: &mut Book, ctx: &mut ExportContext) -> Vec<KfxFragment> {
+pub(super) fn build_font_fragments(book: &Book, ctx: &mut ExportContext) -> Vec<KfxFragment> {
     use crate::style::{FontStyle, FontWeight};
 
     let mut fragments = Vec::new();
@@ -278,8 +278,8 @@ mod resource_export_tests {
 
     #[test]
     fn test_kfx_export_includes_images() {
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
-        let data = build_kfx_container(&mut book).unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let data = build_kfx_container(&book).unwrap();
 
         // KFX should be > 400KB (images alone are ~401KB)
         assert!(
@@ -292,14 +292,14 @@ mod resource_export_tests {
     #[test]
     fn test_kfx_asset_roundtrip() {
         // Export EPUB to KFX
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
-        let kfx_data = build_kfx_container(&mut book).unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let kfx_data = build_kfx_container(&book).unwrap();
 
         // Write to temp file and re-open
         let temp_path = std::env::temp_dir().join("test_roundtrip.kfx");
         std::fs::write(&temp_path, &kfx_data).unwrap();
 
-        let mut reimported = Book::open(&temp_path).unwrap();
+        let reimported = Book::open(&temp_path).unwrap();
         let assets: Vec<_> = reimported.list_assets().to_vec();
 
         // Load all assets and verify total size
@@ -329,7 +329,7 @@ mod anchor_resolution_tests {
     fn test_cross_file_anchor_resolution_flow() {
         // Test the full anchor resolution flow with epictetus.epub
         // This EPUB has endnotes in endnotes.xhtml with links from the main text
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
 
         // Step 1: Resolve all links using centralized resolver
         let resolved = book.resolve_links().unwrap();
@@ -347,7 +347,7 @@ mod anchor_resolution_tests {
     fn test_anchor_symbol_reuse() {
         // Test that anchor symbols are consistent between link_to and anchor creation
         // This tests the core invariant of the anchor registry
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
 
         let mut ctx = ExportContext::new();
 
@@ -366,7 +366,7 @@ mod anchor_resolution_tests {
         let resolved = book.resolve_links().unwrap();
 
         // Step 2: Register link targets from ResolvedLinks
-        register_link_targets(&mut book, &spine_info, &resolved, &mut ctx).unwrap();
+        register_link_targets(&book, &spine_info, &resolved, &mut ctx).unwrap();
 
         // Step 3: Verify that href lookups return the same symbol as GlobalNodeId lookups
         // Find an internal link that has both
@@ -399,8 +399,8 @@ mod anchor_resolution_tests {
     #[test]
     fn test_anchor_entities_created_in_full_export() {
         // Test that anchor entities are actually created during full export
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
-        let kfx_data = build_kfx_container(&mut book).unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let kfx_data = build_kfx_container(&book).unwrap();
 
         // Parse the KFX container to find anchor entities
         use crate::kfx::container::{

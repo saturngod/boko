@@ -275,7 +275,7 @@ mod entity_structure_tests {
     #[test]
     fn test_entity_order_matches_reference() {
         // Build KFX from EPUB and verify entity order matches Amazon reference
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
         let container_id = generate_container_id();
         let mut ctx = ExportContext::new();
 
@@ -390,7 +390,7 @@ mod entity_structure_tests {
 
     #[test]
     fn test_chapter_entities_grouped_returns_correct_types() {
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
         let mut ctx = ExportContext::new();
 
         // Get first chapter
@@ -464,17 +464,17 @@ mod section_type_tests {
     /// type: text, NOT type: container. The container type is reserved for c0.
     #[test]
     fn test_titlepage_section_has_text_type_when_standalone_cover_exists() {
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
         let mut ctx = ExportContext::new();
 
         // Verify this book needs a standalone cover (cover.jpg != titlepage.png)
-        let asset_paths: Vec<_> = book.list_assets().to_vec();
+        let asset_paths = book.list_assets();
         let cover_image = book
             .metadata()
             .cover_image
             .clone()
             .expect("should have cover");
-        let normalized = normalize_cover_path(&cover_image, &asset_paths);
+        let normalized = normalize_cover_path(&cover_image, asset_paths);
 
         // Get first chapter ID
         let first_chapter_id = book.spine().first().expect("should have spine").id;

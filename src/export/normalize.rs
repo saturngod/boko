@@ -268,8 +268,8 @@ fn rewrite_document_hrefs(
 /// # Returns
 ///
 /// A `NormalizedContent` containing all normalized data ready for export.
-pub fn normalize_book(book: &mut Book) -> crate::Result<NormalizedContent> {
-    let spine: Vec<_> = book.spine().to_vec();
+pub fn normalize_book(book: &Book) -> crate::Result<NormalizedContent> {
+    let spine = book.spine();
 
     // =========================================================================
     // Pass 1: Load all chapters and merge styles

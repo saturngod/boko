@@ -37,13 +37,13 @@ impl MarkdownExporter {
 }
 
 impl Exporter for MarkdownExporter {
-    fn export<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> crate::Result<()> {
+    fn export<W: Write + Seek>(&self, book: &Book, writer: &mut W) -> crate::Result<()> {
         let _ = self.config; // Reserved for future use (line wrapping)
 
         // 1. Resolve all links (I/O: loads chapters internally)
         let resolved = book.resolve_links()?;
 
-        let spine: Vec<_> = book.spine().to_vec();
+        let spine = book.spine();
 
         // 2. Load all chapters and build heading slugs
         let chapters: Vec<_> = spine
