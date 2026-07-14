@@ -33,6 +33,14 @@ refactor. It contains breaking changes to the public API.
   Ion codec; `ion-rs` was only needed by the KFX dump tool. Consumers using
   `default-features = false` who relied on `ion-rs` being pulled in transitively
   must enable the `cli` feature.
+- **`Book` and the `Importer`/`Exporter` traits operate on shared references.**
+  Every data method (`load_raw`, `load_asset`, `load_chapter`, `load_stylesheet`,
+  `font_faces`, …) takes `&self`; `Exporter::export` and `Book::export` take
+  `&Book`; `Book::resolve_links` is `&self`, memoized, and returns
+  `Arc<ResolvedLinks>`. `Importer::toc_mut` is gone — `resolve_toc` returns a
+  fixed-up copy and `Book` caches the resolved views. Custom importers convert
+  interior caches to `OnceLock`/`RwLock`; in exchange, chapter compilation
+  parallelizes for every format and books can be exported concurrently.
 - **The standalone `kfx-dump` binary is now the `boko kfx-dump` subcommand.**
   Same flags (`-r`, `-s`, `-f <field>`), byte-identical output; `cargo install
   boko` no longer places a second binary on `PATH`.

@@ -52,7 +52,7 @@ KFX/KDF/Ion internals can be inspected with the `kfx-dump` subcommand:
 use boko::{Book, Format};
 use std::fs::File;
 
-let mut book = Book::open("in.epub")?;
+let book = Book::open("in.epub")?;
 let mut out = File::create("out.kfx")?;
 book.export(Format::Kfx, &mut out)?;
 ```

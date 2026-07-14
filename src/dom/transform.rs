@@ -1,5 +1,8 @@
 //! Transform ArenaDom to Chapter.
 
+use selectors::Element as _;
+use selectors::bloom::BloomFilter;
+
 use super::arena::{ArenaDom, ArenaNodeData, ArenaNodeId};
 use super::element_ref::ElementRef;
 use super::role_map::element_to_role;
@@ -35,15 +38,29 @@ struct TransformContext<'a> {
     cascade_index: CascadeIndex<'a>,
     /// Reused across every element of the chapter (candidate buffer + selector caches).
     cascade_scratch: CascadeScratch,
+    /// Ancestor bloom filter for the selectors crate's fast-reject path.
+    /// Invariant: whenever styles are computed for an element, the filter
+    /// contains the hashes of exactly that element's element ancestors (the
+    /// DFS pushes each element before descending into its children and pops
+    /// it after). Only maintained when `use_bloom` is set.
+    bloom: BloomFilter,
+    /// Whether maintaining `bloom` can pay off: false when no selector has
+    /// ancestor requirements (then `None` is passed and matching skips the
+    /// bloom checks entirely).
+    use_bloom: bool,
     chapter: Chapter,
 }
 
 impl<'a> TransformContext<'a> {
     fn new(dom: &'a ArenaDom, stylesheets: &'a [(&'a Stylesheet, Origin)]) -> Self {
+        let cascade_index = CascadeIndex::build(stylesheets);
+        let use_bloom = cascade_index.has_complex_selectors();
         Self {
             dom,
-            cascade_index: CascadeIndex::build(stylesheets),
+            cascade_index,
             cascade_scratch: CascadeScratch::default(),
+            bloom: BloomFilter::new(),
+            use_bloom,
             chapter: Chapter::new(),
         }
     }
@@ -67,15 +84,28 @@ impl<'a> TransformContext<'a> {
             None
         });
 
+        // Seed the ancestor bloom filter with body's element ancestors (html):
+        // the filter must contain every element ancestor of whatever element
+        // styles are computed for, starting with body itself.
+        if self.use_bloom {
+            let mut ancestor = ElementRef::new(self.dom, body).parent_element();
+            while let Some(elem) = ancestor {
+                elem.each_bloom_hash(|hash| self.bloom.insert_hash(hash));
+                ancestor = elem.parent_element();
+            }
+        }
+
         // Compute body's style so its properties (like hyphens: auto) are inherited
         let mut body_style = {
             let elem_ref = ElementRef::new(self.dom, body);
+            let bloom = if self.use_bloom { Some(&self.bloom) } else { None };
             compute_styles_indexed(
                 elem_ref,
                 &self.cascade_index,
                 None,
                 &mut self.chapter.styles,
                 &mut self.cascade_scratch,
+                bloom,
             )
         };
 
@@ -86,7 +116,13 @@ impl<'a> TransformContext<'a> {
             body_style.language = Some(lang);
         }
 
-        // Process body's children as children of IR root, inheriting body's style
+        // Process body's children as children of IR root, inheriting body's
+        // style. Body becomes an ancestor of everything the DFS styles, so
+        // push it onto the filter first (a no-op when body is the document
+        // node rather than an element).
+        if self.use_bloom {
+            ElementRef::new(self.dom, body).each_bloom_hash(|hash| self.bloom.insert_hash(hash));
+        }
         self.process_children(body, NodeId::ROOT, Some(&body_style), 0);
 
         self.chapter
@@ -187,14 +223,18 @@ impl<'a> TransformContext<'a> {
             }
 
             ArenaNodeData::Element { name, attrs, .. } => {
-                // Compute style for this element
+                // Compute style for this element. The bloom filter holds the
+                // hashes of this element's ancestors (maintained by the
+                // push/pop around process_children below).
                 let elem_ref = ElementRef::new(self.dom, dom_id);
+                let bloom = if self.use_bloom { Some(&self.bloom) } else { None };
                 let mut computed = compute_styles_indexed(
                     elem_ref,
                     &self.cascade_index,
                     parent_style,
                     &mut self.chapter.styles,
                     &mut self.cascade_scratch,
+                    bloom,
                 );
 
                 // Merge lang attribute into style (for KFX language property)
@@ -292,8 +332,17 @@ impl<'a> TransformContext<'a> {
                     self.chapter.semantics.set_header_cell(ir_id, true);
                 }
 
-                // Process children
+                // Process children. This element is an ancestor of its
+                // children, so push its hashes onto the filter around the
+                // recursion (and pop them after, keeping the counting filter
+                // balanced).
+                if self.use_bloom {
+                    elem_ref.each_bloom_hash(|hash| self.bloom.insert_hash(hash));
+                }
                 self.process_children(dom_id, ir_id, Some(&computed), depth + 1);
+                if self.use_bloom {
+                    elem_ref.each_bloom_hash(|hash| self.bloom.remove_hash(hash));
+                }
             }
 
             // Skip other node types

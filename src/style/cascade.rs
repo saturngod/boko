@@ -7,8 +7,9 @@
 use std::cmp::Ordering;
 use rustc_hash::FxHashMap;
 
-use selectors::context::{MatchingContext, SelectorCaches};
-use selectors::parser::{Component, Selector};
+use selectors::bloom::BloomFilter;
+use selectors::context::{MatchingContext, QuirksMode, SelectorCaches};
+use selectors::parser::{AncestorHashes, Component, Selector};
 
 use super::declaration::Declaration;
 use super::parse::{CssRule, Origin, Specificity, Stylesheet};
@@ -146,6 +147,16 @@ pub struct CascadeIndex<'a> {
     by_class: FxHashMap<String, Vec<RuleRef>>,
     by_local: FxHashMap<String, Vec<RuleRef>>,
     universal: Vec<RuleRef>,
+    /// Per-sheet, per-rule ancestor hashes for the bloom-filter fast path,
+    /// indexed as `ancestor_hashes[sheet][rule][selector]` (parallel to
+    /// `rule.selectors`). Passed to `matches_selector` so it can fast-reject
+    /// candidates whose ancestor requirements the current ancestor bloom
+    /// filter cannot satisfy.
+    ancestor_hashes: Vec<Vec<Box<[AncestorHashes]>>>,
+    /// Whether any selector produced a non-empty ancestor-hash set, i.e.
+    /// whether an ancestor bloom filter could reject anything at all. When
+    /// false, callers can skip maintaining a filter entirely.
+    has_ancestor_hashes: bool,
 }
 
 impl<'a> CascadeIndex<'a> {
@@ -160,8 +171,11 @@ impl<'a> CascadeIndex<'a> {
             by_class: FxHashMap::default(),
             by_local: FxHashMap::default(),
             universal: Vec::new(),
+            ancestor_hashes: Vec::with_capacity(stylesheets.len()),
+            has_ancestor_hashes: false,
         };
         for (sheet_idx, (sheet, _origin)) in stylesheets.iter().enumerate() {
+            let mut sheet_hashes = Vec::with_capacity(sheet.rules.len());
             for (rule_idx, rule) in sheet.rules.iter().enumerate() {
                 let rref = (sheet_idx as u32, rule_idx as u32);
                 // A rule matches if any of its selectors match, so file it under
@@ -174,9 +188,31 @@ impl<'a> CascadeIndex<'a> {
                         BucketKey::Universal => index.universal.push(rref),
                     }
                 }
+                // Matching always runs with QuirksMode::NoQuirks, and these
+                // hashes must be collected under the same quirks mode.
+                let rule_hashes: Box<[AncestorHashes]> = rule
+                    .selectors
+                    .iter()
+                    .map(|selector| {
+                        let hashes = AncestorHashes::new(selector, QuirksMode::NoQuirks);
+                        // A zero first hash means "no usable ancestor hashes"
+                        // (the fast path bails on the first zero).
+                        index.has_ancestor_hashes |= hashes.packed_hashes[0] != 0;
+                        hashes
+                    })
+                    .collect();
+                sheet_hashes.push(rule_hashes);
             }
+            index.ancestor_hashes.push(sheet_hashes);
         }
         index
+    }
+
+    /// Whether any selector in the index has combinators whose ancestor
+    /// requirements the bloom-filter fast path could reject on. When this is
+    /// false, maintaining an ancestor filter cannot help matching.
+    pub fn has_complex_selectors(&self) -> bool {
+        self.has_ancestor_hashes
     }
 
     /// Fill `out` with the candidate rules for an element, in source order and
@@ -234,16 +270,26 @@ pub fn compute_styles(
         parent_style,
         style_pool,
         &mut CascadeScratch::default(),
+        None,
     )
 }
 
 /// Compute styles for an element using a prebuilt [`CascadeIndex`].
+///
+/// `bloom`, when provided, must be an ancestor bloom filter containing the
+/// hashes ([`ElementRef::each_bloom_hash`]) of every *element ancestor* of
+/// `elem` — and nothing else, in particular not `elem` itself. It lets
+/// selector matching fast-reject descendant/child-combinator candidates
+/// without walking the ancestor chain. Passing a filter that is missing an
+/// ancestor would silently drop matching rules; pass `None` when no
+/// correctly-maintained filter is available.
 pub fn compute_styles_indexed(
     elem: ElementRef<'_>,
     index: &CascadeIndex<'_>,
     parent_style: Option<&ComputedStyle>,
     _style_pool: &mut StylePool,
     scratch: &mut CascadeScratch,
+    bloom: Option<&BloomFilter>,
 ) -> ComputedStyle {
     let CascadeScratch {
         caches,
@@ -259,7 +305,8 @@ pub fn compute_styles_indexed(
     for &(sheet_idx, rule_idx) in candidates.iter() {
         let (stylesheet, origin) = index.stylesheets[sheet_idx as usize];
         let rule = &stylesheet.rules[rule_idx as usize];
-        if let Some(specificity) = rule_match_specificity(elem, rule, caches) {
+        let hashes = &index.ancestor_hashes[sheet_idx as usize][rule_idx as usize];
+        if let Some(specificity) = rule_match_specificity(elem, rule, hashes, bloom, caches) {
             // Collect normal declarations
             for decl_idx in 0..rule.declarations.len() {
                 matched.push(MatchedDecl {
@@ -351,24 +398,28 @@ pub fn compute_styles_indexed(
 fn rule_match_specificity(
     elem: ElementRef<'_>,
     rule: &CssRule,
+    hashes: &[AncestorHashes],
+    bloom: Option<&BloomFilter>,
     caches: &mut SelectorCaches,
 ) -> Option<Specificity> {
     let mut context = MatchingContext::new(
         selectors::matching::MatchingMode::Normal,
-        None,
+        bloom,
         caches,
-        selectors::context::QuirksMode::NoQuirks,
+        QuirksMode::NoQuirks,
         selectors::matching::NeedsSelectorFlags::No,
         selectors::matching::MatchingForInvalidation::No,
     );
 
+    debug_assert_eq!(rule.selectors.len(), hashes.len());
     rule.selectors
         .iter()
         .zip(&rule.selector_specificities)
-        .filter(|(selector, _)| {
-            selectors::matching::matches_selector(selector, 0, None, &elem, &mut context)
+        .zip(hashes)
+        .filter(|&((selector, _), hashes)| {
+            selectors::matching::matches_selector(selector, 0, Some(hashes), &elem, &mut context)
         })
-        .map(|(_, spec)| *spec)
+        .map(|((_, spec), _)| *spec)
         .max()
 }
 

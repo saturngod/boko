@@ -25,14 +25,25 @@ pub struct BokoSelectors;
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
 pub struct IdentStr(pub String);
 
+/// Hash used for [`IdentStr`]'s `PrecomputedHash` impl, callable on a raw
+/// `&str`.
+///
+/// The ancestor bloom-filter fast path requires the element side
+/// ([`ElementRef::each_bloom_hash`]) to hash id/class strings exactly like
+/// the selector side (`IdentStr::precomputed_hash`, consumed by
+/// `selectors::parser::AncestorHashes`), so both go through this function.
+pub(crate) fn ident_hash(s: &str) -> u32 {
+    // Simple hash based on string content
+    let mut h: u32 = 0;
+    for byte in s.bytes() {
+        h = h.wrapping_mul(31).wrapping_add(u32::from(byte));
+    }
+    h
+}
+
 impl precomputed_hash::PrecomputedHash for IdentStr {
     fn precomputed_hash(&self) -> u32 {
-        // Simple hash based on string content
-        let mut h: u32 = 0;
-        for byte in self.0.bytes() {
-            h = h.wrapping_mul(31).wrapping_add(byte as u32);
-        }
-        h
+        ident_hash(&self.0)
     }
 }
 
@@ -210,6 +221,33 @@ pub struct ElementRef<'a> {
 impl<'a> ElementRef<'a> {
     pub fn new(dom: &'a ArenaDom, id: ArenaNodeId) -> Self {
         Self { dom, id }
+    }
+
+    /// Call `f` with the bloom-filter hash of each selector-addressable
+    /// feature of this element: local name, namespace, id, and classes.
+    ///
+    /// These are exactly the hashes `selectors::parser::AncestorHashes`
+    /// collects from the ancestor compounds of a selector, so pushing them
+    /// for every ancestor of an element lets `matches_selector` fast-reject
+    /// descendant/child-combinator selectors whose ancestor requirements the
+    /// element's real ancestor chain cannot satisfy. Hashes are pre-masked
+    /// with `BLOOM_HASH_MASK`, matching the masked lookups the selectors
+    /// crate performs.
+    pub(crate) fn each_bloom_hash(&self, mut f: impl FnMut(u32)) {
+        use precomputed_hash::PrecomputedHash;
+        use selectors::bloom::BLOOM_HASH_MASK;
+        if let Some(name) = self.dom.element_name(self.id) {
+            f(name.precomputed_hash() & BLOOM_HASH_MASK);
+        }
+        if let Some(ns) = self.dom.element_namespace(self.id) {
+            f(ns.precomputed_hash() & BLOOM_HASH_MASK);
+        }
+        if let Some(id) = self.dom.element_id(self.id) {
+            f(ident_hash(id) & BLOOM_HASH_MASK);
+        }
+        for class in self.dom.element_classes(self.id) {
+            f(ident_hash(class) & BLOOM_HASH_MASK);
+        }
     }
 }
 
@@ -447,9 +485,9 @@ impl<'a> selectors::Element for ElementRef<'a> {
         // We don't need to track selector flags for our use case
     }
 
-    fn add_element_unique_hashes(&self, _filter: &mut selectors::bloom::BloomFilter) -> bool {
-        // No bloom filter support needed
-        false
+    fn add_element_unique_hashes(&self, filter: &mut selectors::bloom::BloomFilter) -> bool {
+        self.each_bloom_hash(|hash| filter.insert_hash(hash));
+        true
     }
 
     fn has_custom_state(&self, _name: &IdentStr) -> bool {
