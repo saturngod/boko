@@ -79,16 +79,11 @@ pub const AID_ABLE_TAGS: &[&str] = &[
 
 /// A chunk of content extracted from the skeleton
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields prepared for full chunking implementation
 pub struct Chunk {
     /// The raw bytes of this chunk
     pub raw: Vec<u8>,
     /// Insert position in the skeleton (absolute byte offset)
     pub insert_pos: usize,
-    /// Tags that start in this chunk (their aid values)
-    pub starts_tags: Vec<String>,
-    /// Tags that end in this chunk (their aid values)
-    pub ends_tags: Vec<String>,
     /// Selector for this chunk (e.g., "P-//*[@aid='xxx']")
     pub selector: String,
     /// File number this chunk belongs to
@@ -157,9 +152,7 @@ impl Skeleton {
 
 /// SKEL table entry (for INDX record)
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields prepared for full chunking implementation
 pub struct SkelEntry {
-    pub file_number: usize,
     pub name: String,
     pub chunk_count: usize,
     pub start_pos: usize,
@@ -178,9 +171,7 @@ pub struct ChunkEntry {
 }
 
 /// Result of chunking operation
-#[allow(dead_code)] // skeletons field prepared for full chunking implementation
 pub struct ChunkerResult {
-    pub skeletons: Vec<Skeleton>,
     pub skel_table: Vec<SkelEntry>,
     pub chunk_table: Vec<ChunkEntry>,
     pub text: Vec<u8>,
@@ -245,7 +236,6 @@ impl Chunker {
         let skel_table: Vec<SkelEntry> = skeletons
             .iter()
             .map(|s| SkelEntry {
-                file_number: s.file_number,
                 name: format!("SKEL{:010}", s.file_number),
                 chunk_count: s.chunks.len(),
                 start_pos: s.start_pos,
@@ -266,7 +256,6 @@ impl Chunker {
         let aid_offset_map = self.build_aid_offset_map(&rebuilt, &chunk_table);
 
         ChunkerResult {
-            skeletons,
             skel_table,
             chunk_table,
             text,
@@ -410,8 +399,6 @@ impl Chunker {
             chunks.push(Chunk {
                 raw,
                 insert_pos: base + cumulative,
-                starts_tags: Vec::new(),
-                ends_tags: Vec::new(),
                 selector: selector.clone(),
                 file_number,
                 sequence_number: 0, // assigned by Chunker::process

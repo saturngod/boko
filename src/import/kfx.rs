@@ -37,10 +37,6 @@ pub struct KfxImporter {
     /// Random-access byte source.
     source: Arc<dyn ByteSource>,
 
-    /// Container header length (offset to entity data).
-    #[allow(dead_code)]
-    header_len: usize,
-
     /// Entity index: maps (type_id, entity_idx) -> EntityLoc
     entities: Vec<EntityLoc>,
 
@@ -352,7 +348,6 @@ impl KfxImporter {
 
         let mut importer = Self {
             source,
-            header_len: header.header_len,
             entities,
             asset_paths,
             font_entities,

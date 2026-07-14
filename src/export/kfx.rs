@@ -30,37 +30,16 @@ use crate::model::{
 };
 use crate::util::detect_media_format;
 
-/// KFX export configuration.
-#[derive(Debug, Clone, Default)]
-pub struct KfxConfig {
-    // Future: compression, DRM settings, etc.
-}
-
 /// KFX format exporter.
 ///
 /// Converts books to Amazon's KFX format for Kindle devices.
-pub struct KfxExporter {
-    #[allow(dead_code)]
-    config: KfxConfig,
-}
+#[derive(Default)]
+pub struct KfxExporter;
 
 impl KfxExporter {
-    /// Create a new KfxExporter with default configuration.
+    /// Create a new KfxExporter.
     pub fn new() -> Self {
-        Self {
-            config: KfxConfig::default(),
-        }
-    }
-
-    /// Create a new KfxExporter with custom configuration.
-    pub fn with_config(config: KfxConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl Default for KfxExporter {
-    fn default() -> Self {
-        Self::new()
+        Self
     }
 }
 
@@ -1369,128 +1348,6 @@ fn build_cover_storyline(chapter: &Chapter, ctx: &mut ExportContext) -> IonValue
 
     // Fallback: empty list if no image found
     IonValue::List(vec![])
-}
-
-/// Build the three KFX entities for a chapter: Content, Storyline, Section.
-///
-/// This is the "Assembler" (Macro layer) that:
-/// 1. Sets up naming for this chapter's entity triad
-/// 2. Calls schema-driven token generation (`ir_to_tokens`)
-/// 3. Calls `tokens_to_ion` which SPLITS data:
-///    - Structure → Ion (for Storyline)
-///    - Text → ctx.text_accumulator (for Content)
-/// 4. Packages results into three KFX fragments
-///
-/// The Assembler knows about KFX Entity topology but NOT about element semantics.
-/// Element semantics are handled by the Schema.
-#[allow(dead_code)]
-fn build_chapter_entities(
-    chapter: &Chapter,
-    chapter_id: ChapterId,
-    section_name: &str,
-    ctx: &mut ExportContext,
-) -> Vec<KfxFragment> {
-    use crate::kfx::storyline::{ir_to_tokens, tokens_to_ion};
-
-    let mut fragments = Vec::new();
-
-    // =========================================================================
-    // 1. SETUP: Naming for this chapter's entity triad
-    // =========================================================================
-    let story_name = format!("story_{}", section_name);
-    let content_name = format!("content_{}", section_name);
-
-    let section_name_symbol = ctx.symbols.get_or_intern(section_name);
-    let story_name_symbol = ctx.symbols.get_or_intern(&story_name);
-    let content_name_symbol = ctx.symbols.get_or_intern(&content_name);
-
-    // Tell tokens_to_ion what content name to use for references
-    ctx.begin_chapter(&content_name);
-
-    // Get the section fragment ID assigned during Pass 1
-    let section_id = ctx
-        .get_chapter_fragment(chapter_id)
-        .unwrap_or_else(|| ctx.next_fragment_id());
-
-    // =========================================================================
-    // 2. GENERATE: Schema-driven token generation + text/structure split
-    // =========================================================================
-    // ir_to_tokens uses the Schema to convert IR → Tokens
-    // tokens_to_ion SPLITS: Structure → Ion, Text → ctx.text_accumulator
-    let tokens = ir_to_tokens(chapter, ctx);
-    let storyline_content_list = tokens_to_ion(&tokens, ctx);
-
-    // Drain the accumulated text strings (captured during tokens_to_ion)
-    let content_strings = ctx.drain_text();
-
-    // =========================================================================
-    // 3. ASSEMBLE: Package into three KFX Entities
-    // =========================================================================
-
-    // Entity A: CONTENT ($145) - Holds the raw text strings
-    if !content_strings.is_empty() {
-        let content_ion = IonValue::Struct(vec![
-            (
-                KfxSymbol::Name as u64,
-                IonValue::Symbol(content_name_symbol),
-            ),
-            (
-                KfxSymbol::ContentList as u64,
-                IonValue::List(content_strings.into_iter().map(IonValue::String).collect()),
-            ),
-        ]);
-        fragments.push(KfxFragment::new(
-            KfxSymbol::Content,
-            &content_name,
-            content_ion,
-        ));
-    }
-
-    // Entity B: STORYLINE ($259) - Holds the structure, references Content by name
-    let storyline_ion = IonValue::Struct(vec![
-        (
-            KfxSymbol::StoryName as u64,
-            IonValue::Symbol(story_name_symbol),
-        ),
-        (KfxSymbol::ContentList as u64, storyline_content_list),
-    ]);
-    fragments.push(KfxFragment::new(
-        KfxSymbol::Storyline,
-        &story_name,
-        storyline_ion,
-    ));
-
-    // Entity C: SECTION ($260) - Entry point, references Storyline by story_name
-    let page_template = IonValue::Struct(vec![
-        (KfxSymbol::Id as u64, IonValue::Int(section_id as i64)),
-        (
-            KfxSymbol::StoryName as u64,
-            IonValue::Symbol(story_name_symbol),
-        ),
-        (
-            KfxSymbol::Type as u64,
-            IonValue::Symbol(KfxSymbol::Text as u64),
-        ),
-    ]);
-
-    let section_ion = IonValue::Struct(vec![
-        (
-            KfxSymbol::SectionName as u64,
-            IonValue::Symbol(section_name_symbol),
-        ),
-        (
-            KfxSymbol::PageTemplates as u64,
-            IonValue::List(vec![page_template]),
-        ),
-    ]);
-    fragments.push(KfxFragment::new_with_id(
-        KfxSymbol::Section,
-        section_id,
-        section_name,
-        section_ion,
-    ));
-
-    fragments
 }
 
 /// Build the document symbols section.
