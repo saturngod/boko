@@ -99,12 +99,19 @@ pub(crate) fn parse_font_family(input: &mut Parser<'_, '_>) -> Option<String> {
     let mut families = Vec::new();
 
     loop {
+        // A family name is either a quoted string, or a sequence of one or more
+        // unquoted identifiers joined by spaces (e.g. `Palatino Linotype`).
         if let Ok(token) = input.try_parse(|i| i.expect_string_cloned()) {
             families.push(token.to_string());
-        } else if let Ok(token) = input.try_parse(|i| i.expect_ident_cloned()) {
-            families.push(token.to_string());
         } else {
-            break;
+            let mut idents = Vec::new();
+            while let Ok(token) = input.try_parse(|i| i.expect_ident_cloned()) {
+                idents.push(token.to_string());
+            }
+            if idents.is_empty() {
+                break;
+            }
+            families.push(idents.join(" "));
         }
 
         if input.try_parse(|i| i.expect_comma()).is_err() {
@@ -140,40 +147,39 @@ pub(crate) fn parse_font_face_block(input: &mut Parser<'_, '_>) -> Option<FontFa
     let mut font_style = FontStyle::Normal;
     let mut src: Option<String> = None;
 
-    // Parse declarations within the @font-face block
+    // Parse declarations within the @font-face block. Each declaration's value
+    // is parsed inside its own `;`-delimited scope so that tokens a specific
+    // parser leaves behind (e.g. the `format("woff")` after a `src` url) can't
+    // leak into and derail the next declaration.
     while let Ok(name) = input.expect_ident_cloned() {
-        let name_str = name.as_ref();
-        if input.expect_colon().is_ok() {
-            match name_str {
-                "font-family" => {
-                    font_family = parse_font_face_family(input);
-                }
-                "font-weight" => {
-                    if let Some(w) = parse_font_weight(input) {
-                        font_weight = w;
-                    }
-                }
-                "font-style" => {
-                    if let Some(s) = parse_font_style(input) {
-                        font_style = s;
-                    }
-                }
-                "src" => {
-                    src = parse_font_face_src(input);
-                }
-                _ => {
-                    // Skip unknown properties
-                    while input.next().is_ok() {
-                        // Consume until we hit a semicolon or end of block
-                        if matches!(input.current_source_location().line, _) {
-                            break;
+        let name_str = name.as_ref().to_string();
+        if input.expect_colon().is_err() {
+            continue;
+        }
+        let _ = input.parse_until_after(
+            cssparser::Delimiter::Semicolon,
+            |value_input| -> Result<(), ParseError<'_, ()>> {
+                match name_str.as_str() {
+                    "font-family" => font_family = parse_font_face_family(value_input),
+                    "font-weight" => {
+                        if let Some(w) = parse_font_weight(value_input) {
+                            font_weight = w;
                         }
                     }
+                    "font-style" => {
+                        if let Some(s) = parse_font_style(value_input) {
+                            font_style = s;
+                        }
+                    }
+                    "src" => src = parse_font_face_src(value_input),
+                    _ => {}
                 }
-            }
-            // Consume semicolon if present
-            let _ = input.try_parse(|i| i.expect_semicolon());
-        }
+                // Drain anything the value parser didn't consume so the scope
+                // advances cleanly to (and past) the delimiter.
+                while value_input.next().is_ok() {}
+                Ok(())
+            },
+        );
     }
 
     // Require both font-family and src
@@ -218,4 +224,32 @@ fn parse_font_face_src(input: &mut Parser<'_, '_>) -> Option<String> {
         return Some(url);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cssparser::{Parser, ParserInput};
+
+    fn family(css: &str) -> Option<String> {
+        let mut input = ParserInput::new(css);
+        parse_font_family(&mut Parser::new(&mut input))
+    }
+
+    #[test]
+    fn multi_word_unquoted_family_is_not_truncated() {
+        // "Palatino Linotype" is one family; the fallback must survive too.
+        assert_eq!(
+            family("Palatino Linotype, serif").as_deref(),
+            Some("Palatino Linotype, serif")
+        );
+    }
+
+    #[test]
+    fn quoted_and_unquoted_families_mix() {
+        assert_eq!(
+            family("\"Times New Roman\", Georgia, serif").as_deref(),
+            Some("Times New Roman, Georgia, serif")
+        );
+    }
 }
