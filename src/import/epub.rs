@@ -1,7 +1,7 @@
 //! EPUB format importer - handles all IO.
 
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -111,7 +111,7 @@ impl Importer for EpubImporter {
             .ok_or_else(|| crate::Error::NotFound {
                 what: format!("chapter {}", id.0),
             })?;
-        Ok(self.read_entry(path)?)
+        self.read_entry(path)
     }
 
     fn list_assets(&self) -> &[PathBuf] {
@@ -120,7 +120,7 @@ impl Importer for EpubImporter {
 
     fn load_asset(&mut self, path: &Path) -> crate::Result<Vec<u8>> {
         let key = path.to_string_lossy().replace('\\', "/");
-        Ok(self.read_entry(&key)?)
+        self.read_entry(&key)
     }
 
     fn load_stylesheet(&mut self, path: &Path) -> Option<Arc<Stylesheet>> {
@@ -306,7 +306,7 @@ impl EpubImporter {
     }
 
     /// Read and decompress a ZIP entry by path.
-    fn read_entry(&self, path: &str) -> io::Result<Vec<u8>> {
+    fn read_entry(&self, path: &str) -> crate::Result<Vec<u8>> {
         read_entry(&self.source, &self.zip_index, path)
     }
 }
@@ -319,12 +319,9 @@ fn read_entry(
     source: &Arc<dyn ByteSource>,
     index: &HashMap<String, ZipEntryLoc>,
     path: &str,
-) -> io::Result<Vec<u8>> {
-    let loc = index.get(path).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("File not found in ZIP: {}", path),
-        )
+) -> crate::Result<Vec<u8>> {
+    let loc = index.get(path).ok_or_else(|| crate::Error::NotFound {
+        what: format!("{} (in EPUB archive)", path),
     })?;
 
     // Read compressed data via random access
@@ -341,10 +338,10 @@ fn read_entry(
             decoder.read_to_end(&mut out)?;
             Ok(out)
         }
-        method => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("Unsupported compression method: {}", method),
-        )),
+        method => Err(crate::Error::Malformed {
+            format: crate::Format::Epub,
+            context: format!("unsupported compression method: {}", method),
+        }),
     }
 }
 

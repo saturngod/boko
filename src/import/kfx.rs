@@ -6,7 +6,6 @@
 //! Pure parsing functions are in `crate::kfx::container`.
 
 use std::collections::HashMap;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -93,12 +92,6 @@ pub struct KfxImporter {
 
     /// Maps element string ID -> GlobalNodeId (built during index_anchors)
     element_id_map: HashMap<String, GlobalNodeId>,
-}
-
-impl From<ContainerError> for io::Error {
-    fn from(e: ContainerError) -> Self {
-        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-    }
 }
 
 impl From<ContainerError> for crate::Error {
@@ -191,7 +184,7 @@ impl Importer for KfxImporter {
 
         // Find section entity and resolve to storyline
         let storyline_loc = self.resolve_section_to_storyline(&section_name)?;
-        Ok(self.read_entity(storyline_loc)?)
+        self.read_entity(storyline_loc)
     }
 
     fn list_assets(&self) -> &[PathBuf] {
@@ -203,7 +196,7 @@ impl Importer for KfxImporter {
 
         // Handle font path lookup (e.g., "fonts/font_0000.otf")
         if let Some(loc) = self.font_entities.get(&*name) {
-            return Ok(self.read_entity(*loc)?);
+            return self.read_entity(*loc);
         }
 
         // Handle direct entity ID lookup (e.g., "#1102" from list_assets)
@@ -211,7 +204,7 @@ impl Importer for KfxImporter {
             if let Ok(id) = id_str.parse::<u32>() {
                 // Find entity by ID
                 if let Some(loc) = self.entities.iter().find(|e| e.id == id) {
-                    return Ok(self.read_entity(*loc)?);
+                    return self.read_entity(*loc);
                 }
             }
             return Err(crate::Error::NotFound {
@@ -231,7 +224,7 @@ impl Importer for KfxImporter {
                 what: format!("asset {}", name),
             })?;
 
-        Ok(self.read_entity(*loc)?)
+        self.read_entity(*loc)
     }
 
     fn requires_normalized_export(&self) -> bool {
@@ -323,10 +316,10 @@ impl KfxImporter {
 
         // Get index table location (required)
         let (index_offset, index_length) = container_info.index.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Missing index table in container",
-            )
+            crate::Error::Malformed {
+                format: crate::Format::Kfx,
+                context: "missing index table in container".into(),
+            }
         })?;
 
         // Read and parse document symbols (optional)
@@ -403,7 +396,7 @@ impl KfxImporter {
     }
 
     /// Read an entity's raw data (after ENTY header).
-    fn read_entity(&self, loc: EntityLoc) -> io::Result<Vec<u8>> {
+    fn read_entity(&self, loc: EntityLoc) -> crate::Result<Vec<u8>> {
         let entity_data = self.source.read_at(loc.offset as u64, loc.length)?;
 
         // Use pure function to skip ENTY header
@@ -424,10 +417,14 @@ impl KfxImporter {
     /// annotation indicating their schema type; without this strip, those
     /// entities silently fall through `get_field()` lookups because the
     /// outer value is an `Annotated`, not a `Struct`.
-    fn parse_entity_ion(&self, loc: EntityLoc) -> io::Result<IonValue> {
+    fn parse_entity_ion(&self, loc: EntityLoc) -> crate::Result<IonValue> {
         let ion_data = self.read_entity(loc)?;
         let mut parser = IonParser::new(&ion_data);
-        Ok(match parser.parse()? {
+        let parsed = parser.parse().map_err(|e| crate::Error::Malformed {
+            format: crate::Format::Kfx,
+            context: e.to_string(),
+        })?;
+        Ok(match parsed {
             IonValue::Annotated(_, inner) => *inner,
             other => other,
         })
@@ -439,7 +436,7 @@ impl KfxImporter {
     }
 
     /// Parse book metadata.
-    fn parse_metadata(&mut self) -> io::Result<()> {
+    fn parse_metadata(&mut self) -> crate::Result<()> {
         // Find book_metadata entity
         let loc = self
             .entities
@@ -544,7 +541,7 @@ impl KfxImporter {
     }
 
     /// Parse book navigation (TOC and landmarks).
-    fn parse_navigation(&mut self) -> io::Result<()> {
+    fn parse_navigation(&mut self) -> crate::Result<()> {
         // Find book_navigation entity
         let loc = self
             .entities
@@ -707,7 +704,7 @@ impl KfxImporter {
     /// Parse spine from reading_orders.
     ///
     /// Uses the section→storyline cache to get size estimates.
-    fn parse_spine(&mut self) -> io::Result<()> {
+    fn parse_spine(&mut self) -> crate::Result<()> {
         let section_names = self.get_reading_order_sections()?;
 
         for (idx, name) in section_names.into_iter().enumerate() {
@@ -729,20 +726,17 @@ impl KfxImporter {
     }
 
     /// Resolve a section name to its storyline entity location.
-    fn resolve_section_to_storyline(&self, section_name: &str) -> io::Result<EntityLoc> {
+    fn resolve_section_to_storyline(&self, section_name: &str) -> crate::Result<EntityLoc> {
         self.section_storylines
             .get(section_name)
             .copied()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("Could not resolve section: {}", section_name),
-                )
+            .ok_or_else(|| crate::Error::NotFound {
+                what: format!("section {}", section_name),
             })
     }
 
     /// Build the section name → storyline location cache.
-    fn index_section_storylines(&mut self) -> io::Result<()> {
+    fn index_section_storylines(&mut self) -> crate::Result<()> {
         if self.section_storylines_indexed {
             return Ok(());
         }
@@ -792,7 +786,7 @@ impl KfxImporter {
     /// Extract section names from reading_orders in document_data or metadata.
     ///
     /// Prefers the "default" reading order if multiple are present.
-    fn get_reading_order_sections(&self) -> io::Result<Vec<String>> {
+    fn get_reading_order_sections(&self) -> crate::Result<Vec<String>> {
         // Try document_data ($538) first, then metadata ($258)
         let doc_data_loc = self
             .entities
@@ -923,7 +917,7 @@ impl KfxImporter {
     }
 
     /// Index external resources.
-    fn index_resources(&mut self) -> io::Result<()> {
+    fn index_resources(&mut self) -> crate::Result<()> {
         if self.resources_indexed {
             return Ok(());
         }
@@ -1001,7 +995,7 @@ impl KfxImporter {
     ///
     /// This enables resolution of both external and internal links where
     /// `link_to` contains an anchor name.
-    fn index_anchor_entities(&mut self) -> io::Result<()> {
+    fn index_anchor_entities(&mut self) -> crate::Result<()> {
         if self.anchors_indexed {
             return Ok(());
         }
@@ -1075,7 +1069,7 @@ impl KfxImporter {
     ///
     /// This enables resolution of style references in storyline elements.
     /// Style entities ($157) contain properties like font_weight, text_alignment, margins, etc.
-    fn index_styles(&mut self) -> io::Result<()> {
+    fn index_styles(&mut self) -> crate::Result<()> {
         if self.styles_indexed {
             return Ok(());
         }
