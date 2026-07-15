@@ -55,6 +55,10 @@ encoding_rs = "0.8"
 # Base64 encoding for KFX raw media
 base64 = "0.22"
 
+# Normalize KFX covers to RGB JPEG/JFIF for Kindle library and lock-screen use.
+# Keep the decoder set limited to raster formats commonly found in EPUB files.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+
 # Ion binary format parsing for KFX dump tool (CLI only; the library uses
 # its own hand-rolled reader/writer in src/kfx/ion.rs)
 ion-rs = { version = "1.0.0-rc.11", features = ["experimental-reader-writer"], optional = true }

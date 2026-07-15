@@ -32,6 +32,7 @@ use crate::kfx::fragment::KfxFragment;
 use crate::kfx::ion::IonValue;
 use crate::kfx::metadata::{
     MetadataCategory, MetadataContext, build_category_entries, generate_book_id,
+    generate_content_id,
 };
 use crate::kfx::serialization::{
     SerializedEntity, create_entity_data, generate_container_id, serialize_annotated_ion,
@@ -85,23 +86,26 @@ fn build_kfx_container(book: &mut Book) -> crate::Result<Vec<u8>> {
     // This happens when the EPUB cover image differs from the first spine chapter's image
     let asset_paths: Vec<_> = book.list_assets().to_vec();
     let cover_image = book.metadata().cover_image.clone();
+    let normalized_cover_path = cover_image
+        .as_ref()
+        .map(|path| normalize_cover_path(path, &asset_paths));
     let first_chapter_id = book.spine().first().map(|e| e.id);
 
-    let standalone_cover_path: Option<String> = match (cover_image, first_chapter_id) {
-        (Some(cover_img), Some(first_id)) => {
-            let normalized = normalize_cover_path(&cover_img, &asset_paths);
-            book.load_chapter_cached(first_id)
-                .ok()
-                .and_then(|first_chapter| {
-                    if needs_standalone_cover(&normalized, &first_chapter) {
-                        Some(normalized)
-                    } else {
-                        None
-                    }
-                })
-        }
-        _ => None,
-    };
+    let standalone_cover_path: Option<String> =
+        match (normalized_cover_path.as_ref(), first_chapter_id) {
+            (Some(normalized), Some(first_id)) => {
+                book.load_chapter_cached(first_id)
+                    .ok()
+                    .and_then(|first_chapter| {
+                        if needs_standalone_cover(normalized, &first_chapter) {
+                            Some(normalized.clone())
+                        } else {
+                            None
+                        }
+                    })
+            }
+            _ => None,
+        };
 
     // If standalone cover needed, section offset starts at 1 (c0 reserved for cover)
     let section_offset = if standalone_cover_path.is_some() {
@@ -370,7 +374,14 @@ fn build_kfx_container(book: &mut Book) -> crate::Result<Vec<u8>> {
             && let Ok(data) = book.load_asset(asset_path)
         {
             // external_resource ($164) - metadata about the resource
-            fragments.push(build_external_resource_fragment(asset_path, &data, &mut ctx));
+            let data = if normalized_cover_path.as_deref() == Some(asset_path.as_str()) {
+                normalize_kfx_cover(data)
+            } else {
+                data
+            };
+            fragments.push(build_external_resource_fragment(
+                asset_path, &data, &mut ctx,
+            ));
             // bcRawMedia ($417) - the actual bytes (moved, not copied)
             fragments.push(build_resource_fragment(asset_path, data, &mut ctx));
         }

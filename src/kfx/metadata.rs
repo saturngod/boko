@@ -63,6 +63,8 @@ pub enum MetadataField {
     AssetId,
     /// Book ID - from context (derived from identifier), not Metadata.
     BookId,
+    /// Sideload content ID/ASIN - from context, not Metadata.
+    ContentId,
     /// dcterms:modified timestamp
     ModifiedDate,
     /// First contributor with role="trl" (translator)
@@ -120,7 +122,10 @@ impl MetadataField {
             MetadataField::AuthorSort => meta.author_sort.as_deref(),
             MetadataField::SeriesName => meta.collection.as_ref().map(|c| c.name.as_str()),
             // These are context-driven or need special handling
-            MetadataField::AssetId | MetadataField::BookId | MetadataField::SeriesPosition => None,
+            MetadataField::AssetId
+            | MetadataField::BookId
+            | MetadataField::ContentId
+            | MetadataField::SeriesPosition => None,
         }
     }
 }
@@ -177,18 +182,22 @@ pub fn metadata_schema() -> Vec<MetadataRule> {
             category: MetadataCategory::KindleTitle,
             source: MetadataSource::Dynamic(MetadataField::BookId),
         },
-        // Kindle's USB library thumbnail uses content_id (falling back to ASIN)
-        // together with cde_content_type. Keep it identical to the stable book_id
-        // so a companion thumbnail can be associated with this publication.
+        // Personal-document identifiers used by Kindle's USB library thumbnail
+        // association. KFX Output uses the same value for ASIN and content_id.
+        MetadataRule {
+            key: "ASIN",
+            category: MetadataCategory::KindleTitle,
+            source: MetadataSource::Dynamic(MetadataField::ContentId),
+        },
         MetadataRule {
             key: "content_id",
             category: MetadataCategory::KindleTitle,
-            source: MetadataSource::Dynamic(MetadataField::BookId),
+            source: MetadataSource::Dynamic(MetadataField::ContentId),
         },
         MetadataRule {
             key: "cde_content_type",
             category: MetadataCategory::KindleTitle,
-            source: MetadataSource::Static("EBOK"),
+            source: MetadataSource::Static("PDOC"),
         },
         // Extended metadata for better round-trip fidelity
         MetadataRule {
@@ -259,6 +268,9 @@ pub struct MetadataContext<'a> {
     /// Book ID (stable per publication, derived from identifier).
     /// Format: 23-character URL-safe Base64.
     pub book_id: Option<String>,
+    /// Stable personal-document ID used for both ASIN and content_id.
+    /// Format: 32 uppercase hexadecimal characters.
+    pub content_id: Option<String>,
 }
 
 /// Generate a book ID from a publication identifier.
@@ -278,11 +290,25 @@ pub fn generate_book_id(identifier: &str) -> String {
     // (Previously `DefaultHasher`, whose output is explicitly not guaranteed
     // stable across Rust releases — a toolchain bump would silently change
     // every "stable" book ID.)
-    let digest = sha1_smol::Sha1::from(identifier.as_bytes()).digest().bytes();
+    let digest = sha1_smol::Sha1::from(identifier.as_bytes())
+        .digest()
+        .bytes();
     bytes.extend_from_slice(&digest[..16]);
 
     // URL-safe Base64 encode (no padding), 17 bytes → 23 chars
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes)
+}
+
+/// Generate the stable 32-character identifier Kindle uses to associate a
+/// sideloaded personal document with its library thumbnail.
+pub fn generate_content_id(identifier: &str) -> String {
+    let digest = sha1_smol::Sha1::from(identifier.as_bytes())
+        .digest()
+        .bytes();
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect()
 }
 
 /// Build metadata entries for a category from the schema.
@@ -329,6 +355,7 @@ pub fn build_category_entries(
                         // Book ID from context (derived from identifier)
                         ctx.book_id.clone()
                     }
+                    MetadataField::ContentId => ctx.content_id.clone(),
                     MetadataField::SeriesPosition => {
                         // Series position from collection
                         meta.collection.as_ref().and_then(|c| c.position).map(|p| {
@@ -548,21 +575,45 @@ mod tests {
     }
 
     #[test]
-    fn test_cde_content_type_is_ebok() {
+    fn test_sideload_metadata_is_pdoc_with_matching_asin_and_content_id() {
         let meta = Metadata {
             title: "Test".to_string(),
             language: "en".to_string(),
             ..Default::default()
         };
 
-        let ctx = MetadataContext::default();
+        let ctx = MetadataContext {
+            content_id: Some("0123456789ABCDEF0123456789ABCDEF".to_string()),
+            ..Default::default()
+        };
         let entries = build_category_entries(MetadataCategory::KindleTitle, &meta, &ctx);
 
         assert!(
             entries
                 .iter()
-                .any(|(k, v)| *k == "cde_content_type" && v == "EBOK")
+                .any(|(k, v)| *k == "cde_content_type" && v == "PDOC")
         );
+        assert!(
+            entries
+                .iter()
+                .any(|(k, v)| *k == "ASIN" && v == "0123456789ABCDEF0123456789ABCDEF")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(k, v)| *k == "content_id" && v == "0123456789ABCDEF0123456789ABCDEF")
+        );
+    }
+
+    #[test]
+    fn test_generate_content_id_is_stable_uppercase_hex() {
+        let id = super::generate_content_id("urn:uuid:test-id");
+        assert_eq!(id.len(), 32);
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_digit() || ('A'..='F').contains(&c))
+        );
+        assert_eq!(id, super::generate_content_id("urn:uuid:test-id"));
     }
 
     #[test]
@@ -577,6 +628,7 @@ mod tests {
         let ctx = MetadataContext {
             asset_id: Some("CR!ABCDEFGHIJKLMNOPQRSTUVWXYZ12"),
             book_id: Some("BtestBookId12345678901".to_string()),
+            content_id: Some("0123456789ABCDEF0123456789ABCDEF".to_string()),
             ..Default::default()
         };
         let entries = build_category_entries(MetadataCategory::KindleTitle, &meta, &ctx);
@@ -594,7 +646,7 @@ mod tests {
         assert!(
             entries
                 .iter()
-                .any(|(k, v)| *k == "content_id" && v == "BtestBookId12345678901")
+                .any(|(k, v)| *k == "content_id" && v == "0123456789ABCDEF0123456789ABCDEF")
         );
     }
 }

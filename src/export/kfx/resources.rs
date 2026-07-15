@@ -1,5 +1,48 @@
 use super::*;
 
+/// Normalize a KFX cover to an RGB JPEG containing a JFIF header.
+///
+/// Kindle can render several image formats in book content, but its library and
+/// lock-screen cover handling is more restrictive. Keep an already-compatible
+/// JFIF image byte-for-byte; otherwise transcode supported raster images. If an
+/// unusual or corrupt image cannot be decoded, retain the source bytes so cover
+/// normalization never makes an otherwise-convertible book fail.
+pub(super) fn normalize_kfx_cover(data: Vec<u8>) -> Vec<u8> {
+    if is_jfif_jpeg(&data) {
+        return data;
+    }
+
+    let Ok(image) = image::load_from_memory(&data) else {
+        return data;
+    };
+    let rgba = image.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    // JPEG has no alpha channel. Composite transparent cover pixels over white
+    // instead of exposing their usually-black hidden RGB values.
+    let mut rgb = Vec::with_capacity((width as usize).saturating_mul(height as usize) * 3);
+    for pixel in rgba.pixels() {
+        let alpha = pixel[3] as u32;
+        for channel in &pixel.0[..3] {
+            let blended = (*channel as u32 * alpha + 255 * (255 - alpha) + 127) / 255;
+            rgb.push(blended as u8);
+        }
+    }
+    let mut jpeg = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90);
+    if encoder
+        .encode(&rgb, width, height, image::ExtendedColorType::Rgb8)
+        .is_err()
+    {
+        return data;
+    }
+
+    jpeg
+}
+
+fn is_jfif_jpeg(data: &[u8]) -> bool {
+    data.starts_with(&[0xff, 0xd8]) && data.windows(5).any(|window| window == b"JFIF\0")
+}
+
 /// Build an external_resource fragment ($164) - metadata about a resource.
 pub(super) fn build_external_resource_fragment(
     href: &str,
@@ -36,7 +79,9 @@ pub(super) fn build_external_resource_fragment(
     }
 
     // mime type for images
-    if let Some(mime) = crate::util::detect_mime_type(href, data) {
+    let mime = crate::util::detect_mime_type("", data)
+        .or_else(|| crate::util::detect_mime_type(href, data));
+    if let Some(mime) = mime {
         fields.push((KfxSymbol::Mime as u64, IonValue::String(mime.to_string())));
     }
 
@@ -255,8 +300,18 @@ pub(super) fn build_resource_path_fragment() -> KfxFragment {
 ///
 /// Delegates to the pure `detect_media_format()` utility and maps to KFX symbol.
 pub(super) fn detect_format_symbol(href: &str, data: &[u8]) -> u64 {
-    let format = detect_media_format(href, data);
-    format_to_kfx_symbol(format)
+    format_to_kfx_symbol(detect_resource_media_format(href, data))
+}
+
+fn detect_resource_media_format(href: &str, data: &[u8]) -> crate::util::MediaFormat {
+    // Prefer magic bytes. This matters when a cover originally named `.png`
+    // has been normalized to JPEG while retaining its stable resource name.
+    let detected = detect_media_format("", data);
+    if detected == crate::util::MediaFormat::Binary {
+        detect_media_format(href, data)
+    } else {
+        detected
+    }
 }
 
 /// Check if a path is a media asset (image, font, etc.)
@@ -275,6 +330,41 @@ pub(super) fn is_media_asset(path: &str) -> bool {
 mod resource_export_tests {
     use super::*;
     use crate::model::Book;
+
+    fn tiny_png() -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn test_kfx_cover_is_normalized_to_jfif() {
+        let jpeg = normalize_kfx_cover(tiny_png());
+
+        assert!(jpeg.starts_with(&[0xff, 0xd8]));
+        assert!(jpeg.windows(5).any(|window| window == b"JFIF\0"));
+        assert_eq!(crate::util::extract_image_dimensions(&jpeg), Some((1, 1)));
+        let decoded = image::load_from_memory(&jpeg).unwrap().to_rgb8();
+        assert!(
+            decoded
+                .get_pixel(0, 0)
+                .0
+                .iter()
+                .all(|channel| *channel > 250)
+        );
+    }
+
+    #[test]
+    fn test_resource_format_prefers_normalized_cover_magic() {
+        let jpeg = normalize_kfx_cover(tiny_png());
+        assert_eq!(
+            detect_format_symbol("images/cover.png", &jpeg),
+            KfxSymbol::Jpg as u64
+        );
+    }
 
     #[test]
     fn test_kfx_export_includes_images() {
