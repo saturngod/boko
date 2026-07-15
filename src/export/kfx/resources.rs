@@ -163,14 +163,8 @@ pub(super) fn build_font_fragments(book: &Book, ctx: &mut ExportContext) -> Vec<
 }
 
 /// Build anchor fragments ($266) for all recorded anchors.
-///
-/// Returns (fragments, anchor_ids_by_fragment) where anchor_ids_by_fragment
-/// maps fragment_id → list of anchor symbol IDs for use in position_map.
-pub(super) fn build_anchor_fragments(
-    ctx: &mut ExportContext,
-) -> (Vec<KfxFragment>, HashMap<u64, Vec<u64>>) {
+pub(super) fn build_anchor_fragments(ctx: &mut ExportContext) -> Vec<KfxFragment> {
     let mut fragments = Vec::new();
-    let mut anchor_ids_by_fragment: HashMap<u64, Vec<u64>> = HashMap::new();
 
     // Get resolved internal anchors from the AnchorRegistry
     let resolved_anchors = ctx.anchor_registry.drain_anchors();
@@ -178,13 +172,6 @@ pub(super) fn build_anchor_fragments(
     for anchor in resolved_anchors {
         // Intern the anchor symbol to get its ID
         let anchor_symbol_id = ctx.symbols.get_or_intern(&anchor.symbol);
-
-        // Track which anchors belong to which SECTION for position_map
-        // Key by section_id (page_template ID), not fragment_id (content ID)
-        anchor_ids_by_fragment
-            .entry(anchor.section_id)
-            .or_default()
-            .push(anchor_symbol_id);
 
         // Build position struct - uses content fragment_id for navigation target
         let mut pos_fields = Vec::new();
@@ -230,7 +217,7 @@ pub(super) fn build_anchor_fragments(
         fragments.push(KfxFragment::new(KfxSymbol::Anchor, &anchor.symbol, ion));
     }
 
-    (fragments, anchor_ids_by_fragment)
+    fragments
 }
 
 /// Generate a short resource name for a given href.

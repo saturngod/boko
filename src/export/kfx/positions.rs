@@ -4,10 +4,7 @@ use super::*;
 ///
 /// Maps each section to the list of EIDs it contains. This enables
 /// the Kindle reader to track which section contains a given position.
-pub(super) fn build_position_map_fragment(
-    ctx: &ExportContext,
-    _anchor_ids_by_fragment: &HashMap<u64, Vec<u64>>,
-) -> KfxFragment {
+pub(super) fn build_position_map_fragment(ctx: &ExportContext) -> KfxFragment {
     let mut entries = Vec::new();
 
     // Handle standalone cover section (c0) if present
@@ -325,7 +322,7 @@ mod tests {
         ctx.content_ids_by_chapter.insert(ch2, vec![96, 97]);
         ctx.content_ids_by_chapter.insert(ch3, vec![101]);
 
-        let frag = build_position_map_fragment(&ctx, &HashMap::new());
+        let frag = build_position_map_fragment(&ctx);
         let entries = extract_entries(&frag);
         assert_eq!(
             entries,
@@ -354,7 +351,7 @@ mod tests {
         ctx.content_ids_by_chapter.insert(ch1, vec![91]);
         ctx.content_ids_by_chapter.insert(ch3, vec![101]);
 
-        let frag = build_position_map_fragment(&ctx, &HashMap::new());
+        let frag = build_position_map_fragment(&ctx);
         let entries = extract_entries(&frag);
 
         // The failed chapter's section produces no entry, and — critically —

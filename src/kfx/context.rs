@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use rustc_hash::FxHashMap;
 
 use crate::import::ChapterId;
-use crate::model::{GlobalNodeId, LandmarkType, NodeId, TocEntry};
+use crate::model::{GlobalNodeId, LandmarkType, NodeId};
 use crate::style::StyleId;
 
 use super::style_registry::StyleRegistry;
@@ -1053,22 +1053,6 @@ impl ExportContext {
     // =========================================================================
     // TOC Anchor Management
     // =========================================================================
-
-    /// Register TOC entries to mark their targets for anchor creation.
-    ///
-    /// Uses the pre-resolved `target` field from `ResolvedLinks`.
-    pub fn register_toc_targets(&mut self, entries: &[TocEntry]) {
-        for entry in entries {
-            // The target is already resolved by resolve_links()
-            // We just need to ensure it's registered for anchor creation
-            // (which happens when we process internal_targets from ResolvedLinks)
-
-            // Recurse into children
-            if !entry.children.is_empty() {
-                self.register_toc_targets(&entry.children);
-            }
-        }
-    }
 
     /// Update landmark fragment IDs to use storyline content IDs.
     pub fn fix_landmark_content_ids(&mut self) {
