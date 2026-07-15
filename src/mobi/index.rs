@@ -649,59 +649,80 @@ impl IndxBuilder {
     /// data record (last entry name + count) + a trailing IDXT, and data
     /// records use a completely different INDX header layout (8 bytes of
     /// 0xFF at offset 28).
+    ///
+    /// Data records are capped at 64 KB (the PDB record limit, which also
+    /// keeps the u16 IDXT offsets from overflowing), so larger indexes
+    /// (~2800+ chunks) are split greedily across multiple data records;
+    /// `read_index` above walks `num_of_records` data records to reassemble
+    /// them.
     pub fn build(&self) -> io::Result<Vec<Vec<u8>>> {
         if self.entries.is_empty() {
-            return Ok(vec![self.build_header_record(0, &[], &[])]);
+            return Ok(vec![self.build_header_record(0, &[])?]);
         }
 
-        // IDXT offsets are u16s pointing past the 192-byte data-record header.
-        // A very large index (~2800+ chunks) can push entry data past
-        // 64 KB, and the `as u16` casts below would silently truncate the
-        // offsets — writing a corrupt AZW3. Boko emits a single data record
-        // (no multi-record split), so refuse to build past the limit. This
-        // also bounds the entry count, so `entries.len() as u16` in the
-        // header geometry cannot truncate either (every entry occupies at
-        // least one byte of entry data).
-        let entry_data_len: usize = self
-            .entries
-            .iter()
-            .map(|(name, tag_data)| 1 + name.len() + tag_data.len())
-            .sum();
-        if 192 + entry_data_len > usize::from(u16::MAX) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "INDX entry data exceeds the 64 KB single-record limit (book has too many index entries)",
-            ));
+        // PDB records are capped at 64 KB, and a data record is
+        // `192-byte header + entry data + IDXT` where the IDXT holds one u16
+        // per entry plus an end-of-data u16, 4-byte aligned. Staying under
+        // the record cap also keeps every IDXT offset (`192 + data position`)
+        // within u16 range.
+        const MAX_RECORD: usize = 0x10000;
+        let idxt_size = |entry_count: usize| -> usize {
+            // 'IDXT' + one offset per entry + end-of-data offset, padded.
+            (4 + 2 * (entry_count + 1)).next_multiple_of(4)
+        };
+
+        // Partition entries into per-record ranges.
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut range_start = 0usize;
+        let mut range_len = 0usize;
+        let mut range_count = 0usize;
+        for (i, (name, tag_data)) in self.entries.iter().enumerate() {
+            let size = 1 + name.len() + tag_data.len();
+            if 192 + size + idxt_size(1) > MAX_RECORD {
+                // One entry that cannot fit in any record on its own; nothing
+                // to split. Refuse rather than truncate offsets.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "single INDX entry exceeds the 64 KB record limit",
+                ));
+            }
+            if 192 + range_len + size + idxt_size(range_count + 1) > MAX_RECORD {
+                ranges.push((range_start, i));
+                range_start = i;
+                range_len = 0;
+                range_count = 0;
+            }
+            range_len += size;
+            range_count += 1;
         }
+        ranges.push((range_start, self.entries.len()));
 
-        let (entry_data, idxt_offsets) = self.build_entries();
-        let idxt = self.build_idxt(&idxt_offsets, entry_data.len());
-
-        let data_record = self.build_data_record(&entry_data, &idxt);
-
+        let mut data_records: Vec<Vec<u8>> = Vec::with_capacity(ranges.len());
         // Geometry summary for the header record: one entry per data record
-        // giving the last entry's name and its count. Boko emits a single
-        // data record, so a single summary entry.
-        let last_name = self
-            .entries
-            .last()
-            .map(|(n, _)| n.clone())
-            .unwrap_or_default();
-        let header_record = self.build_header_record(
-            self.entries.len() as u32,
-            &[(last_name, self.entries.len() as u16)],
-            &[1],
-        );
+        // giving the last entry's name and the record's entry count.
+        let mut last_indices: Vec<(String, u16)> = Vec::with_capacity(ranges.len());
+        for &(start, end) in &ranges {
+            let slice = &self.entries[start..end];
+            let (entry_data, idxt_offsets) = build_entries(slice)?;
+            let idxt = build_idxt(&idxt_offsets, entry_data.len());
+            data_records.push(build_data_record(slice.len(), &entry_data, &idxt));
+            // Cannot truncate: every entry occupies at least one byte of
+            // entry data plus two IDXT bytes within the 64 KB record, which
+            // bounds the per-record count well below u16::MAX.
+            last_indices.push((slice[slice.len() - 1].0.clone(), (end - start) as u16));
+        }
 
-        Ok(vec![header_record, data_record])
+        let mut records = Vec::with_capacity(1 + data_records.len());
+        records.push(self.build_header_record(self.entries.len() as u32, &last_indices)?);
+        records.extend(data_records);
+        Ok(records)
     }
 
     fn build_header_record(
         &self,
         total_entries: u32,
         last_indices: &[(String, u16)],
-        _record_counts: &[u32],
-    ) -> Vec<u8> {
+    ) -> io::Result<Vec<u8>> {
         let tagx = self.build_tagx();
         let tagx_aligned = align_to_4(tagx);
 
@@ -713,9 +734,18 @@ impl IndxBuilder {
         let geom_start = 192 + tagx_aligned.len();
         let mut idxt_entries: Vec<u16> = Vec::with_capacity(last_indices.len());
         for (name, count) in last_indices {
-            idxt_entries.push((geom_start + geometry.len()) as u16);
+            let offset = u16::try_from(geom_start + geometry.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "INDX geometry block exceeds the header record's offset space",
+                )
+            })?;
+            idxt_entries.push(offset);
             let name_bytes = name.as_bytes();
-            geometry.push(name_bytes.len() as u8);
+            let name_len = u8::try_from(name_bytes.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "INDX entry name exceeds 255 bytes")
+            })?;
+            geometry.push(name_len);
             geometry.extend_from_slice(name_bytes);
             geometry.extend_from_slice(&count.to_be_bytes());
         }
@@ -759,35 +789,7 @@ impl IndxBuilder {
         record.extend_from_slice(&geometry_aligned);
         record.extend_from_slice(&idxt_inner_aligned);
 
-        record
-    }
-
-    fn build_data_record(&self, entry_data: &[u8], idxt: &[u8]) -> Vec<u8> {
-        // Calibre's data-record INDX layout differs from the header layout:
-        // there are 8 bytes of 0xFF at offset 28 and zeros from 36..192.
-        // See calibre/mobi/writer8/index.py:Index.__call__.
-        let idxt_offset = 192 + entry_data.len();
-        let record_count = self.entries.len() as u32;
-
-        let mut record = Vec::with_capacity(192 + entry_data.len() + idxt.len());
-        record.extend_from_slice(b"INDX"); // 0..4
-        record.extend_from_slice(&192u32.to_be_bytes()); // 4..8 header_length
-        record.extend_from_slice(&0u32.to_be_bytes()); // 8..12 unknown
-        record.extend_from_slice(&1u32.to_be_bytes()); // 12..16 header type = 1 (data record)
-        record.extend_from_slice(&0u32.to_be_bytes()); // 16..20 unknown
-        record.extend_from_slice(&(idxt_offset as u32).to_be_bytes()); // 20..24 idxt_offset
-        record.extend_from_slice(&record_count.to_be_bytes()); // 24..28 entries in this record
-        record.extend_from_slice(&[0xFFu8; 8]); // 28..36 calibre writes 8 bytes of 0xFF
-        record.extend_from_slice(&[0u8; 156]); // 36..192 zeros
-
-        record.extend_from_slice(entry_data);
-        record.extend_from_slice(idxt);
-
-        while !record.len().is_multiple_of(4) {
-            record.push(0);
-        }
-
-        record
+        Ok(record)
     }
 
     fn build_tagx(&self) -> Vec<u8> {
@@ -814,47 +816,80 @@ impl IndxBuilder {
         tagx
     }
 
-    fn build_entries(&self) -> (Vec<u8>, Vec<u16>) {
-        let mut data = Vec::new();
-        let mut offsets = Vec::new();
+}
 
-        for (name, tag_data) in &self.entries {
-            // Cannot truncate: `build()` rejects indexes whose total entry
-            // data would push any offset past u16::MAX.
-            offsets.push((192 + data.len()) as u16);
+/// Serialize a run of entries into one data record's entry-data block plus
+/// its IDXT offsets. `IndxBuilder::build` guarantees the run fits, so the
+/// `as u16` casts cannot truncate.
+fn build_entries(entries: &[(String, Vec<u8>)]) -> io::Result<(Vec<u8>, Vec<u16>)> {
+    let mut data = Vec::new();
+    let mut offsets = Vec::new();
 
-            let name_bytes = name.as_bytes();
-            data.push(name_bytes.len() as u8);
-            data.extend_from_slice(name_bytes);
-            data.extend_from_slice(tag_data);
-        }
+    for (name, tag_data) in entries {
+        offsets.push((192 + data.len()) as u16);
 
-        (data, offsets)
+        let name_bytes = name.as_bytes();
+        // The entry name is length-prefixed with a single byte on disk.
+        let name_len = u8::try_from(name_bytes.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "INDX entry name exceeds 255 bytes")
+        })?;
+        data.push(name_len);
+        data.extend_from_slice(name_bytes);
+        data.extend_from_slice(tag_data);
     }
 
-    fn build_idxt(&self, offsets: &[u16], entry_data_len: usize) -> Vec<u8> {
-        let mut idxt = Vec::new();
+    Ok((data, offsets))
+}
 
-        // IDXT signature
-        idxt.extend_from_slice(b"IDXT");
+fn build_idxt(offsets: &[u16], entry_data_len: usize) -> Vec<u8> {
+    let mut idxt = Vec::new();
 
-        // Entry offsets (2 bytes each, big-endian)
-        for &offset in offsets {
-            idxt.extend_from_slice(&offset.to_be_bytes());
-        }
+    // IDXT signature
+    idxt.extend_from_slice(b"IDXT");
 
-        // Add end-of-data offset. Cannot truncate: `build()` rejects indexes
-        // where 192 + entry_data_len exceeds u16::MAX.
-        let end_offset = (192 + entry_data_len) as u16;
-        idxt.extend_from_slice(&end_offset.to_be_bytes());
-
-        // Pad to 4-byte boundary
-        while !idxt.len().is_multiple_of(4) {
-            idxt.push(0);
-        }
-
-        idxt
+    // Entry offsets (2 bytes each, big-endian)
+    for &offset in offsets {
+        idxt.extend_from_slice(&offset.to_be_bytes());
     }
+
+    // Add end-of-data offset. Cannot truncate: `IndxBuilder::build` splits
+    // records so 192 + entry_data_len never exceeds u16::MAX.
+    let end_offset = (192 + entry_data_len) as u16;
+    idxt.extend_from_slice(&end_offset.to_be_bytes());
+
+    // Pad to 4-byte boundary
+    while !idxt.len().is_multiple_of(4) {
+        idxt.push(0);
+    }
+
+    idxt
+}
+
+/// Assemble one INDX data record: calibre's data-record layout differs from
+/// the header layout — 8 bytes of 0xFF at offset 28 and zeros from 36..192.
+/// See calibre/mobi/writer8/index.py:Index.__call__.
+fn build_data_record(entry_count: usize, entry_data: &[u8], idxt: &[u8]) -> Vec<u8> {
+    let idxt_offset = 192 + entry_data.len();
+
+    let mut record = Vec::with_capacity(192 + entry_data.len() + idxt.len());
+    record.extend_from_slice(b"INDX"); // 0..4
+    record.extend_from_slice(&192u32.to_be_bytes()); // 4..8 header_length
+    record.extend_from_slice(&0u32.to_be_bytes()); // 8..12 unknown
+    record.extend_from_slice(&1u32.to_be_bytes()); // 12..16 header type = 1 (data record)
+    record.extend_from_slice(&0u32.to_be_bytes()); // 16..20 unknown
+    record.extend_from_slice(&(idxt_offset as u32).to_be_bytes()); // 20..24 idxt_offset
+    record.extend_from_slice(&(entry_count as u32).to_be_bytes()); // 24..28 entries in this record
+    record.extend_from_slice(&[0xFFu8; 8]); // 28..36 calibre writes 8 bytes of 0xFF
+    record.extend_from_slice(&[0u8; 156]); // 36..192 zeros
+
+    record.extend_from_slice(entry_data);
+    record.extend_from_slice(idxt);
+
+    while !record.len().is_multiple_of(4) {
+        record.push(0);
+    }
+
+    record
 }
 
 // Skeleton index tags
@@ -937,43 +972,85 @@ const CHUNK_TAG_EOF: TagDef = TagDef {
     eof: 1,
 };
 
-/// Build CNCX record from chunk selectors
-pub fn build_cncx(selectors: &[String]) -> io::Result<Vec<u8>> {
-    let mut cncx = Vec::new();
+/// Flush threshold for a CNCX record. PDB records are capped at 64 KB and the
+/// offset stored in index entries reserves only the low 16 bits for the
+/// within-record position; calibre's `CNCX` class (mobi/utils.py) flushes at
+/// 0xFBF8 to stay comfortably below both limits, and we mirror it.
+const CNCX_RECORD_LIMIT: usize = 0xFBF8;
+
+/// Build CNCX record(s) from labels, together with the offset each label is
+/// stored at.
+///
+/// Offsets use the Kindle convention mirrored by `Cncx::parse` above (and
+/// calibre's `CNCX` class): the record number is packed into the high bits
+/// (`record_number * 0x10000`) and the low 16 bits are the byte offset within
+/// that record. When a label would push the current record past
+/// `CNCX_RECORD_LIMIT`, the record is flushed and the next label starts a new
+/// record at the next 0x10000 boundary.
+fn build_cncx_with_offsets(selectors: &[String]) -> io::Result<(Vec<Vec<u8>>, Vec<u32>)> {
+    let mut records: Vec<Vec<u8>> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    let mut offsets: Vec<u32> = Vec::with_capacity(selectors.len());
 
     for selector in selectors {
         let bytes = selector.as_bytes();
-        cncx.extend(encint(bytes.len() as u32));
-        cncx.extend_from_slice(bytes);
+        let len_prefix = encint(bytes.len() as u32);
+        let raw_len = len_prefix.len() + bytes.len();
+
+        // A single label that can never fit in one record cannot be split
+        // (the length prefix + payload must be contiguous); refuse rather
+        // than emit a dangling offset. Calibre never hits this because it
+        // truncates labels to 500 characters much earlier.
+        if raw_len > CNCX_RECORD_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "single CNCX label exceeds the 64 KB record limit",
+            ));
+        }
+
+        if current.len() + raw_len > CNCX_RECORD_LIMIT {
+            // CNCX records must be 4-byte aligned. Calibre's `CNCX` class
+            // aligns every flushed record (mobi/utils.py `align_block`);
+            // without this Kindle's CNCX scanner can read a misaligned
+            // trailing varint and either return the wrong string or hang.
+            records.push(align_to_4(std::mem::take(&mut current)));
+        }
+
+        let offset = u32::try_from(records.len() * 0x10000 + current.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CNCX offset exceeds the 32-bit offset space (too many index labels)",
+            )
+        })?;
+        offsets.push(offset);
+
+        current.extend_from_slice(&len_prefix);
+        current.extend_from_slice(bytes);
     }
 
-    // Boko writes a single CNCX record. PDB records are capped at 64 KB, and
-    // offsets past 0x10000 select a *different* CNCX record in the Kindle
-    // format (calibre rolls over: `offset = record_number * 0x10000`). A very
-    // large book would silently produce dangling offsets into a record that
-    // doesn't exist; refuse to build instead (no multi-record split).
-    if cncx.len() > 0x10000 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "CNCX data exceeds the 64 KB single-record limit (book has too many index labels)",
-        ));
+    if !current.is_empty() {
+        records.push(align_to_4(current));
     }
 
-    // CNCX records must be 4-byte aligned. Calibre's `CNCX` class calls
-    // `align_block(buf.getvalue())` (utils.py:612, 621) on every flushed
-    // record. Without this Kindle's CNCX scanner can read a misaligned
-    // trailing varint and either return the wrong string or hang.
-    while !cncx.len().is_multiple_of(4) {
-        cncx.push(0);
-    }
-
-    Ok(cncx)
+    Ok((records, offsets))
 }
 
-/// Build chunk/fragment index records
+/// Build CNCX record(s) from chunk selectors. Large label sets are split
+/// across multiple records; see `build_cncx_with_offsets` for the offset
+/// convention. The records must be written to the PDB in order, immediately
+/// after the owning index's data records.
+pub fn build_cncx(selectors: &[String]) -> io::Result<Vec<Vec<u8>>> {
+    build_cncx_with_offsets(selectors).map(|(records, _)| records)
+}
+
+/// Build chunk/fragment index records. `num_cncx` is the number of CNCX
+/// records that will follow the index's data records (i.e.
+/// `build_cncx(..).len()`), recorded in the INDX header so readers know how
+/// many records to fetch.
 pub fn build_chunk_indx(
     chunks: &[super::skeleton::ChunkEntry],
     cncx_offsets: &[u32],
+    num_cncx: u32,
 ) -> io::Result<Vec<Vec<u8>>> {
     let tagx = vec![
         CHUNK_TAG_CNCX,
@@ -983,10 +1060,7 @@ pub fn build_chunk_indx(
         CHUNK_TAG_EOF,
     ];
     let mut builder = IndxBuilder::new(tagx, 1);
-
-    if !chunks.is_empty() {
-        builder.set_cncx_count(1);
-    }
+    builder.set_cncx_count(num_cncx);
 
     for (i, chunk) in chunks.iter().enumerate() {
         // Control byte: all tags present
@@ -1015,18 +1089,14 @@ pub fn build_chunk_indx(
     builder.build()
 }
 
-/// Calculate CNCX offsets for a list of selectors
+/// Calculate CNCX offsets for a list of selectors. Must stay consistent with
+/// `build_cncx` (both defer to `build_cncx_with_offsets`), including the
+/// record rollover: offsets encode `record_number * 0x10000 + within_record`.
+/// Returns empty offsets for label sets `build_cncx` would reject.
 pub fn calculate_cncx_offsets(selectors: &[String]) -> Vec<u32> {
-    let mut offsets = Vec::new();
-    let mut offset: u32 = 0;
-
-    for selector in selectors {
-        offsets.push(offset);
-        let len_bytes = encint(selector.len() as u32);
-        offset += len_bytes.len() as u32 + selector.len() as u32;
-    }
-
-    offsets
+    build_cncx_with_offsets(selectors)
+        .map(|(_, offsets)| offsets)
+        .unwrap_or_default()
 }
 
 // NCX (Table of Contents) index tags
@@ -1105,6 +1175,11 @@ const GUIDE_TAG_EOF: TagDef = TagDef {
     eof: 1,
 };
 
+/// Return shape of the index builders that own a string table: the INDX
+/// records (header + data) followed by the CNCX record(s), each written to
+/// the PDB in order.
+pub type IndxAndCncxRecords = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
 /// A guide entry — maps an EPUB landmark to a Kindle navigation point.
 #[derive(Debug, Clone)]
 pub struct GuideBuildEntry {
@@ -1117,18 +1192,15 @@ pub struct GuideBuildEntry {
     pub pos_fid: (u32, u32),
 }
 
-/// Build the K8 guide index records (one or more INDX records + a CNCX).
-pub fn build_guide_indx(entries: &[GuideBuildEntry]) -> io::Result<(Vec<Vec<u8>>, Vec<u8>)> {
+/// Build the K8 guide index records (one or more INDX records + CNCX records).
+pub fn build_guide_indx(entries: &[GuideBuildEntry]) -> io::Result<IndxAndCncxRecords> {
     let tagx = vec![GUIDE_TAG_TITLE, GUIDE_TAG_POS_FID, GUIDE_TAG_EOF];
     let mut builder = IndxBuilder::new(tagx, 1);
 
     let titles: Vec<String> = entries.iter().map(|e| e.title.clone()).collect();
-    let title_offsets = calculate_cncx_offsets(&titles);
-    let cncx = build_cncx(&titles)?;
+    let (cncx, title_offsets) = build_cncx_with_offsets(&titles)?;
 
-    if !entries.is_empty() {
-        builder.set_cncx_count(1);
-    }
+    builder.set_cncx_count(cncx.len() as u32);
 
     for (i, entry) in entries.iter().enumerate() {
         // Both tags are mandatory for guide entries.
@@ -1171,8 +1243,9 @@ pub struct NcxBuildEntry {
     pub pos_fid: Option<(u32, u32)>,
 }
 
-/// Build NCX index for table of contents
-pub fn build_ncx_indx(entries: &[NcxBuildEntry]) -> io::Result<(Vec<Vec<u8>>, Vec<u8>)> {
+/// Build NCX index for table of contents. Returns the INDX records plus the
+/// CNCX record(s) holding the entry labels.
+pub fn build_ncx_indx(entries: &[NcxBuildEntry]) -> io::Result<IndxAndCncxRecords> {
     let tagx = vec![
         NCX_TAG_OFFSET,
         NCX_TAG_LENGTH,
@@ -1193,12 +1266,9 @@ pub fn build_ncx_indx(entries: &[NcxBuildEntry]) -> io::Result<(Vec<Vec<u8>>, Ve
 
     // Build CNCX with labels
     let labels: Vec<String> = entries.iter().map(|e| e.label.clone()).collect();
-    let label_offsets = calculate_cncx_offsets(&labels);
-    let cncx = build_cncx(&labels)?;
+    let (cncx, label_offsets) = build_cncx_with_offsets(&labels)?;
 
-    if !entries.is_empty() {
-        builder.set_cncx_count(1);
-    }
+    builder.set_cncx_count(cncx.len() as u32);
 
     for (i, entry) in entries.iter().enumerate() {
         // Control byte 0: tags 1-4 and hierarchy tags
@@ -1309,10 +1379,11 @@ mod tests {
             "Simple Text".to_string(),
         ];
 
-        let cncx_bytes = build_cncx(&labels).unwrap();
+        let cncx_records = build_cncx(&labels).unwrap();
         let offsets = calculate_cncx_offsets(&labels);
+        assert_eq!(cncx_records.len(), 1, "small label set fits one record");
 
-        let parsed = Cncx::parse(&[cncx_bytes], "utf-8");
+        let parsed = Cncx::parse(&cncx_records, "utf-8");
 
         for (i, label) in labels.iter().enumerate() {
             let offset = offsets[i];
@@ -1328,46 +1399,145 @@ mod tests {
     }
 
     #[test]
-    fn test_indx_build_rejects_entry_data_past_u16() {
-        // IDXT offsets are u16; entry data pushing past 64 KB used to be
-        // silently truncated by `as u16`, writing corrupt AZW3 index records
-        // for very large books. Exactly at the boundary must still build;
-        // one byte past must error.
-        let make_builder = |tag_data_len: usize| {
-            let mut builder = IndxBuilder::new(vec![SKEL_TAG_EOF], 1);
-            // Entry data size = 1 (name length byte) + name + tag_data.
-            builder.add_entry("A".to_string(), vec![0u8; tag_data_len]);
-            builder
-        };
+    fn test_indx_build_splits_entry_data_across_records() {
+        // IDXT offsets are u16; entry data past 64 KB per record must be
+        // split into multiple data records rather than truncated or refused.
 
-        // 192 + 1 + 1 + tag_data_len == u16::MAX  =>  tag_data_len = 65341
-        let at_limit = make_builder(65341);
-        assert!(at_limit.build().is_ok(), "boundary case must still build");
+        // A single entry filling one record exactly still builds as one data
+        // record: 192 (header) + 1 (name len) + 1 (name) + 65334 (tag data)
+        // + 8 (IDXT) == 0x10000.
+        let mut builder = IndxBuilder::new(vec![SKEL_TAG_EOF], 1);
+        builder.add_entry("A".to_string(), vec![0u8; 65334]);
+        let records = builder.build().unwrap();
+        assert_eq!(records.len(), 2, "header + 1 data record");
+        assert_eq!(records[1].len(), 0x10000);
 
-        let past_limit = make_builder(65342);
-        let err = past_limit.build().unwrap_err();
+        // One byte more and the single entry cannot fit any record: error.
+        let mut builder = IndxBuilder::new(vec![SKEL_TAG_EOF], 1);
+        builder.add_entry("A".to_string(), vec![0u8; 65335]);
+        let err = builder.build().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(
-            err.to_string().contains("64 KB"),
-            "Expected 64 KB limit error, got: {err}"
-        );
+
+        // Multiple entries that jointly exceed one record's capacity split.
+        let mut builder = IndxBuilder::new(vec![SKEL_TAG_EOF], 1);
+        for i in 0..80 {
+            builder.add_entry(format!("{i:04}"), vec![0u8; 1000]);
+        }
+        let records = builder.build().unwrap();
+        assert_eq!(records.len(), 3, "header + 2 data records");
+
+        let header = IndxHeader::parse(&records[0]).unwrap();
+        assert_eq!(header.entry_count, 2, "num_of_records in header");
+        assert_eq!(header.total_entries, 80);
+
+        // Per-record entry counts must sum to the total, every record's
+        // IDXT must sit where the header says, and no record may exceed
+        // the 64 KB PDB record limit.
+        let mut sum = 0;
+        for rec in &records[1..] {
+            assert!(rec.len() <= 0x10000, "data record exceeds 64 KB");
+            let h = IndxHeader::parse(rec).unwrap();
+            let idxt = h.idxt_start as usize;
+            assert_eq!(&rec[idxt..idxt + 4], b"IDXT");
+            sum += h.entry_count;
+        }
+        assert_eq!(sum, 80);
     }
 
     #[test]
-    fn test_build_cncx_rejects_data_past_64kb() {
-        // Offsets past 0x10000 select a nonexistent second CNCX record;
-        // build_cncx must refuse rather than emit dangling offsets.
-        // encint(65533) is 3 bytes, so this string lands exactly on 0x10000.
-        let at_limit = vec!["x".repeat(65533)];
-        assert!(build_cncx(&at_limit).is_ok(), "boundary case must build");
+    fn test_build_cncx_splits_past_record_limit() {
+        // Labels totalling more than one record must be split, with offsets
+        // encoding `record_number << 16 | offset_within_record` — the exact
+        // convention Cncx::parse (and calibre) use.
+        let labels: Vec<String> = (0..3000)
+            .map(|i| format!("Section {i:05} of the Extended Compendium, Volume {}", i % 7))
+            .collect();
 
-        let past_limit = vec!["x".repeat(65534)];
-        let err = build_cncx(&past_limit).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let records = build_cncx(&labels).unwrap();
+        let offsets = calculate_cncx_offsets(&labels);
+
+        assert!(records.len() >= 2, "must split into multiple records");
+        for rec in &records {
+            assert!(rec.len() <= CNCX_RECORD_LIMIT + 3, "record too large");
+            assert!(rec.len().is_multiple_of(4), "records must be 4-byte aligned");
+        }
         assert!(
-            err.to_string().contains("64 KB"),
-            "Expected 64 KB limit error, got: {err}"
+            offsets.iter().any(|&o| o >= 0x10000),
+            "some offsets must land in a later record"
         );
+
+        // Every label must be retrievable at its advertised offset.
+        let parsed = Cncx::parse(&records, "utf-8");
+        for (label, &off) in labels.iter().zip(&offsets) {
+            assert_eq!(parsed.get(off), Some(label), "label at offset {off:#x}");
+        }
+
+        // A single label that cannot fit in any record must still error.
+        let oversized = vec!["x".repeat(CNCX_RECORD_LIMIT)];
+        let err = build_cncx(&oversized).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_chunk_indx_multi_record_roundtrip() {
+        use crate::mobi::skeleton::ChunkEntry;
+
+        // 3000 chunks (the ">2800 chunks" failure regime): entry data
+        // (~25 bytes/entry) exceeds one INDX data record and the selector
+        // labels (~22 bytes each) exceed one CNCX record, so both splits
+        // are exercised at production thresholds. The reader half is the
+        // real `read_index`, i.e. exactly what the AZW3 importer runs.
+        let chunks: Vec<ChunkEntry> = (0..3000)
+            .map(|i| ChunkEntry {
+                insert_pos: i * 8192,
+                selector: format!("P-//*[@aid='{i:07}']"),
+                file_number: i / 100,
+                sequence_number: i,
+                start_pos: i * 8192,
+                length: 8192,
+            })
+            .collect();
+
+        let selectors: Vec<String> = chunks.iter().map(|c| c.selector.clone()).collect();
+        let cncx_offsets = calculate_cncx_offsets(&selectors);
+        let cncx_records = build_cncx(&selectors).unwrap();
+        assert!(
+            cncx_offsets.iter().any(|&o| o >= 0x10000),
+            "test must span multiple CNCX records"
+        );
+
+        let indx_records =
+            build_chunk_indx(&chunks, &cncx_offsets, cncx_records.len() as u32).unwrap();
+        assert!(
+            indx_records.len() > 2,
+            "test must span multiple INDX data records"
+        );
+
+        // Serve records in on-disk order: header, data records, CNCX records.
+        let mut all = indx_records;
+        all.extend(cncx_records);
+        let mut read_record = |idx: usize| -> io::Result<Vec<u8>> {
+            all.get(idx)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no such record"))
+        };
+
+        let (entries, cncx) = read_index(&mut read_record, 0, "utf-8").unwrap();
+        let elems = parse_div_index(&entries, &cncx);
+
+        assert_eq!(elems.len(), 3000);
+        for (i, elem) in elems.iter().enumerate() {
+            assert_eq!(elem.insert_pos as usize, i * 8192, "insert_pos of chunk {i}");
+            assert_eq!(
+                elem.toc_text.as_deref(),
+                Some(format!("P-//*[@aid='{i:07}']").as_str()),
+                "selector of chunk {i}"
+            );
+            assert_eq!(elem.file_number as usize, i / 100, "file_number of chunk {i}");
+            assert_eq!(elem.sequence_number as usize, i, "sequence_number of chunk {i}");
+            assert_eq!(elem.start_pos as usize, i * 8192, "start_pos of chunk {i}");
+            assert_eq!(elem.length, 8192, "length of chunk {i}");
+        }
     }
 
     #[test]
@@ -1409,7 +1579,7 @@ mod tests {
             parse_tagx(&ncx_records[0][tagx_start..]).expect("Failed to parse TAGX");
 
         // Parse CNCX
-        let cncx = Cncx::parse(&[ncx_cncx], "utf-8");
+        let cncx = Cncx::parse(&ncx_cncx, "utf-8");
 
         // Parse the data record
         let data_record = &ncx_records[1];

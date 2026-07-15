@@ -389,17 +389,23 @@ impl Kf8Builder {
                     .iter()
                     .map(|c| c.selector.clone())
                     .collect();
+                // `calculate_cncx_offsets` and `build_cncx` share the same
+                // record-rollover logic, so the offsets already encode
+                // `record_number << 16 | offset_within_record`.
                 let cncx_offsets = calculate_cncx_offsets(&selectors);
-                let cncx = build_cncx(&selectors)?;
+                let cncx_records = build_cncx(&selectors)?;
 
                 self.frag_index = self.records.len() as u32;
-                let chunk_records = build_chunk_indx(&chunker_result.chunk_table, &cncx_offsets)?;
+                let chunk_records = build_chunk_indx(
+                    &chunker_result.chunk_table,
+                    &cncx_offsets,
+                    cncx_records.len() as u32,
+                )?;
                 for record in chunk_records {
                     self.records.push(record);
                 }
-
-                if !cncx.is_empty() {
-                    self.records.push(cncx);
+                for record in cncx_records {
+                    self.records.push(record);
                 }
             }
         }
@@ -422,8 +428,8 @@ impl Kf8Builder {
                 for record in ncx_records {
                     self.records.push(record);
                 }
-                if !ncx_cncx.is_empty() {
-                    self.records.push(ncx_cncx);
+                for record in ncx_cncx {
+                    self.records.push(record);
                 }
                 self.ncx_entries = ncx_entries;
             }
@@ -444,8 +450,8 @@ impl Kf8Builder {
                 for record in guide_records {
                     self.records.push(record);
                 }
-                if !guide_cncx.is_empty() {
-                    self.records.push(guide_cncx);
+                for record in guide_cncx {
+                    self.records.push(record);
                 }
             }
         }
