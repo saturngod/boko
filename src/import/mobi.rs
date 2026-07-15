@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::dom::Stylesheet;
@@ -58,7 +58,7 @@ pub struct MobiImporter {
     chapter_paths: Vec<String>,
 
     /// Discovered asset paths.
-    assets: Vec<PathBuf>,
+    assets: Vec<String>,
 
     /// Cached parsed stylesheets.
     css_cache: HashMap<String, Arc<Stylesheet>>,
@@ -108,37 +108,34 @@ impl Importer for MobiImporter {
             })
     }
 
-    fn list_assets(&self) -> &[PathBuf] {
+    fn list_assets(&self) -> &[String] {
         &self.assets
     }
 
-    fn load_asset(&mut self, path: &Path) -> crate::Result<Vec<u8>> {
-        let key = path.to_string_lossy();
-
+    fn load_asset(&mut self, path: &str) -> crate::Result<Vec<u8>> {
         // Parse index from path (images/image_XXXX.ext or fonts/font_XXXX.ext).
         // Images and fonts share the same record-index space, so the prefix
         // selects naming but the underlying lookup is the same.
-        let idx: usize = key
+        let idx: usize = path
             .strip_prefix("images/image_")
-            .or_else(|| key.strip_prefix("fonts/font_"))
+            .or_else(|| path.strip_prefix("fonts/font_"))
             .and_then(|s| s.split('.').next())
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| crate::Error::NotFound {
-                what: format!("asset {}", key),
+                what: format!("asset {}", path),
             })?;
 
         Ok(self.load_image_record(idx)?)
     }
 
-    fn load_stylesheet(&mut self, path: &Path) -> Option<Arc<Stylesheet>> {
-        let key = path.to_string_lossy().replace('\\', "/");
-        if let Some(sheet) = self.css_cache.get(&key) {
+    fn load_stylesheet(&mut self, path: &str) -> Option<Arc<Stylesheet>> {
+        if let Some(sheet) = self.css_cache.get(path) {
             return Some(Arc::clone(sheet));
         }
         let css_bytes = self.load_asset(path).ok()?;
         let css_str = String::from_utf8_lossy(&css_bytes);
         let sheet = Arc::new(Stylesheet::parse(&css_str));
-        self.css_cache.insert(key, Arc::clone(&sheet));
+        self.css_cache.insert(path.to_string(), Arc::clone(&sheet));
         Some(sheet)
     }
 
@@ -207,7 +204,11 @@ impl MobiImporter {
 
         // Read record 0 (MOBI header)
         let (start, end) = pdb.record_range(0, file_len)?;
-        let record0 = source.read_at(start, (end - start) as usize)?;
+        let record0_len = usize::try_from(end - start).map_err(|_| crate::Error::Malformed {
+            format: crate::Format::Mobi,
+            context: "record 0 too large".into(),
+        })?;
+        let record0 = source.read_at(start, record0_len)?;
         let mobi = MobiHeader::parse(&record0)?;
 
         if mobi.encryption != 0 {
@@ -229,7 +230,7 @@ impl MobiImporter {
         {
             // cover_offset is 0-indexed relative to first image
             if let Some(cover_path) = assets.get(cover_idx as usize) {
-                metadata.cover_image = Some(cover_path.to_string_lossy().to_string());
+                metadata.cover_image = Some(cover_path.clone());
             }
         }
 
@@ -243,7 +244,9 @@ impl MobiImporter {
         let ncx_entries = if mobi.ncx_index != NULL_INDEX {
             let mut read_record = |idx: usize| -> io::Result<Vec<u8>> {
                 let (start, end) = pdb.record_range(idx, file_len)?;
-                source.read_at(start, (end - start) as usize)
+                let len = usize::try_from(end - start)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "record too large"))?;
+                source.read_at(start, len)
             };
 
             match read_index(&mut read_record, mobi.ncx_index as usize, codec) {
@@ -335,7 +338,7 @@ impl MobiImporter {
     }
 
     /// Discover asset paths by scanning image and font records.
-    fn discover_assets(&self) -> Vec<PathBuf> {
+    fn discover_assets(&self) -> Vec<String> {
         let mut assets = Vec::new();
 
         if self.mobi.first_image_index == NULL_INDEX {
@@ -345,7 +348,9 @@ impl MobiImporter {
         let first_img = self.mobi.first_image_index as usize;
         for i in first_img..self.pdb.num_records as usize {
             if let Ok((start, end)) = self.pdb.record_range(i, self.file_len) {
-                let read_len = 16.min((end - start) as usize);
+                // min against a small constant before the cast so a >4 GiB
+                // record length can't truncate on 32-bit targets.
+                let read_len = (end - start).min(16) as usize;
                 let mut header = [0u8; 16];
                 if self
                     .source
@@ -364,9 +369,9 @@ impl MobiImporter {
                             "image/gif" => "gif",
                             _ => "bin",
                         };
-                        assets.push(PathBuf::from(format!("images/image_{idx:04}.{ext}")));
+                        assets.push(format!("images/image_{idx:04}.{ext}"));
                     } else if let Some(font_ext) = detect_font_type(header) {
-                        assets.push(PathBuf::from(format!("fonts/font_{idx:04}.{font_ext}")));
+                        assets.push(format!("fonts/font_{idx:04}.{font_ext}"));
                     }
                 }
             }
@@ -394,7 +399,9 @@ impl MobiImporter {
     /// Read a record by index.
     fn read_record(&self, idx: usize) -> io::Result<Vec<u8>> {
         let (start, end) = self.pdb.record_range(idx, self.file_len)?;
-        self.source.read_at(start, (end - start) as usize)
+        let len = usize::try_from(end - start)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "record too large"))?;
+        self.source.read_at(start, len)
     }
 }
 
@@ -413,7 +420,9 @@ fn extract_text_from_source(
 
     let read_record = |idx: usize| -> io::Result<Vec<u8>> {
         let (start, end) = pdb.record_range(idx, file_len)?;
-        source.read_at(start, (end - start) as usize)
+        let len = usize::try_from(end - start)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "record too large"))?;
+        source.read_at(start, len)
     };
 
     // Build decompressor if needed
@@ -467,7 +476,7 @@ fn discover_assets_from_source(
     pdb: &PdbInfo,
     mobi: &MobiHeader,
     file_len: u64,
-) -> Vec<PathBuf> {
+) -> Vec<String> {
     let mut assets = Vec::new();
 
     if mobi.first_image_index == NULL_INDEX {
@@ -477,7 +486,9 @@ fn discover_assets_from_source(
     let first_img = mobi.first_image_index as usize;
     for i in first_img..pdb.num_records as usize {
         if let Ok((start, end)) = pdb.record_range(i, file_len) {
-            let read_len = 16.min((end - start) as usize);
+            // min against a small constant before the cast so a >4 GiB
+            // record length can't truncate on 32-bit targets.
+            let read_len = (end - start).min(16) as usize;
             let mut header = [0u8; 16];
             if source.read_at_into(start, &mut header[..read_len]).is_ok() {
                 let header = &header[..read_len];
@@ -492,9 +503,9 @@ fn discover_assets_from_source(
                         "image/gif" => "gif",
                         _ => "bin",
                     };
-                    assets.push(PathBuf::from(format!("images/image_{idx:04}.{ext}")));
+                    assets.push(format!("images/image_{idx:04}.{ext}"));
                 } else if let Some(font_ext) = detect_font_type(header) {
-                    assets.push(PathBuf::from(format!("fonts/font_{idx:04}.{font_ext}")));
+                    assets.push(format!("fonts/font_{idx:04}.{font_ext}"));
                 }
             }
         }

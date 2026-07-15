@@ -45,9 +45,12 @@ pub(super) fn build_external_resource_fragment(
 }
 
 /// Build a resource fragment (bcRawMedia $417) - the actual bytes.
+///
+/// Takes ownership of `data` so multi-MB image/font payloads move into the
+/// fragment instead of being copied.
 pub(super) fn build_resource_fragment(
     href: &str,
-    data: &[u8],
+    data: Vec<u8>,
     ctx: &mut ExportContext,
 ) -> KfxFragment {
     // Use resource/ prefix to distinguish from external_resource fragment
@@ -59,7 +62,7 @@ pub(super) fn build_resource_fragment(
     ctx.symbols.get_or_intern(&raw_name);
 
     // Create raw fragment for binary resources
-    KfxFragment::raw(KfxSymbol::Bcrawmedia as u64, &raw_name, data.to_vec())
+    KfxFragment::raw(KfxSymbol::Bcrawmedia as u64, &raw_name, data)
 }
 
 /// Build font entity fragments ($262) from @font-face rules.
@@ -257,8 +260,11 @@ pub(super) fn detect_format_symbol(href: &str, data: &[u8]) -> u64 {
 }
 
 /// Check if a path is a media asset (image, font, etc.)
-pub(super) fn is_media_asset(path: &std::path::Path) -> bool {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+pub(super) fn is_media_asset(path: &str) -> bool {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
     matches!(
         ext.to_lowercase().as_str(),
         "jpg" | "jpeg" | "png" | "gif" | "svg" | "webp" | "ttf" | "otf" | "woff" | "woff2"

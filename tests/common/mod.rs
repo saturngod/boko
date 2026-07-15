@@ -48,7 +48,7 @@ pub fn export_to_bytes(book: &mut Book, format: Format) -> Vec<u8> {
         Format::Markdown => boko::export::MarkdownExporter::new()
             .export(book, &mut buf)
             .expect("markdown export"),
-        Format::Mobi => panic!("MOBI is export-only-unsupported"),
+        other => panic!("unsupported export format {other:?}"),
     }
     buf.into_inner()
 }
@@ -112,7 +112,7 @@ pub fn summarize(book: &mut Book) -> BookSummary {
     let asset_exts = book
         .list_assets()
         .iter()
-        .filter_map(|p| p.extension().and_then(|s| s.to_str()))
+        .filter_map(|p| std::path::Path::new(p).extension().and_then(|s| s.to_str()))
         .map(str::to_ascii_lowercase)
         .collect();
 

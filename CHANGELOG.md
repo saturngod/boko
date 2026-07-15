@@ -30,9 +30,17 @@ refactor. It contains breaking changes to the public API.
   nothing. Use `KfxExporter::new()` / `KfxExporter::default()`. (`Azw3Config`
   and `EpubConfig`, which carry real options, are unchanged.)
 - **`ion-rs` is now gated behind the `cli` feature.** The library uses its own
-  Ion codec; `ion-rs` was only needed by the `kfx-dump` binary. Consumers using
+  Ion codec; `ion-rs` was only needed by the KFX dump tool. Consumers using
   `default-features = false` who relied on `ion-rs` being pulled in transitively
   must enable the `cli` feature.
+- **The standalone `kfx-dump` binary is now the `boko kfx-dump` subcommand.**
+  Same flags (`-r`, `-s`, `-f <field>`), byte-identical output; `cargo install
+  boko` no longer places a second binary on `PATH`.
+- **Archive entry names are strings.** `Importer::list_assets` returns
+  `&[String]`, and `load_asset`/`load_stylesheet` take `&str` — names inside
+  EPUB/MOBI/KFX containers are UTF-8 zip paths, not OS paths. `Importer::open`
+  still takes `&Path`. `kfx::container::read_u16_le/read_u32_le/read_u64_le`
+  now return `Option` instead of panicking on truncated buffers.
 
 ### Added
 

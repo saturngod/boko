@@ -1,8 +1,8 @@
 //! EPUB format importer - handles all IO.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 use zip::ZipArchive;
 
@@ -50,11 +50,12 @@ pub struct EpubImporter {
     /// Maps ChapterId -> ZIP path (e.g., "OEBPS/text/ch01.xhtml").
     spine_paths: Vec<String>,
 
-    /// All asset paths in the ZIP.
-    assets: Vec<PathBuf>,
+    /// All asset paths in the ZIP (archive entry names, forward slashes).
+    assets: Vec<String>,
 
-    /// Cached parsed stylesheets.
-    css_cache: HashMap<String, Arc<Stylesheet>>,
+    /// Cached parsed stylesheets. Behind a lock so parallel chapter
+    /// compilation ([`Importer::load_chapters`]) can share it through `&self`.
+    css_cache: RwLock<HashMap<String, Arc<Stylesheet>>>,
 
     // --- Link resolution ---
     /// Maps path (without fragment) -> ChapterId
@@ -113,25 +114,46 @@ impl Importer for EpubImporter {
         self.read_entry(path)
     }
 
-    fn list_assets(&self) -> &[PathBuf] {
+    fn list_assets(&self) -> &[String] {
         &self.assets
     }
 
-    fn load_asset(&mut self, path: &Path) -> crate::Result<Vec<u8>> {
-        let key = path.to_string_lossy().replace('\\', "/");
-        self.read_entry(&key)
+    fn load_asset(&mut self, path: &str) -> crate::Result<Vec<u8>> {
+        self.read_entry(path)
     }
 
-    fn load_stylesheet(&mut self, path: &Path) -> Option<Arc<Stylesheet>> {
-        let key = path.to_string_lossy().replace('\\', "/");
-        if let Some(sheet) = self.css_cache.get(&key) {
-            return Some(Arc::clone(sheet));
+    fn load_stylesheet(&mut self, path: &str) -> Option<Arc<Stylesheet>> {
+        self.load_stylesheet_shared(path)
+    }
+
+    fn load_chapters(&mut self, ids: &[ChapterId]) -> Vec<crate::Result<Chapter>> {
+        // Everything a chapter load needs is `&self` here (random-access ZIP
+        // reads, the locked CSS cache), so chapters compile in parallel: the
+        // HTML parse + CSS cascade + IR transform dominate cold conversion.
+        let load_one = |id: &ChapterId| -> crate::Result<Chapter> {
+            let path =
+                self.spine_paths
+                    .get(id.0 as usize)
+                    .ok_or_else(|| crate::Error::NotFound {
+                        what: format!("chapter {}", id.0),
+                    })?;
+            let html_bytes = self.read_entry(path)?;
+            Ok(crate::import::compile_chapter_html(
+                &html_bytes,
+                Some(path),
+                &mut |css_path| self.load_stylesheet_shared(css_path),
+            ))
+        };
+
+        #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+        {
+            use rayon::prelude::*;
+            ids.par_iter().map(load_one).collect()
         }
-        let css_bytes = self.load_asset(path).ok()?;
-        let css_str = String::from_utf8_lossy(&css_bytes);
-        let sheet = Arc::new(Stylesheet::parse(&css_str));
-        self.css_cache.insert(key, Arc::clone(&sheet));
-        Some(sheet)
+        #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+        {
+            ids.iter().map(load_one).collect()
+        }
     }
 
     fn index_anchors(&mut self, chapters: &[(ChapterId, Arc<Chapter>)]) {
@@ -189,23 +211,17 @@ impl EpubImporter {
                     compression: compression_to_u16(file.compression()),
                 },
             );
-            assets.push(PathBuf::from(name));
+            assets.push(name);
         }
 
         // 2. Find OPF path from container.xml
         let container_bytes = read_entry(&source, &zip_index, "META-INF/container.xml")?;
         let opf_path = parse_container_xml(&container_bytes)?;
-        let opf_base = Path::new(&opf_path)
-            .parent()
-            .map(|p| {
-                let s = p.to_string_lossy();
-                if s.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}/", s)
-                }
-            })
-            .unwrap_or_default();
+        // Directory of the OPF (including trailing slash), or "" for root.
+        let opf_base = match opf_path.rfind('/') {
+            Some(idx) => opf_path[..=idx].to_string(),
+            None => String::new(),
+        };
 
         // 3. Parse OPF
         let opf_bytes = read_entry(&source, &zip_index, &opf_path)?;
@@ -300,13 +316,33 @@ impl EpubImporter {
             assets,
             path_to_chapter,
             anchor_map: HashMap::new(),
-            css_cache: HashMap::new(),
+            css_cache: RwLock::new(HashMap::new()),
         })
     }
 
     /// Read and decompress a ZIP entry by path.
     fn read_entry(&self, path: &str) -> crate::Result<Vec<u8>> {
         read_entry(&self.source, &self.zip_index, path)
+    }
+
+    /// Load and cache a parsed stylesheet through `&self`, so both the
+    /// `&mut self` trait method and parallel chapter compilation share the
+    /// same cache.
+    fn load_stylesheet_shared(&self, path: &str) -> Option<Arc<Stylesheet>> {
+        if let Ok(cache) = self.css_cache.read()
+            && let Some(sheet) = cache.get(path)
+        {
+            return Some(Arc::clone(sheet));
+        }
+        let css_bytes = self.read_entry(path).ok()?;
+        let css_str = String::from_utf8_lossy(&css_bytes);
+        let sheet = Arc::new(Stylesheet::parse(&css_str));
+        // Two threads may race to parse the same sheet; the first insert wins
+        // so every chapter ends up sharing one Arc.
+        match self.css_cache.write() {
+            Ok(mut cache) => Some(Arc::clone(cache.entry(path.to_string()).or_insert(sheet))),
+            Err(_) => Some(sheet),
+        }
     }
 }
 

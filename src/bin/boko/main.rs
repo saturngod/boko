@@ -3,6 +3,8 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+
+mod kfx_dump;
 use serde::Serialize;
 
 use boko::{Book, Chapter, ChapterId, Format, NodeId, Role, ToCss, TocEntry, extract_section_tree};
@@ -47,6 +49,9 @@ enum Command {
         #[arg(short, long)]
         quiet: bool,
     },
+
+    /// Dump KFX/KDF/Ion files for debugging (KFX containers and raw Ion binary)
+    KfxDump(kfx_dump::KfxDumpArgs),
 
     /// Extract hierarchical section tree (JSON)
     Sections {
@@ -94,6 +99,7 @@ fn main() -> ExitCode {
 
     let result = match cli.command {
         Command::Info { file, json } => show_info(&file, json),
+        Command::KfxDump(args) => kfx_dump::run(&args),
         Command::Sections { file } => show_sections(&file),
         Command::Convert {
             input,
@@ -255,7 +261,7 @@ fn print_json(book: &mut Book, path: &str) -> Result<(), String> {
         .map(|p| {
             let size = book.load_asset(p).map_or(0, |d| d.len());
             AssetInfo {
-                path: p.to_string_lossy().to_string(),
+                path: p.clone(),
                 size,
             }
         })
@@ -428,7 +434,7 @@ fn print_human(book: &mut Book, path: &str) -> Result<(), String> {
     for asset in &assets {
         let size = book
             .load_asset(asset).map_or_else(|_| "?".to_string(), |data| format_bytes(data.len()));
-        println!("  {} ({})", asset.display(), size);
+        println!("  {} ({})", asset, size);
     }
 
     Ok(())
@@ -866,35 +872,9 @@ fn collect_styles(chapter: &Chapter) -> Vec<StyleInfo> {
 }
 
 fn role_to_string(role: Role) -> String {
-    match role {
-        Role::Text => "Text".to_string(),
-        Role::Paragraph => "Paragraph".to_string(),
-        Role::Heading(level) => format!("Heading({level})"),
-        Role::Container => "Container".to_string(),
-        Role::Image => "Image".to_string(),
-        Role::Link => "Link".to_string(),
-        Role::OrderedList => "OrderedList".to_string(),
-        Role::UnorderedList => "UnorderedList".to_string(),
-        Role::ListItem => "ListItem".to_string(),
-        Role::Table => "Table".to_string(),
-        Role::TableHead => "TableHead".to_string(),
-        Role::TableBody => "TableBody".to_string(),
-        Role::TableRow => "TableRow".to_string(),
-        Role::TableCell => "TableCell".to_string(),
-        Role::Sidebar => "Sidebar".to_string(),
-        Role::Footnote => "Footnote".to_string(),
-        Role::Figure => "Figure".to_string(),
-        Role::Inline => "Inline".to_string(),
-        Role::BlockQuote => "BlockQuote".to_string(),
-        Role::Root => "Root".to_string(),
-        Role::Break => "Break".to_string(),
-        Role::Rule => "Rule".to_string(),
-        Role::DefinitionList => "DefinitionList".to_string(),
-        Role::DefinitionTerm => "DefinitionTerm".to_string(),
-        Role::DefinitionDescription => "DefinitionDescription".to_string(),
-        Role::CodeBlock => "CodeBlock".to_string(),
-        Role::Caption => "Caption".to_string(),
-    }
+    // The derived Debug output matches the names this hand-written match
+    // produced, and stays exhaustive as `Role` (non_exhaustive) grows.
+    format!("{role:?}")
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {
