@@ -43,7 +43,10 @@ const FIELDS: [&str; 14] = [
 #[test]
 fn kfx_dump_field_reports_match_golden() {
     let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/epictetus.kfx");
-    let expected = include_str!("fixtures/kfx_dump_fields.expected");
+    // Normalize CRLF: on Windows, git checkout (without the .gitattributes
+    // `-text` guard) and console pipes can introduce \r\n on either side.
+    let expected = include_str!("fixtures/kfx_dump_fields.expected").replace("\r\n", "\n");
+    let expected = expected.as_str();
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_boko"));
     cmd.arg("kfx-dump").arg(fixture);
@@ -64,7 +67,9 @@ fn kfx_dump_field_reports_match_golden() {
         "kfx-dump field-report mode wrote to stderr:\n{stderr}"
     );
 
-    let stdout = String::from_utf8(output.stdout).expect("kfx-dump stdout was not UTF-8");
+    let stdout = String::from_utf8(output.stdout)
+        .expect("kfx-dump stdout was not UTF-8")
+        .replace("\r\n", "\n");
     if stdout != expected {
         // Point at the first divergent line for a readable failure instead of
         // dumping two ~1000-line blobs.
