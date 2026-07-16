@@ -44,12 +44,21 @@ fn vacuum_siblings(chapter: &mut Chapter, parent_id: NodeId) {
         // separator, not indentation: divs routinely hold inline content
         // directly (`<div><i>A</i> <i>B</i></div>` must keep its space even
         // though Container is a "structural" parent).
-        let flanked_by_inline = prev_opt
-            .and_then(|id| chapter.node(id))
-            .is_some_and(|n| is_inline_role(n.role))
-            && next_opt
-                .and_then(|id| chapter.node(id))
-                .is_some_and(|n| is_inline_role(n.role));
+        //
+        // A neighbor only counts as a flank if it carries actual content: an
+        // inline element, or a NON-whitespace text node. A whitespace-only
+        // text node must not count, or two adjacent spaces (e.g. left behind
+        // when a `display:none` inline between them was dropped) would each
+        // "flank" the other and neither would be cleaned, yielding a double
+        // space. This mirrors the transform's `is_inline_level` predicate.
+        let is_inline_flank = |id: NodeId| {
+            chapter.node(id).is_some_and(|n| {
+                is_inline_role(n.role)
+                    && (n.role != Role::Text || !chapter.text(n.text).trim().is_empty())
+            })
+        };
+        let flanked_by_inline =
+            prev_opt.is_some_and(&is_inline_flank) && next_opt.is_some_and(&is_inline_flank);
 
         if !flanked_by_inline && should_vacuum(chapter, current_id) {
             // Unlink this node

@@ -365,6 +365,18 @@ mod tests {
     }
 
     #[test]
+    fn hidden_inline_between_inline_siblings_yields_single_space() {
+        // A display:none inline between two inline siblings (with newlines on
+        // both sides) must collapse to a single space, not a double space:
+        // both surrounding whitespace nodes are kept, the hidden element
+        // vanishes, and the vacuum pass must clean one of the resulting
+        // adjacent spaces. Browsers render this as "A B".
+        let html = "<html><body><div><i>A</i>\n<span style=\"display:none\">X</span>\n<i>B</i></div></body></html>";
+        let chapter = compile_html(html, &[]);
+        assert_eq!(full_text(&chapter), "A B");
+    }
+
+    #[test]
     fn indentation_between_blocks_is_still_dropped() {
         let html = "<html><body><div>\n  <p>One</p>\n  <p>Two</p>\n</div></body></html>";
         let chapter = compile_html(html, &[]);

@@ -127,7 +127,7 @@ fn synthesize_xhtml_from_body(
     doc.push_str(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml">
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
 <head>
   <meta charset="utf-8"/>
   <title>"#,
@@ -290,6 +290,28 @@ fn walk_node<R: StyleResolver>(id: NodeId, ctx: &mut SynthesisContext<'_, R>, de
         if let Some(colspan) = ctx.ir.semantics.col_span(id) {
             write!(attrs, " colspan=\"{}\"", colspan).unwrap();
         }
+    }
+
+    // Preserve semantic markers captured on import: epub:type (footnote /
+    // noteref / pagebreak — drives reader footnote popups and page lists),
+    // ARIA role, and <time datetime>. Without these the round trip demotes
+    // EPUB3 footnotes to plain links and loses pagebreak semantics.
+    if let Some(epub_type) = ctx.ir.semantics.epub_type(id) {
+        attrs.push_str(" epub:type=\"");
+        escape_xml_into(&mut attrs, epub_type);
+        attrs.push('"');
+    }
+    if let Some(aria_role) = ctx.ir.semantics.aria_role(id) {
+        attrs.push_str(" role=\"");
+        escape_xml_into(&mut attrs, aria_role);
+        attrs.push('"');
+    }
+    // datetime is only ever set on <time> elements, so emitting it wherever
+    // present reproduces it on the right element without a role check.
+    if let Some(datetime) = ctx.ir.semantics.datetime(id) {
+        attrs.push_str(" datetime=\"");
+        escape_xml_into(&mut attrs, datetime);
+        attrs.push('"');
     }
 
     // Emit opening tag
@@ -472,6 +494,37 @@ mod tests {
         assert!(result.body.contains("<p>"));
         assert!(result.body.contains("Hello, World!"));
         assert!(result.body.contains("</p>"));
+    }
+
+    #[test]
+    fn epub_type_and_role_are_preserved() {
+        // Semantic markers captured on import must survive synthesis, or
+        // EPUB3 footnote/pagebreak semantics are lost on every →EPUB export.
+        let mut chapter = Chapter::new();
+        let a = chapter.alloc_node(Node::new(Role::Link));
+        chapter.append_child(NodeId::ROOT, a);
+        chapter.semantics.set_href(a, "ch2.xhtml#n1");
+        chapter.semantics.set_epub_type(a, "noteref");
+        chapter.semantics.set_aria_role(a, "doc-noteref");
+
+        let result = synthesize_html(&chapter, &HashMap::new());
+        assert!(
+            result.body.contains("epub:type=\"noteref\""),
+            "{}",
+            result.body
+        );
+        assert!(
+            result.body.contains("role=\"doc-noteref\""),
+            "{}",
+            result.body
+        );
+
+        // And the document root must declare the epub namespace.
+        let doc = synthesize_xhtml_document(&chapter, &HashMap::new(), "T", None);
+        assert!(
+            doc.body
+                .contains("xmlns:epub=\"http://www.idpf.org/2007/ops\"")
+        );
     }
 
     #[test]

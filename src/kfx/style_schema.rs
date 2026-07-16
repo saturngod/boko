@@ -1491,11 +1491,22 @@ pub fn extract_ir_field(ir_style: &ir_style::ComputedStyle, field: IrField) -> O
         // Language is not a CSS property (to_css emits it via the HTML lang
         // attribute instead).
         IrField::Language => ir_style.language.clone(),
-        // BoxAlign: derived from margin-left: auto + margin-right: auto.
+        // BoxAlign: horizontal centering from `margin: <v> auto`.
+        //
+        // `Length::Auto` is also the DEFAULT (unset) margin, so
+        // left==auto && right==auto alone can't distinguish real centering
+        // from margins that were simply never set — and blindly centering the
+        // latter wrongly centers every width-constrained box (e.g.
+        // `width:200px` with no margins). Require positive evidence: the
+        // dominant centering idiom `margin: 0 auto` / `margin: 1em auto` sets
+        // top/bottom to a concrete value, whereas fully-unset margins leave
+        // all four `Auto`. So only center when a vertical margin is explicit.
         IrField::BoxAlign => {
-            if ir_style.margin_left == ir_style::Length::Auto
-                && ir_style.margin_right == ir_style::Length::Auto
-            {
+            let auto = ir_style::Length::Auto;
+            let horizontally_auto = ir_style.margin_left == auto && ir_style.margin_right == auto;
+            let vertical_is_explicit =
+                ir_style.margin_top != auto || ir_style.margin_bottom != auto;
+            if horizontally_auto && vertical_is_explicit {
                 Some("center".to_string())
             } else {
                 None
@@ -1673,7 +1684,8 @@ impl ValueTransform {
             }
 
             ValueTransform::ParseColor => {
-                // Packed integer: 0xRRGGBB
+                // Packed ARGB (0xAARRGGBB); the alpha byte is dropped since IR
+                // colors have no alpha channel.
                 let packed = value.as_int()? as u32;
                 let r = (packed >> 16) & 0xFF;
                 let g = (packed >> 8) & 0xFF;
@@ -2410,12 +2422,9 @@ mod tests {
         let default = ir_style::ComputedStyle::default();
         for &field in ALL_FIELDS {
             let extracted = extract_ir_field(&default, field);
-            if field == IrField::BoxAlign {
-                // Default margins are `auto`, which BoxAlign maps to center.
-                assert_eq!(extracted, Some("center".to_string()));
-            } else {
-                assert_eq!(extracted, None, "{field:?} non-None on default style");
-            }
+            // A fully-default style extracts nothing — including BoxAlign,
+            // which no longer centers on unset (all-auto) margins.
+            assert_eq!(extracted, None, "{field:?} non-None on default style");
         }
     }
 
@@ -3071,8 +3080,10 @@ mod tests {
     fn test_box_align_from_margin_auto() {
         use crate::style::{ComputedStyle, Length};
 
-        // margin-left: auto + margin-right: auto → box_align: center
+        // `margin: 0 auto` → left/right auto, top/bottom explicit → center.
         let mut style = ComputedStyle::default();
+        style.margin_top = Length::Px(0.0);
+        style.margin_bottom = Length::Px(0.0);
         style.margin_left = Length::Auto;
         style.margin_right = Length::Auto;
 
@@ -3081,16 +3092,20 @@ mod tests {
     }
 
     #[test]
-    fn test_box_align_not_emitted_without_both_auto() {
+    fn test_box_align_not_emitted_for_unset_margins() {
         use crate::style::{ComputedStyle, Length};
 
-        // Only margin-left: auto is not enough
+        // A width-constrained box with UNSET margins (all four default Auto)
+        // must NOT center — it renders left-aligned in CSS.
+        let mut style = ComputedStyle::default();
+        style.width = Length::Px(200.0);
+        assert_eq!(extract_ir_field(&style, IrField::BoxAlign), None);
+
+        // Only margin-left: auto is not enough either.
         let mut style = ComputedStyle::default();
         style.margin_left = Length::Auto;
         style.margin_right = Length::Px(0.0);
-
-        let result = extract_ir_field(&style, IrField::BoxAlign);
-        assert_eq!(result, None);
+        assert_eq!(extract_ir_field(&style, IrField::BoxAlign), None);
     }
 
     // ========================================================================

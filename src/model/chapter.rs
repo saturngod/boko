@@ -231,18 +231,24 @@ impl Iterator for DfsIter<'_> {
         let current = self.next?;
 
         // Descend to the first child; else move to the next sibling; else
-        // climb through ancestors until one has a next sibling.
+        // climb through ancestors until one has a next sibling. The climb is
+        // bounded by the node count: a well-formed ancestor chain is shorter
+        // than that, so exceeding it means a corrupt parent-pointer cycle
+        // (unreachable via the construction API, but the old stack iterator
+        // never read `parent` and so couldn't hang on one) — terminate
+        // instead of spinning forever.
         self.next = self.chapter.node(current).and_then(|node| {
             if let Some(child) = node.first_child {
                 return Some(child);
             }
             let mut n = node;
-            loop {
+            for _ in 0..self.chapter.node_count() {
                 if let Some(sib) = n.next_sibling {
                     return Some(sib);
                 }
                 n = self.chapter.node(n.parent?)?;
             }
+            None
         });
 
         Some(current)

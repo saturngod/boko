@@ -128,24 +128,35 @@ impl Skeleton {
     /// rendering a part; `chunk_table.insert_pos` and `pos_fid` offsets are
     /// in *this* coordinate space, not in the rawML layout.
     pub fn rebuild(&self) -> Vec<u8> {
-        // Sort chunks by their position-within-skel so multiple chunks per
-        // skel insert in order. (In the current writer there's always one
-        // chunk per skel, but the math is the same.)
+        // The skeleton is `prefix ++ suffix` with the whole body region cut
+        // out, and the chunks are that body region split by size into
+        // contiguous pieces. So every chunk inserts at the SAME point — where
+        // the body was removed — in order. `insert_pos - start_pos` is in
+        // reassembled coordinates (prefix ++ body ++ suffix), which for the
+        // 2nd+ chunk exceeds `skeleton.len()`; using it per-chunk (and
+        // clamping) spliced the suffix between chunks and corrupted every
+        // aid offset past the first ~8 KB. The first chunk's rel_pos is the
+        // true body-removal boundary.
         let mut chunks: Vec<&Chunk> = self.chunks.iter().collect();
         chunks.sort_by_key(|c| c.insert_pos);
+
+        let boundary = chunks
+            .first()
+            .map(|c| {
+                c.insert_pos
+                    .saturating_sub(self.start_pos)
+                    .min(self.skeleton.len())
+            })
+            .unwrap_or(self.skeleton.len());
 
         let mut result = Vec::with_capacity(
             self.skeleton.len() + chunks.iter().map(|c| c.raw.len()).sum::<usize>(),
         );
-        let mut skel_cursor = 0;
+        result.extend_from_slice(&self.skeleton[..boundary]);
         for chunk in chunks {
-            let rel_pos = chunk.insert_pos.saturating_sub(self.start_pos);
-            let rel_pos = rel_pos.min(self.skeleton.len());
-            result.extend_from_slice(&self.skeleton[skel_cursor..rel_pos]);
             result.extend_from_slice(&chunk.raw);
-            skel_cursor = rel_pos;
         }
-        result.extend_from_slice(&self.skeleton[skel_cursor..]);
+        result.extend_from_slice(&self.skeleton[boundary..]);
         result
     }
 }
@@ -662,6 +673,69 @@ mod chunker_tests {
         let chunks = split_body_into_chunks(b"", 8192);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].is_empty());
+    }
+
+    #[test]
+    fn rebuild_keeps_multi_chunk_body_contiguous() {
+        // A body larger than CHUNK_SIZE splits into several chunks. rebuild()
+        // must reassemble them contiguously between the scaffold prefix and
+        // suffix — it used to splice the </body></html> suffix between the
+        // first and second chunk, corrupting every aid offset past ~8 KB.
+        let prefix = b"<html><head></head><body aid=\"0000\">";
+        let suffix = b"</body></html>";
+        let chunk_a = vec![b'A'; CHUNK_SIZE]; // fills the first chunk
+        let chunk_b = b"<p>tail paragraph</p>".to_vec();
+        let start_pos = 0;
+
+        let skeleton: Vec<u8> = prefix.iter().chain(suffix.iter()).copied().collect();
+        let base = start_pos + prefix.len();
+        let skel = Skeleton {
+            file_number: 0,
+            skeleton,
+            start_pos,
+            chunks: vec![
+                Chunk {
+                    raw: chunk_a.clone(),
+                    insert_pos: base,
+                    selector: String::new(),
+                    file_number: 0,
+                    sequence_number: 0,
+                    start_pos: 0,
+                },
+                Chunk {
+                    raw: chunk_b.clone(),
+                    insert_pos: base + chunk_a.len(),
+                    selector: String::new(),
+                    file_number: 0,
+                    sequence_number: 1,
+                    start_pos: chunk_a.len(),
+                },
+            ],
+        };
+
+        let rebuilt = skel.rebuild();
+        let expected: Vec<u8> = prefix
+            .iter()
+            .chain(chunk_a.iter())
+            .chain(chunk_b.iter())
+            .chain(suffix.iter())
+            .copied()
+            .collect();
+        assert_eq!(rebuilt, expected, "suffix must follow all body chunks");
+        // The tail paragraph must appear after the bulk body, not before the
+        // suffix-that-used-to-be-spliced-early.
+        let body_end = rebuilt
+            .windows(suffix.len())
+            .position(|w| w == suffix)
+            .unwrap();
+        let tail = rebuilt
+            .windows(chunk_b.len())
+            .position(|w| w == chunk_b.as_slice())
+            .unwrap();
+        assert!(
+            tail < body_end,
+            "tail chunk must precede the closing suffix"
+        );
     }
 
     #[test]

@@ -88,9 +88,14 @@ fn descendant_book() -> EpubBuilder {
 // whitespace between two inline siblings (poetry `<span>…</span>\n<br/>`,
 // colophon text before links) is now preserved as a single space instead of
 // being dropped, which previously glued words together ("toEpictetus").
-const FP_EPICTETUS: &str = "0d8b98b70173bfaa610327ea3e4246a6cff26750";
-const FP_CLASS: &str = "8e084650371da2cab255c51438fd8bdb401ebc42";
-const FP_DESCENDANT: &str = "e6c0a96d4233a78a589342f442811d84bd15c23f";
+// Updated again for semantic-marker preservation: synthesized documents now
+// declare `xmlns:epub` on <html> and re-emit epub:type / ARIA role / datetime
+// (928 epub:type markers survive the epictetus round trip). The matched
+// cascade declarations are unchanged — only the emitted markup gained
+// attributes.
+const FP_EPICTETUS: &str = "75fa8416a3fa70d69b9411979190ad3e32b56791";
+const FP_CLASS: &str = "0011593d1051d42ce417aa0bd9d63012fdaf42b7";
+const FP_DESCENDANT: &str = "76e77d1c07d7156e03e6549241d920c6d935aae2";
 
 #[test]
 fn cascade_output_is_stable_epictetus() {
