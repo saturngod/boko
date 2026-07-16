@@ -39,7 +39,7 @@ pub use node::{Node, NodeId, Role, TextRange};
 pub use semantic::SemanticMap;
 
 // Re-export link types
-pub use links::{AnchorTarget, ChapterId, GlobalNodeId, InternalLocation, Link, LinkTarget};
+pub use links::{AnchorTarget, ChapterId, GlobalNodeId};
 
 // Re-export resolved links (moved to crate::resolved; kept here so
 // `boko::model::ResolvedLinks` remains a valid path)

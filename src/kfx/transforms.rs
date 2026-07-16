@@ -7,7 +7,7 @@
 //! ## Example
 //!
 //! A KFX link like `kindle:pos:fid:0001:off:0000012A` needs to be:
-//! - **Import**: Parsed into `LinkTarget::KindlePosition { fid, offset }`
+//! - **Import**: Parsed into an `(fid, offset)` position pair
 //! - **Export**: Encoded back to the `kindle:pos:...` string format
 
 use std::collections::HashMap;
