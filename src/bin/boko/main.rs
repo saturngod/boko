@@ -701,11 +701,8 @@ fn dump_ir_json(book: &mut Book, path: &str, opts: &DumpOptions) -> Result<(), S
     for (id, source_path) in chapter_ids {
         let chapter = book.load_chapter(id).map_err(|e| e.to_string())?;
 
-        let tree = if opts.styles_only {
-            None
-        } else {
-            Some(dump_node_json(&chapter, NodeId::ROOT, opts, 0))
-        };
+        // styles_only returned early above, so tree is always emitted here.
+        let tree = Some(dump_node_json(&chapter, NodeId::ROOT, opts, 0));
 
         info.chapters.push(ChapterDump {
             id: id.0,
