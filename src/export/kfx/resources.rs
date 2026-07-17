@@ -65,6 +65,21 @@ pub(super) fn build_resource_fragment(
     KfxFragment::raw(KfxSymbol::Bcrawmedia as u64, &raw_name, data)
 }
 
+/// Build a bcRawFont fragment ($418) - raw font bytes.
+///
+/// Shares the `resource/{name}` fid the $262 font entity's location field
+/// points at, mirroring `build_resource_fragment` for images.
+pub(super) fn build_font_data_fragment(
+    href: &str,
+    data: Vec<u8>,
+    ctx: &mut ExportContext,
+) -> KfxFragment {
+    let resource_name = generate_resource_name(href, ctx);
+    let raw_name = format!("resource/{}", resource_name);
+    ctx.symbols.get_or_intern(&raw_name);
+    KfxFragment::raw(KfxSymbol::Bcrawfont as u64, &raw_name, data)
+}
+
 /// Build font entity fragments ($262) from @font-face rules.
 ///
 /// Font entities link font_family names (e.g., "cover-Ubuntu") to resource locations.
@@ -141,22 +156,10 @@ pub(super) fn build_font_fragments(book: &Book, ctx: &mut ExportContext) -> Vec<
             ),
         ]);
 
-        // Generate unique fragment name for this font face
-        let frag_name = format!(
-            "font-{}-{}-{}",
-            font_face.font_family,
-            if font_face.font_weight.0 >= 700 {
-                "bold"
-            } else {
-                "normal"
-            },
-            match font_face.font_style {
-                FontStyle::Italic | FontStyle::Oblique => "italic",
-                FontStyle::Normal => "normal",
-            }
-        );
-
-        fragments.push(KfxFragment::new(KfxSymbol::Font, &frag_name, ion));
+        // Font entities are ROOT fragments (unnamed, id = the $262 type
+        // itself, several allowed) in Amazon output; a named $262 decodes as
+        // an unexpected root id in reference tooling.
+        fragments.push(KfxFragment::singleton(KfxSymbol::Font, ion));
     }
 
     fragments

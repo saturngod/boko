@@ -609,7 +609,8 @@ mod tests {
 
     #[test]
     fn test_content_features_fragment() {
-        let frag = build_content_features_fragment();
+        let ctx = ExportContext::new();
+        let frag = build_content_features_fragment(&ctx);
 
         // Should be $585 (content_features) type
         assert_eq!(frag.ftype, KfxSymbol::ContentFeatures as u64);
@@ -627,11 +628,24 @@ mod tests {
                     "content_features should contain features"
                 );
 
-                // Features should be a list with 3 items
+                // Baseline features only (no HDV image / RST-marker JPEG in
+                // this empty context): reflow-style + CanonicalFormat.
                 if let Some((_, IonValue::List(items))) = features {
-                    assert_eq!(items.len(), 3, "should have 3 feature entries");
+                    assert_eq!(items.len(), 2, "should have 2 baseline feature entries");
                 } else {
                     panic!("features should be a list");
+                }
+
+                // Media-derived features appear when the resource pass saw them.
+                let mut hdv_ctx = ExportContext::new();
+                hdv_ctx.has_hdv_image = true;
+                hdv_ctx.jpg_rst_marker_present = true;
+                let hdv_frag = build_content_features_fragment(&hdv_ctx);
+                if let crate::kfx::fragment::FragmentData::Ion(IonValue::Struct(f)) = &hdv_frag.data
+                    && let Some((_, IonValue::List(items))) =
+                        f.iter().find(|(id, _)| *id == KfxSymbol::Features as u64)
+                {
+                    assert_eq!(items.len(), 4, "HDV + RST flags add two entries");
                 }
             } else {
                 panic!("expected Struct");
@@ -737,7 +751,8 @@ mod tests {
     #[test]
     fn test_singleton_uses_null_symbol() {
         // Build a singleton fragment and serialize it
-        let frags = [build_content_features_fragment()];
+        let ctx = ExportContext::new();
+        let frags = [build_content_features_fragment(&ctx)];
         let local_symbols: Vec<String> = vec![];
         let entities = serialize_fragments(&frags, &local_symbols);
 

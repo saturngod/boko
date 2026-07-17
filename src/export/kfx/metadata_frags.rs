@@ -108,10 +108,16 @@ pub(super) fn build_book_metadata_fragment(
         .iter()
         .map(|&cat| {
             let entries = build_category_entries(cat, meta, &meta_ctx);
-            let ion_entries: Vec<IonValue> = entries
+            let mut ion_entries: Vec<IonValue> = entries
                 .into_iter()
                 .map(|(k, v)| metadata_kv(k, &v))
                 .collect();
+            // Boolean flags the reference always carries; they don't fit the
+            // string-valued schema, so they're emitted directly.
+            if cat == MetadataCategory::KindleTitle {
+                ion_entries.push(metadata_kv_bool("is_sample", false));
+                ion_entries.push(metadata_kv_bool("override_kindle_font", false));
+            }
 
             IonValue::Struct(vec![
                 (
@@ -139,80 +145,68 @@ pub(super) fn metadata_kv(key: &str, value: &str) -> IonValue {
     ])
 }
 
+/// Helper to create a metadata key-value struct with a boolean value.
+fn metadata_kv_bool(key: &str, value: bool) -> IonValue {
+    IonValue::Struct(vec![
+        (KfxSymbol::Key as u64, IonValue::String(key.to_string())),
+        (KfxSymbol::Value as u64, IonValue::Bool(value)),
+    ])
+}
+
 /// Build the content features fragment ($585).
 ///
 /// This describes the content capabilities/features of the book.
-pub(super) fn build_content_features_fragment() -> KfxFragment {
-    // Build feature entries matching reference KFX
-    let reflow_style = IonValue::Struct(vec![
-        (
-            KfxSymbol::Namespace as u64,
-            IonValue::String("com.amazon.yjconversion".to_string()),
-        ),
-        (
-            KfxSymbol::Key as u64,
-            IonValue::String("reflow-style".to_string()),
-        ),
-        (
-            KfxSymbol::VersionInfo as u64,
-            IonValue::Struct(vec![(
-                KfxSymbol::Version as u64,
-                IonValue::Struct(vec![
-                    (KfxSymbol::MajorVersion as u64, IonValue::Int(6)),
-                    (KfxSymbol::MinorVersion as u64, IonValue::Int(0)),
-                ]),
-            )]),
-        ),
-    ]);
+pub(super) fn build_content_features_fragment(ctx: &ExportContext) -> KfxFragment {
+    // Build feature entries matching reference KFX. Baseline features are
+    // unconditional; media-derived features (yj_hdv, yj_jpg_rst_marker_present)
+    // depend on facts gathered during the resource pass, so the fragment is
+    // rebuilt after resources are appended (see build_kfx_container).
+    let mut features = vec![
+        feature_entry("com.amazon.yjconversion", "reflow-style", 6),
+        feature_entry("SDK.Marker", "CanonicalFormat", 1),
+    ];
 
-    let canonical_format = IonValue::Struct(vec![
-        (
-            KfxSymbol::Namespace as u64,
-            IonValue::String("SDK.Marker".to_string()),
-        ),
-        (
-            KfxSymbol::Key as u64,
-            IonValue::String("CanonicalFormat".to_string()),
-        ),
-        (
-            KfxSymbol::VersionInfo as u64,
-            IonValue::Struct(vec![(
-                KfxSymbol::Version as u64,
-                IonValue::Struct(vec![
-                    (KfxSymbol::MajorVersion as u64, IonValue::Int(1)),
-                    (KfxSymbol::MinorVersion as u64, IonValue::Int(0)),
-                ]),
-            )]),
-        ),
-    ]);
+    // HDV ("high-definition variant") declares images above the classic
+    // 1920px bound; the reference only emits it when such an image exists.
+    if ctx.has_hdv_image {
+        features.push(feature_entry("com.amazon.yjconversion", "yj_hdv", 1));
+    }
 
-    let yj_hdv = IonValue::Struct(vec![
-        (
-            KfxSymbol::Namespace as u64,
-            IonValue::String("com.amazon.yjconversion".to_string()),
-        ),
-        (
-            KfxSymbol::Key as u64,
-            IonValue::String("yj_hdv".to_string()),
-        ),
-        (
-            KfxSymbol::VersionInfo as u64,
-            IonValue::Struct(vec![(
-                KfxSymbol::Version as u64,
-                IonValue::Struct(vec![
-                    (KfxSymbol::MajorVersion as u64, IonValue::Int(1)),
-                    (KfxSymbol::MinorVersion as u64, IonValue::Int(0)),
-                ]),
-            )]),
-        ),
-    ]);
+    // Declared when any JPEG payload contains restart markers (FF D0-D7);
+    // renderers use it to enable segmented decoding.
+    if ctx.jpg_rst_marker_present {
+        features.push(feature_entry(
+            "com.amazon.yjconversion",
+            "yj_jpg_rst_marker_present",
+            1,
+        ));
+    }
 
-    let content_features = IonValue::Struct(vec![(
-        KfxSymbol::Features as u64,
-        IonValue::List(vec![reflow_style, canonical_format, yj_hdv]),
-    )]);
+    let content_features =
+        IonValue::Struct(vec![(KfxSymbol::Features as u64, IonValue::List(features))]);
 
     KfxFragment::singleton(KfxSymbol::ContentFeatures, content_features)
+}
+
+/// Build one $585 feature entry: `{namespace, key, version_info: {version}}`.
+fn feature_entry(namespace: &str, key: &str, major: i64) -> IonValue {
+    IonValue::Struct(vec![
+        (
+            KfxSymbol::Namespace as u64,
+            IonValue::String(namespace.to_string()),
+        ),
+        (KfxSymbol::Key as u64, IonValue::String(key.to_string())),
+        (
+            KfxSymbol::VersionInfo as u64,
+            IonValue::Struct(vec![(
+                KfxSymbol::Version as u64,
+                IonValue::Struct(vec![
+                    (KfxSymbol::MajorVersion as u64, IonValue::Int(major)),
+                    (KfxSymbol::MinorVersion as u64, IonValue::Int(0)),
+                ]),
+            )]),
+        ),
+    ])
 }
 
 /// Build the document data fragment ($538).

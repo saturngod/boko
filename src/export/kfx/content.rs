@@ -302,7 +302,7 @@ mod entity_structure_tests {
         // Pass 2: Build fragments in correct order
         let mut fragments = Vec::new();
 
-        fragments.push(build_content_features_fragment());
+        fragments.push(build_content_features_fragment(&ctx));
         fragments.push(build_book_metadata_fragment(&book, &container_id, &ctx));
         fragments.push(build_metadata_fragment(&ctx));
         fragments.push(build_document_data_fragment(&ctx));

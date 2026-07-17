@@ -110,7 +110,7 @@ fn build_kfx_container(book: &Book) -> crate::Result<Vec<u8>> {
     // M+. content ($145) - all together
 
     // 2a. Content features fragment ($585)
-    fragments.push(build_content_features_fragment());
+    fragments.push(build_content_features_fragment(&ctx));
 
     // 2b. Book metadata fragment ($490) - contains categorised_metadata
     fragments.push(build_book_metadata_fragment(book, &container_id, &ctx));
@@ -164,6 +164,11 @@ fn build_kfx_container(book: &Book) -> crate::Result<Vec<u8>> {
     // 2j-2. Font entity fragments ($262)
     // These link font_family names to resource locations (from @font-face rules)
     fragments.extend(build_font_fragments(book, &mut ctx));
+
+    // Rebuild content_features ($585) now that the resource pass has
+    // determined the media-derived flags (HDV images, JPEG restart markers);
+    // the copy pushed before chapters was a placeholder for ordering.
+    fragments[0] = build_content_features_fragment(&ctx);
 
     // 2k. Navigation maps for reader functionality
     fragments.push(build_position_map_fragment(&ctx));
@@ -511,14 +516,113 @@ fn append_resource_fragments(
     fragments: &mut Vec<KfxFragment>,
     ctx: &mut ExportContext,
 ) {
+    // Fonts referenced from @font-face rules; anything else is unreachable
+    // in KFX (nothing can point at it) and the reference omits it.
+    let font_faces = book.font_faces();
+    let font_is_referenced = |asset_path: &str| {
+        font_faces.iter().any(|ff| {
+            ff.src == asset_path
+                || std::path::Path::new(&ff.src)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|f| asset_path.ends_with(f))
+        })
+    };
+
+    // Images actually referenced from emitted Ion (storyline image elements,
+    // cover section templates). Registry membership is not enough: srcs are
+    // registered during tokenization even when the element never reaches the
+    // output (e.g. CSS background images), and an unreachable resource is a
+    // conformance error.
+    let used_resource_symbols = collect_used_resource_symbols(fragments);
+
     for asset_path in book.list_assets() {
         if is_media_asset(book, asset_path)
             && let Ok(data) = book.load_asset(asset_path)
         {
+            if detect_media_format(asset_path, &data).is_font() {
+                // Fonts are bcRawFont ($418) referenced by location from the
+                // root $262 font entities — no external_resource wrapper.
+                // Wrapping them as $417 + image-typed $164 makes reference
+                // tooling flag them as bad/unreferenced images.
+                if font_is_referenced(asset_path) {
+                    fragments.push(build_font_data_fragment(asset_path, data, ctx));
+                }
+                continue;
+            }
+            let referenced = ctx
+                .resource_registry
+                .get_name(asset_path)
+                .and_then(|name| ctx.symbols.get(name))
+                .is_some_and(|sym| used_resource_symbols.contains(&sym));
+            if !referenced {
+                continue;
+            }
+            record_media_features(&data, ctx);
             // external_resource ($164) - metadata about the resource
             fragments.push(build_external_resource_fragment(asset_path, &data, ctx));
             // bcRawMedia ($417) - the actual bytes (moved, not copied)
             fragments.push(build_resource_fragment(asset_path, data, ctx));
+        }
+    }
+}
+
+/// Collect every resource-name symbol referenced from already-built fragments.
+fn collect_used_resource_symbols(fragments: &[KfxFragment]) -> BTreeSet<u64> {
+    fn walk(value: &IonValue, used: &mut BTreeSet<u64>) {
+        match value {
+            IonValue::Struct(fields) => {
+                for (key, val) in fields {
+                    if *key == KfxSymbol::ResourceName as u64
+                        && let IonValue::Symbol(sym) = val
+                    {
+                        used.insert(*sym);
+                    }
+                    walk(val, used);
+                }
+            }
+            IonValue::List(items) => {
+                for item in items {
+                    walk(item, used);
+                }
+            }
+            IonValue::Annotated(_, inner) => walk(inner, used),
+            _ => {}
+        }
+    }
+
+    let mut used = BTreeSet::new();
+    for fragment in fragments {
+        if let crate::kfx::fragment::FragmentData::Ion(value) = &fragment.data {
+            walk(value, &mut used);
+        }
+    }
+    used
+}
+
+/// Record media facts that drive conditional content features ($585).
+fn record_media_features(data: &[u8], ctx: &mut ExportContext) {
+    if !ctx.has_hdv_image
+        && let Some((width, height)) = crate::util::extract_image_dimensions(data)
+        && (width > 1920 || height > 1920)
+    {
+        ctx.has_hdv_image = true;
+    }
+
+    // JPEG restart markers (FF D0-D7) enable segmented decoding; the flag
+    // must reflect their presence in any JPEG payload.
+    if !ctx.jpg_rst_marker_present && data.starts_with(&[0xFF, 0xD8]) {
+        let mut i = 0;
+        while let Some(pos) = memchr::memchr(0xFF, &data[i..]) {
+            let at = i + pos;
+            match data.get(at + 1) {
+                Some(b) if (0xD0..=0xD7).contains(b) => {
+                    ctx.jpg_rst_marker_present = true;
+                    break;
+                }
+                Some(_) => i = at + 1,
+                None => break,
+            }
         }
     }
 }

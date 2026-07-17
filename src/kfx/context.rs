@@ -682,6 +682,15 @@ pub struct ExportContext {
     /// Content fragment ID for standalone cover.
     pub cover_content_id: Option<u64>,
 
+    /// Any image resource exceeds the classic 1920px bound (drives the
+    /// `yj_hdv` content feature). Set during the resource pass.
+    pub has_hdv_image: bool,
+
+    /// Any JPEG resource contains restart markers FF D0-D7 (drives the
+    /// `yj_jpg_rst_marker_present` content feature). Set during the resource
+    /// pass.
+    pub jpg_rst_marker_present: bool,
+
     /// Chapters that need chapter-start anchors.
     chapters_needing_anchor: HashSet<ChapterId>,
 
@@ -763,6 +772,8 @@ impl ExportContext {
             heading_positions: Vec::new(),
             cover_fragment_id: None,
             cover_content_id: None,
+            has_hdv_image: false,
+            jpg_rst_marker_present: false,
             chapters_needing_anchor: HashSet::new(),
             pending_chapter_anchor: None,
             first_content_ids: HashMap::new(),
