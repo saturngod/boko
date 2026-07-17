@@ -58,106 +58,152 @@ pub(super) fn build_position_map_fragment(ctx: &ExportContext) -> KfxFragment {
     KfxFragment::singleton(KfxSymbol::PositionMap, ion)
 }
 
+/// One entry in the book's ordered position stream.
+struct PositionChunk {
+    /// Element id.
+    eid: u64,
+    /// Position count this element covers (chars for text, 1 for rendered
+    /// elements and page templates).
+    length: i64,
+    /// Ordinal of the section this element belongs to.
+    section: usize,
+}
+
+/// The ordered position stream backing both `$265` and `$550`.
+///
+/// Reading order, exactly as the renderer walks the book: for each section,
+/// its page-template eid (one position) followed by its content eids. This
+/// matches the reference position accounting — omitting the page-template
+/// eids (or ordering by fragment id rather than reading order) makes every
+/// later pid disagree with what the reader computes.
+fn position_chunks(ctx: &ExportContext) -> Vec<PositionChunk> {
+    let content_len = |eid: u64| -> i64 {
+        ctx.content_id_lengths
+            .get(&eid)
+            .copied()
+            .unwrap_or(1)
+            .max(1) as i64
+    };
+
+    let mut chunks = Vec::new();
+    let mut section = 0usize;
+
+    // Standalone cover section (c0): page template, then the cover image.
+    if let Some(cover_fid) = ctx.cover_fragment_id {
+        chunks.push(PositionChunk {
+            eid: cover_fid,
+            length: 1,
+            section,
+        });
+        if let Some(content_id) = ctx.cover_content_id {
+            chunks.push(PositionChunk {
+                eid: content_id,
+                length: content_len(content_id),
+                section,
+            });
+        }
+        section += 1;
+    }
+
+    // Spine sections in reading order, pairing each with its chapter by key
+    // (an unloadable chapter has no fragment id and must not shift others).
+    for &(_, chapter_id) in &ctx.spine_section_chapters {
+        let Some(&fragment_id) = ctx.chapter_fragments.get(&chapter_id) else {
+            continue;
+        };
+        chunks.push(PositionChunk {
+            eid: fragment_id,
+            length: 1,
+            section,
+        });
+        if let Some(content_ids) = ctx.content_ids_by_chapter.get(&chapter_id) {
+            for &eid in content_ids {
+                chunks.push(PositionChunk {
+                    eid,
+                    length: content_len(eid),
+                    section,
+                });
+            }
+        }
+        section += 1;
+    }
+
+    chunks
+}
+
 /// Build position_id_map fragment ($265).
 ///
-/// Maps cumulative character positions (PIDs) to EIDs. This enables
-/// reading progress tracking and "go to position" functionality.
-///
-/// Reference format: Sequential PIDs (0, 1, 2...) for initial entries,
-/// then character position offsets for content fragments.
+/// Maps cumulative positions (PIDs) to EIDs, walking the position stream in
+/// reading order. Terminated by the required `{eid: 0, pid: total}` entry.
 pub(super) fn build_position_id_map_fragment(ctx: &ExportContext) -> KfxFragment {
     let mut entries = Vec::new();
     let mut pid = 0i64;
 
-    // Process cover content ID first if present
-    if let Some(cover_id) = ctx.cover_content_id {
-        let content_len = ctx
-            .content_id_lengths
-            .get(&cover_id)
-            .copied()
-            .unwrap_or(1)
-            .max(1) as i64;
-
+    for chunk in position_chunks(ctx) {
         // Note: eid comes first, then pid - matching Amazon's format
-        // Note: offset field is omitted when zero (Amazon's format doesn't include it)
-        let entry = IonValue::Struct(vec![
-            (KfxSymbol::Eid as u64, IonValue::Int(cover_id as i64)),
+        entries.push(IonValue::Struct(vec![
+            (KfxSymbol::Eid as u64, IonValue::Int(chunk.eid as i64)),
             (KfxSymbol::Pid as u64, IonValue::Int(pid)),
-        ]);
-        entries.push(entry);
-        pid += content_len;
-    }
-
-    // Process chapter content in order (sorted by fragment ID)
-    let mut chapter_entries: Vec<_> = ctx.chapter_fragments.iter().collect();
-    chapter_entries.sort_by_key(|(_, fid)| **fid);
-
-    for (chapter_id, _) in &chapter_entries {
-        if let Some(content_ids) = ctx.content_ids_by_chapter.get(chapter_id) {
-            for &eid in content_ids {
-                let content_len = ctx
-                    .content_id_lengths
-                    .get(&eid)
-                    .copied()
-                    .unwrap_or(1)
-                    .max(1) as i64;
-
-                // Note: eid comes first, then pid - matching Amazon's format
-                // Note: offset field is omitted when zero
-                let entry = IonValue::Struct(vec![
-                    (KfxSymbol::Eid as u64, IonValue::Int(eid as i64)),
-                    (KfxSymbol::Pid as u64, IonValue::Int(pid)),
-                ]);
-                entries.push(entry);
-                pid += content_len;
-            }
-        }
+        ]));
+        pid += chunk.length;
     }
 
     // Add terminator entry with eid=0 and pid=max_pid
     // This is required by Amazon's format to indicate the end of content
     // and provides the max position ID for location count calculation
-    let terminator = IonValue::Struct(vec![
+    entries.push(IonValue::Struct(vec![
         (KfxSymbol::Eid as u64, IonValue::Int(0)),
         (KfxSymbol::Pid as u64, IonValue::Int(pid)),
-    ]);
-    entries.push(terminator);
+    ]));
 
     let ion = IonValue::List(entries);
     KfxFragment::singleton(KfxSymbol::PositionIdMap, ion)
 }
 
+/// Positions per Kindle "Location" (Amazon's constant).
+const KFX_POSITIONS_PER_LOCATION: i64 = 110;
+
 /// Build location_map fragment ($550).
 ///
-/// Maps location numbers to positions. Each content block gets one entry
-/// at offset 0 (matching Amazon's format for this entity).
+/// One location per [`KFX_POSITIONS_PER_LOCATION`] positions, with the
+/// counter restarting at every section boundary; a location that lands
+/// inside a long text element carries its offset within that element.
+/// Mirrors the reference `generate_approximate_locations`.
 pub(super) fn build_location_map_fragment(ctx: &ExportContext) -> KfxFragment {
     let mut location_entries = Vec::new();
+    let mut pid = 0i64;
+    let mut next_loc_position = 0i64;
+    let mut current_section = None;
 
-    // Helper closure to process a single content ID - always offset 0
-    let mut process_content_id = |content_id: u64| {
-        let entry = IonValue::Struct(vec![
-            (KfxSymbol::Id as u64, IonValue::Int(content_id as i64)),
-            (KfxSymbol::Offset as u64, IonValue::Int(0)),
-        ]);
-        location_entries.push(entry);
-    };
+    for chunk in position_chunks(ctx) {
+        let mut eid_loc_offset = 0i64;
+        let mut loc_pid = pid;
 
-    // Process cover content ID first if present
-    if let Some(cover_id) = ctx.cover_content_id {
-        process_content_id(cover_id);
-    }
-
-    // Process chapter content in order (sorted by fragment ID)
-    let mut chapter_entries: Vec<_> = ctx.chapter_fragments.iter().collect();
-    chapter_entries.sort_by_key(|(_, fid)| **fid);
-
-    for (chapter_id, _) in &chapter_entries {
-        if let Some(content_ids) = ctx.content_ids_by_chapter.get(chapter_id) {
-            for &content_id in content_ids {
-                process_content_id(content_id);
-            }
+        if current_section != Some(chunk.section) {
+            next_loc_position = loc_pid;
+            current_section = Some(chunk.section);
         }
+
+        loop {
+            if loc_pid == next_loc_position {
+                location_entries.push(IonValue::Struct(vec![
+                    (KfxSymbol::Id as u64, IonValue::Int(chunk.eid as i64)),
+                    (KfxSymbol::Offset as u64, IonValue::Int(eid_loc_offset)),
+                ]));
+                next_loc_position += KFX_POSITIONS_PER_LOCATION;
+            }
+
+            let eid_remaining = chunk.length - eid_loc_offset;
+            let loc_remaining = next_loc_position - loc_pid;
+            if eid_remaining <= loc_remaining {
+                break;
+            }
+
+            eid_loc_offset += loc_remaining;
+            loc_pid = next_loc_position;
+        }
+
+        pid += chunk.length;
     }
 
     // Wrap in locations list structure

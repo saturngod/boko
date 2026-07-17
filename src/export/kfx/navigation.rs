@@ -944,12 +944,12 @@ mod tests {
         use crate::ChapterId;
 
         let mut ctx = ExportContext::new();
-        ctx.register_section("c0");
-        ctx.register_section("c1");
 
-        // Simulate two chapters with multiple content IDs each
+        // Simulate two spine chapters with multiple content IDs each
         let chapter1 = ChapterId(1);
         let chapter2 = ChapterId(2);
+        ctx.register_spine_section("c0", chapter1);
+        ctx.register_spine_section("c1", chapter2);
 
         // Add content IDs for each chapter
         ctx.content_ids_by_chapter
@@ -969,11 +969,12 @@ mod tests {
 
         // Extract and verify the position_id_map entries
         if let crate::kfx::fragment::FragmentData::Ion(IonValue::List(entries)) = &frag.data {
-            // Should have 6 entries (100, 101, 102, 200, 201) + 1 terminator (eid=0)
+            // One entry per page-template eid (90, 95) and content ID
+            // (100, 101, 102, 200, 201), plus the eid=0 terminator.
             assert_eq!(
                 entries.len(),
-                6,
-                "position_id_map should have one entry per content ID plus terminator"
+                8,
+                "position_id_map should cover section templates, content IDs, and terminator"
             );
 
             // Extract all eids
@@ -997,12 +998,12 @@ mod tests {
                 })
                 .collect();
 
-            // Should contain all content IDs
-            assert!(eids.contains(&100), "should contain content ID 100");
-            assert!(eids.contains(&101), "should contain content ID 101");
-            assert!(eids.contains(&102), "should contain content ID 102");
-            assert!(eids.contains(&200), "should contain content ID 200");
-            assert!(eids.contains(&201), "should contain content ID 201");
+            // Reading order: section template, its content, next section...
+            assert_eq!(
+                eids,
+                vec![90, 100, 101, 102, 95, 200, 201, 0],
+                "entries must follow reading order with the terminator last"
+            );
         } else {
             panic!("expected List data");
         }
