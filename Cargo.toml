@@ -107,3 +107,8 @@ codegen-units = 1
 # fields, but keep overflow checks on in release so any missed site aborts
 # loudly instead of silently wrapping to a bogus offset.
 overflow-checks = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
