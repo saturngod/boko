@@ -95,6 +95,11 @@ pub struct Metadata {
     pub author_sort: Option<String>,
     /// belongs-to-collection (series info)
     pub collection: Option<CollectionInfo>,
+    /// Global reading direction from the OPF spine's
+    /// `page-progression-direction` (`"ltr"`, `"rtl"`, or `"default"`).
+    /// Right-to-left books (Arabic, Hebrew, vertical Japanese) lose their
+    /// reading order without it.
+    pub page_progression_direction: Option<String>,
 }
 
 /// A table of contents entry (hierarchical)

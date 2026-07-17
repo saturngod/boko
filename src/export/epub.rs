@@ -731,8 +731,16 @@ fn generate_opf(
     }
     opf.push_str("  </manifest>\n");
 
-    // Spine
-    opf.push_str("  <spine toc=\"ncx\">\n");
+    // Spine. Preserve the global reading direction (RTL books) when the
+    // source declared one and it isn't the default.
+    match metadata.page_progression_direction.as_deref() {
+        Some(dir @ ("rtl" | "ltr")) => {
+            opf.push_str(&format!(
+                "  <spine toc=\"ncx\" page-progression-direction=\"{dir}\">\n"
+            ));
+        }
+        _ => opf.push_str("  <spine toc=\"ncx\">\n"),
+    }
     for id in spine_refs {
         opf.push_str(&format!("    <itemref idref=\"{}\"/>\n", escape_xml(id)));
     }

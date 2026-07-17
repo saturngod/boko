@@ -87,3 +87,42 @@ fn kfx_to_azw3_toc_targets_are_distinct() {
         "TOC entries collapsed to too few targets: {hrefs:?}"
     );
 }
+
+#[test]
+fn rtl_page_progression_direction_survives_epub_roundtrip() {
+    use common::{Doc, EpubBuilder, Nav};
+
+    let epub = EpubBuilder::new("RTL Book")
+        .language("ar")
+        .direction("rtl")
+        .doc(Doc::new(
+            "text/ch1.xhtml",
+            "الفصل",
+            "<h1>عنوان</h1><p>نص عربي.</p>",
+        ))
+        .nav(vec![Nav::new("عنوان", "text/ch1.xhtml")])
+        .build();
+
+    let mut book = boko::Book::from_bytes(&epub, Format::Epub).expect("import rtl epub");
+    assert_eq!(
+        book.metadata().page_progression_direction.as_deref(),
+        Some("rtl"),
+        "RTL direction must be read from the source spine"
+    );
+
+    let bytes = common::export_to_bytes(&mut book, Format::Epub);
+    let reimported = boko::Book::from_bytes(&bytes, Format::Epub).expect("reimport rtl epub");
+    assert_eq!(
+        reimported.metadata().page_progression_direction.as_deref(),
+        Some("rtl"),
+        "RTL direction must survive the EPUB round trip"
+    );
+
+    // And the export must still validate.
+    if let Some(errors) = epubcheck_errors(&bytes, "rtl.epub") {
+        assert_eq!(
+            errors, 0,
+            "epubcheck reported {errors} errors on the RTL export"
+        );
+    }
+}

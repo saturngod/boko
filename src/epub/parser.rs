@@ -166,6 +166,11 @@ impl OpfParser {
                 if let Some(toc) = attr(e, b"toc")? {
                     self.toc_id = Some(toc);
                 }
+                if let Some(dir) = attr(e, b"page-progression-direction")?
+                    && !dir.is_empty()
+                {
+                    self.metadata.page_progression_direction = Some(dir);
+                }
             }
             _ => {}
         }
@@ -1130,6 +1135,20 @@ mod tests {
         assert_eq!(data.manifest.len(), 2);
         assert_eq!(data.spine_ids, vec!["ch1"]);
         assert_eq!(data.metadata.cover_image.as_deref(), Some("cover.jpg"));
+    }
+
+    #[test]
+    fn parse_opf_reads_page_progression_direction() {
+        let opf = r#"<package xmlns="http://www.idpf.org/2007/opf">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>
+  <manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine page-progression-direction="rtl"><itemref idref="c1"/></spine>
+</package>"#;
+        let data = parse_opf(opf).unwrap();
+        assert_eq!(
+            data.metadata.page_progression_direction.as_deref(),
+            Some("rtl")
+        );
     }
 
     #[test]
