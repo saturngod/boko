@@ -319,6 +319,11 @@ fn survey_spine_chapters(
 
         // Load and survey chapter
         if let Ok(chapter) = book.load_chapter_cached(*chapter_id) {
+            // Reserve position-map slots up front (node_count is an upper
+            // bound on the entries this chapter adds) so the map doesn't
+            // rehash repeatedly as positions are recorded — a measurable
+            // chunk of KFX-export allocation time.
+            ctx.position_map.reserve(chapter.node_count());
             survey_chapter(&chapter, *chapter_id, &source_path, ctx);
         }
     }
