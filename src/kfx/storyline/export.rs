@@ -137,6 +137,30 @@ pub(super) fn walk_node_for_export(
         }
     }
 
+    // Table cell spans and ordered-list start value aren't in the schema's
+    // string-valued AttrRule table (they must be emitted as Ion integers),
+    // so carry them through kfx_attrs by hand; `tokens_to_ion` emits these
+    // three symbols as Int. Without this, tables lose merged/spanned cells
+    // and `<ol start=N>` loses its numbering on KFX export.
+    if node.role == Role::TableCell {
+        if let Some(cols) = chapter.semantics.col_span(node_id)
+            && cols > 1
+        {
+            kfx_attrs.push((sym!(TableColumnSpan), cols.to_string()));
+        }
+        if let Some(rows) = chapter.semantics.row_span(node_id)
+            && rows > 1
+        {
+            kfx_attrs.push((sym!(TableRowSpan), rows.to_string()));
+        }
+    }
+    if node.role == Role::OrderedList
+        && let Some(start) = chapter.semantics.list_start(node_id)
+        && start != 1
+    {
+        kfx_attrs.push((sym!(ListStartOffset), start.to_string()));
+    }
+
     // Store the transformed KFX attributes for tokens_to_ion
     elem.kfx_attrs = kfx_attrs;
 

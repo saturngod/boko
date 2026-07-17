@@ -414,12 +414,16 @@ impl KfxSchema {
             },
             vec![],
         );
-        // Table cells → type: text (both th and td)
+        // Table cells → type: text with a yj.semantics.type: table_cell marker
+        // so the cell round-trips as a TableCell (KFX has no dedicated cell
+        // container; without the marker cells import back as plain Paragraphs,
+        // collapsing the table structure).
         self.export_strategy_table.insert(
             Role::TableCell,
-            Strategy::Structure {
+            Strategy::StructureWithSemanticType {
                 role: Role::TableCell,
                 kfx_type: KfxSymbol::Text,
+                semantic_type: "table_cell",
             },
         );
 

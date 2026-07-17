@@ -300,15 +300,22 @@ fn start_element_fields(
     // The schema handles Image src→resource_name, Link href→link_to, etc.
     for (field_id, value_str) in &elem.kfx_attrs {
         // Symbol-vs-string is decided by the FIELD, not the value: reference
-        // fields (resource_name, link_to) are interned symbols; everything
-        // else (alt text, titles) is a plain string. Sniffing the value used
-        // to intern prose like alt="black/white photo" into the symbol
-        // table and emit the wrong Ion type for it.
+        // fields (resource_name, link_to) are interned symbols; the span/
+        // start fields are integers; everything else (alt text, titles) is a
+        // plain string. Sniffing the value used to intern prose like
+        // alt="black/white photo" into the symbol table.
         let is_symbol_field = *field_id == sym!(ResourceName) || *field_id == sym!(LinkTo);
+        let is_int_field = *field_id == sym!(TableColumnSpan)
+            || *field_id == sym!(TableRowSpan)
+            || *field_id == sym!(ListStartOffset);
 
         if is_symbol_field {
             let sym_id = ctx.symbols.get_or_intern(value_str);
             fields.push((*field_id, IonValue::Symbol(sym_id)));
+        } else if is_int_field {
+            if let Ok(n) = value_str.parse::<i64>() {
+                fields.push((*field_id, IonValue::Int(n)));
+            }
         } else {
             fields.push((*field_id, IonValue::String(value_str.clone())));
         }

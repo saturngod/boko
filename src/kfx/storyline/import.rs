@@ -158,6 +158,20 @@ pub(super) fn tokenize_content_item(
     let style_name =
         get_field(fields, sym!(Style)).and_then(|v| resolve_symbol_or_string(v, ctx.doc_symbols));
 
+    // Carry the integer table-span / list-start fields through kfx_attrs so
+    // the token→IR builder can restore them (they have no SemanticTarget and
+    // are the inverse of the export-side hand-emitted attrs).
+    let mut kfx_attrs = Vec::new();
+    for sym in [
+        KfxSymbol::TableColumnSpan,
+        KfxSymbol::TableRowSpan,
+        KfxSymbol::ListStartOffset,
+    ] {
+        if let Some(n) = get_field(fields, sym as u64).and_then(|v| v.as_int()) {
+            kfx_attrs.push((sym as u64, n.to_string()));
+        }
+    }
+
     // Emit StartElement token
     stream.push(KfxToken::StartElement(ElementStart {
         role,
@@ -166,7 +180,7 @@ pub(super) fn tokenize_content_item(
         semantics,
         content_ref,
         style_events,
-        kfx_attrs: Vec::new(),
+        kfx_attrs,
         style_symbol: None,             // Symbol ID (for export)
         style_name,                     // Style name (for import lookup)
         needs_container_wrapper: false, // Only used during export
@@ -376,6 +390,20 @@ where
 
                 // Apply ALL semantic attributes from the generic map
                 apply_semantics_to_node(&mut chapter, node_id, &elem.semantics);
+
+                // Restore integer table-span / list-start attributes.
+                for (field_id, value) in &elem.kfx_attrs {
+                    let Ok(n) = value.parse::<u32>() else {
+                        continue;
+                    };
+                    if *field_id == sym!(TableColumnSpan) {
+                        chapter.semantics.set_col_span(node_id, n);
+                    } else if *field_id == sym!(TableRowSpan) {
+                        chapter.semantics.set_row_span(node_id, n);
+                    } else if *field_id == sym!(ListStartOffset) {
+                        chapter.semantics.set_list_start(node_id, n);
+                    }
+                }
 
                 // Apply element ID if present (KFX stores as integer, we store as string)
                 if let Some(id) = elem.id {
