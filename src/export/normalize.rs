@@ -233,6 +233,40 @@ fn rewrite_href(
     }
 }
 
+/// Reverse the exact set of entities [`escape_xml_into`] produces
+/// (`&amp; &lt; &gt; &quot; &#39;`, plus `&apos;`). Borrows unchanged when
+/// there is no `&`. Unknown entities keep their literal `&`.
+fn xml_unescape(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains('&') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let (repl, len) = if tail.starts_with("&amp;") {
+            ("&", 5)
+        } else if tail.starts_with("&lt;") {
+            ("<", 4)
+        } else if tail.starts_with("&gt;") {
+            (">", 4)
+        } else if tail.starts_with("&quot;") {
+            ("\"", 6)
+        } else if tail.starts_with("&#39;") {
+            ("'", 5)
+        } else if tail.starts_with("&apos;") {
+            ("'", 6)
+        } else {
+            ("&", 1) // not a recognized entity: keep the literal ampersand
+        };
+        out.push_str(repl);
+        rest = &tail[len..];
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
 /// Rewrite the `href="…"` attributes inside a synthesized document so internal
 /// links point at the emitted chapter files.
 fn rewrite_document_hrefs(
@@ -252,14 +286,21 @@ fn rewrite_document_hrefs(
         let (before, after) = rest.split_at(pos + NEEDLE.len());
         out.push_str(before);
         if let Some(end) = after.find('"') {
-            let raw = &after[..end];
+            // The href in the document is XML-escaped (html_synth wrote it),
+            // but every rewrite map is keyed on the raw, unescaped href — so
+            // unescape before lookup or a link containing `&`/`<`/`>` misses
+            // and stays pointed at a nonexistent source path. Re-escape the
+            // result for the attribute context; for the common (no-entity)
+            // href this whole dance is a no-op.
+            let unescaped = xml_unescape(&after[..end]);
+            let key: &str = &unescaped;
             // Resolved-link overrides win: they carry importer knowledge the
             // string-based maps below don't have (see `href_remap`).
-            let rewritten = match href_remap.get(raw) {
+            let rewritten = match href_remap.get(key) {
                 Some(mapped) => mapped.clone(),
-                None => rewrite_href(source_to_output, anchor_to_output, Some(base_source), raw),
+                None => rewrite_href(source_to_output, anchor_to_output, Some(base_source), key),
             };
-            out.push_str(&rewritten);
+            super::escape_xml_into(&mut out, &rewritten);
             rest = &after[end..];
         } else {
             rest = after;
@@ -508,6 +549,39 @@ mod tests {
     use super::*;
     use crate::model::Node;
     use crate::style::{ComputedStyle, FontWeight};
+
+    #[test]
+    fn xml_unescape_reverses_escape_xml() {
+        // Round-trips the exact entity set escape_xml_into produces.
+        for raw in ["a&b", "x<y>z", "he said \"hi\"", "it's", "plain/path#frag"] {
+            let escaped = super::super::escape_xml(raw);
+            assert_eq!(xml_unescape(&escaped), raw, "round trip for {raw:?}");
+        }
+        // No-ampersand fast path borrows unchanged.
+        assert!(matches!(
+            xml_unescape("chapter_0.xhtml#frag"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // Unknown entity keeps its literal ampersand.
+        assert_eq!(xml_unescape("a&unknown;b"), "a&unknown;b");
+    }
+
+    #[test]
+    fn rewrite_document_hrefs_handles_escaped_ampersand() {
+        // A resolved link whose raw href contains `&` is escaped in the doc
+        // as `&amp;`; the rewrite must still find it and retarget it.
+        let mut href_remap = HashMap::new();
+        href_remap.insert("ch1.xhtml#a&b".to_string(), "chapter_0.xhtml#x".to_string());
+        let doc = r#"<a href="ch1.xhtml#a&amp;b">link</a>"#;
+        let out = rewrite_document_hrefs(
+            doc,
+            "src.xhtml",
+            &HashMap::new(),
+            &HashMap::new(),
+            &href_remap,
+        );
+        assert!(out.contains(r#"href="chapter_0.xhtml#x""#), "{out}");
+    }
 
     #[test]
     fn test_global_style_pool_new() {
