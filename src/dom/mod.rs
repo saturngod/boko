@@ -454,6 +454,29 @@ mod tests {
     }
 
     #[test]
+    fn font_shorthand_flows_through_cascade() {
+        // The `font` shorthand must expand and reach the computed style, not
+        // be dropped wholesale.
+        let author = Stylesheet::parse("p { font: italic bold 14px/1.5 Georgia, serif; }");
+        let chapter = compile_html(
+            "<html><body><p>t</p></body></html>",
+            &[(author, Origin::Author)],
+        );
+        for id in chapter.iter_dfs() {
+            let node = chapter.node(id).unwrap();
+            if node.role == Role::Paragraph {
+                let style = chapter.styles.get(node.style).unwrap();
+                assert_eq!(style.font_style, crate::style::FontStyle::Italic);
+                assert_eq!(style.font_weight, crate::style::FontWeight::BOLD);
+                assert_eq!(style.font_size, crate::style::Length::Px(14.0));
+                assert_eq!(style.font_family.as_deref(), Some("Georgia, serif"));
+                return;
+            }
+        }
+        panic!("paragraph not found");
+    }
+
+    #[test]
     fn test_compile_simple_html() {
         let html = "<html><body><p>Test paragraph</p></body></html>";
         let chapter = compile_html(html, &[]);

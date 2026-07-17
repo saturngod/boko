@@ -11,7 +11,7 @@ use super::parse::border::{
 };
 use super::parse::box_model::parse_box_shorthand_values;
 use super::parse::font::{
-    parse_font_family, parse_font_size, parse_font_weight, parse_line_height,
+    parse_font_family, parse_font_shorthand, parse_font_size, parse_font_weight, parse_line_height,
 };
 use super::parse::keywords::{
     parse_border_collapse, parse_border_style_value, parse_box_sizing, parse_break_inside,
@@ -289,6 +289,7 @@ impl Declaration {
             "border-bottom" => parse_border_side_shorthand(input, BorderSide::Bottom),
             "border-left" => parse_border_side_shorthand(input, BorderSide::Left),
             "list-style" => parse_list_style_shorthand(input),
+            "font" => parse_font_shorthand(input).unwrap_or_default(),
             _ => return None,
         })
     }
