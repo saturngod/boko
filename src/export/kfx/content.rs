@@ -250,15 +250,20 @@ pub(super) fn build_symbol_table_ion(local_symbols: &[String]) -> Vec<u8> {
 
 /// Build format capabilities ION.
 pub(super) fn build_format_capabilities_ion() -> Vec<u8> {
-    let caps = IonValue::Struct(vec![
+    // Reference shape (Kindle Previewer output, tests/fixtures/epictetus.kfx):
+    // a LIST of `{$492: <capability key>, version: <int>}` structs. Readers
+    // walk it with per-entry key lookups, so any other shape breaks them.
+    // `kfxgen.textBlock 1` declares that text lives in $145 content fragments
+    // (which boko always emits); the flat $264/$265 position maps with no eid
+    // offsets declare neither `kfxgen.positionMaps` nor `pidMapWithOffset`,
+    // matching the reference.
+    let caps = IonValue::List(vec![IonValue::Struct(vec![
         (
-            KfxSymbol::Namespace as u64,
-            IonValue::String("yj".to_string()),
+            KfxSymbol::Key as u64,
+            IonValue::String("kfxgen.textBlock".to_string()),
         ),
-        (KfxSymbol::MajorVersion as u64, IonValue::Int(1)),
-        (KfxSymbol::MinorVersion as u64, IonValue::Int(0)),
-        (KfxSymbol::Features as u64, IonValue::List(vec![])),
-    ]);
+        (KfxSymbol::Version as u64, IonValue::Int(1)),
+    ])]);
 
     // Annotate with $593 (format_capabilities)
     serialize_annotated_ion(KfxSymbol::FormatCapabilities as u64, &caps)

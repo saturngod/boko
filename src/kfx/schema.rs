@@ -560,6 +560,14 @@ impl KfxSchema {
     }
 
     /// Register landmark type mappings.
+    ///
+    /// The mapping is used in both directions; `EXPORTABLE_LANDMARKS` below
+    /// restricts which of them boko will *write*. Amazon's tooling only ever
+    /// emits cover_page, srl, toc, acknowledgements, and index — the other
+    /// guidance-type symbol IDs exist in the shared symbol table but are
+    /// never used by real books (kfxlib's symbol catalog marks them
+    /// never-observed), so emitting them makes output flag as nonconformant
+    /// and risks confusing firmware. Import still accepts all of them.
     fn register_landmark_rules(&mut self) {
         self.landmark_mapping = vec![
             (LandmarkType::Cover, KfxSymbol::CoverPage),
@@ -906,12 +914,24 @@ impl KfxSchema {
             .map(|(ir, _)| *ir)
     }
 
-    /// Convert an IR LandmarkType to KFX symbol.
+    /// Convert an IR LandmarkType to KFX symbol, for export.
+    ///
+    /// Returns `None` for landmark types whose KFX symbol is never used by
+    /// Amazon-produced books (see `register_landmark_rules`); those landmarks
+    /// are silently dropped from KFX output.
     pub fn landmark_to_kfx(&self, landmark_type: LandmarkType) -> Option<KfxSymbol> {
+        const EXPORTABLE_LANDMARKS: [KfxSymbol; 5] = [
+            KfxSymbol::CoverPage,
+            KfxSymbol::Srl,
+            KfxSymbol::Toc,
+            KfxSymbol::Acknowledgements,
+            KfxSymbol::Index,
+        ];
         self.landmark_mapping
             .iter()
             .find(|(ir, _)| *ir == landmark_type)
             .map(|(_, kfx)| *kfx)
+            .filter(|kfx| EXPORTABLE_LANDMARKS.contains(kfx))
     }
 }
 
@@ -1105,9 +1125,12 @@ mod tests {
             s.landmark_to_kfx(LandmarkType::StartReading),
             Some(KfxSymbol::Srl)
         );
+        // BodyMatter maps to a symbol id no Amazon book uses; it is
+        // import-recognized but never exported.
+        assert_eq!(s.landmark_to_kfx(LandmarkType::BodyMatter), None);
         assert_eq!(
-            s.landmark_to_kfx(LandmarkType::BodyMatter),
-            Some(KfxSymbol::Bodymatter)
+            s.landmark_from_kfx(KfxSymbol::Bodymatter as u64),
+            Some(LandmarkType::BodyMatter)
         );
         // Endnotes has no KFX equivalent
         assert_eq!(s.landmark_to_kfx(LandmarkType::Endnotes), None);
@@ -1116,11 +1139,23 @@ mod tests {
     #[test]
     fn test_landmark_roundtrip() {
         let s = schema();
-        // All mapped landmark types should roundtrip correctly
+        // Every mapped type imports; exportable types roundtrip.
         for (ir_type, kfx_sym) in &s.landmark_mapping {
             let kfx_id = *kfx_sym as u64;
             assert_eq!(s.landmark_from_kfx(kfx_id), Some(*ir_type));
-            assert_eq!(s.landmark_to_kfx(*ir_type), Some(*kfx_sym));
+            if let Some(exported) = s.landmark_to_kfx(*ir_type) {
+                assert_eq!(exported, *kfx_sym);
+            }
+        }
+        // The Amazon-observed set must all be exportable.
+        for ir_type in [
+            LandmarkType::Cover,
+            LandmarkType::StartReading,
+            LandmarkType::Toc,
+            LandmarkType::Acknowledgements,
+            LandmarkType::Index,
+        ] {
+            assert!(s.landmark_to_kfx(ir_type).is_some());
         }
     }
 }
