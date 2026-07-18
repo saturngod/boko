@@ -98,18 +98,34 @@ pub(super) fn walk_node_for_export(
     let mut elem = ElementStart::new(node.role);
     elem.node_id = Some(node_id);
 
+    if node.role == Role::Table {
+        // Drives the yj_table / yj_table_viewer content features ($585).
+        ctx.has_tables = true;
+    }
+
     // Register the node's style and get a KFX style symbol
     // This converts IR ComputedStyle → KFX style and deduplicates
     let style_symbol = ctx.register_style_id(node.style, &chapter.styles);
     elem.style_symbol = Some(style_symbol);
 
     // Check if this element needs container wrapping for borders to render
-    // KFX requires type: container with nested type: text for borders
-    elem.needs_container_wrapper = chapter
-        .styles
-        .get(node.style)
-        .map(needs_container_wrapper)
-        .unwrap_or(false);
+    // KFX requires type: container with nested type: text for borders.
+    //
+    // Table-structural elements are exempt: the wrapper replaces the element
+    // type with `container`, which destroys the table/table_row/cell
+    // structure (a bordered table degraded to nested containers). Kindle
+    // Previewer keeps table element types and renders their borders from
+    // styles directly.
+    let is_table_structural = matches!(
+        node.role,
+        Role::Table | Role::TableRow | Role::TableCell | Role::TableHead | Role::TableBody
+    );
+    elem.needs_container_wrapper = !is_table_structural
+        && chapter
+            .styles
+            .get(node.style)
+            .map(needs_container_wrapper)
+            .unwrap_or(false);
 
     // SCHEMA-DRIVEN attribute export
     // Create a closure to get semantic values by target
@@ -456,6 +472,9 @@ pub(super) fn emit_definition_list(
             } else {
                 ctx.default_style_symbol
             };
+            if wrapper_style == ctx.default_style_symbol {
+                ctx.default_style_used = true;
+            }
             wrapper_elem.style_symbol = Some(wrapper_style);
             stream.push(KfxToken::StartElement(wrapper_elem));
 

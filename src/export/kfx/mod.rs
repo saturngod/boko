@@ -110,7 +110,7 @@ fn build_kfx_container(book: &Book) -> crate::Result<Vec<u8>> {
     // M+. content ($145) - all together
 
     // 2a. Content features fragment ($585)
-    fragments.push(build_content_features_fragment());
+    fragments.push(build_content_features_fragment(&ctx));
 
     // 2b. Book metadata fragment ($490) - contains categorised_metadata
     fragments.push(build_book_metadata_fragment(book, &container_id, &ctx));
@@ -142,13 +142,17 @@ fn build_kfx_container(book: &Book) -> crate::Result<Vec<u8>> {
     fragments.extend(storyline_fragments);
     fragments.extend(content_fragments);
 
+    // Styles and anchors are filtered to what the built Ion actually
+    // references; registration alone does not imply emission.
+    let used = collect_used_symbols(&fragments);
+
     // 2g. Style entities ($157) - generated AFTER chapters since styles are collected during token generation
     // This includes the default style plus any unique styles found in the content
-    fragments.extend(build_style_fragments(&mut ctx));
+    fragments.extend(build_style_fragments(&mut ctx, &used.styles));
 
     // 2h. Anchor fragments - must come after sections/storylines/content/styles
     // This matches the reference KFX entity ordering
-    fragments.extend(build_anchor_fragments(&mut ctx));
+    fragments.extend(build_anchor_fragments(&mut ctx, &used.anchors));
 
     // 2i. Auxiliary data fragments - mark sections as navigation targets
     append_auxiliary_data_fragments(
@@ -164,6 +168,31 @@ fn build_kfx_container(book: &Book) -> crate::Result<Vec<u8>> {
     // 2j-2. Font entity fragments ($262)
     // These link font_family names to resource locations (from @font-face rules)
     fragments.extend(build_font_fragments(book, &mut ctx));
+
+    // Prune font payloads no $262 entity references: every font asset was
+    // emitted as bcRawFont above, and the font entities' location fields are
+    // the single source of truth for which are reachable.
+    let referenced_fonts: BTreeSet<String> = fragments
+        .iter()
+        .filter(|f| f.ftype == KfxSymbol::Font as u64)
+        .filter_map(|f| match &f.data {
+            crate::kfx::fragment::FragmentData::Ion(IonValue::Struct(fields)) => fields
+                .iter()
+                .find(|(k, _)| *k == KfxSymbol::Location as u64)
+                .and_then(|(_, v)| match v {
+                    IonValue::String(loc) => Some(loc.clone()),
+                    _ => None,
+                }),
+            _ => None,
+        })
+        .collect();
+    fragments
+        .retain(|f| f.ftype != KfxSymbol::Bcrawfont as u64 || referenced_fonts.contains(&f.fid));
+
+    // Rebuild content_features ($585) now that the resource pass has
+    // determined the media-derived flags (HDV images, JPEG restart markers);
+    // the copy pushed before chapters was a placeholder for ordering.
+    fragments[0] = build_content_features_fragment(&ctx);
 
     // 2k. Navigation maps for reader functionality
     fragments.push(build_position_map_fragment(&ctx));
@@ -403,6 +432,7 @@ fn register_nav_and_resource_symbols(book: &Book, ctx: &mut ExportContext) {
     ctx.nav_container_symbols.toc = ctx.symbols.get_or_intern("toc");
     ctx.nav_container_symbols.headings = ctx.symbols.get_or_intern("headings");
     ctx.nav_container_symbols.landmarks = ctx.symbols.get_or_intern("landmarks");
+    ctx.nav_container_symbols.page_list = ctx.symbols.get_or_intern("page_list");
 
     // Register resource paths and create short names
     // IMPORTANT: Short names must be interned during Pass 1 to ensure
@@ -434,7 +464,6 @@ fn build_spine_entities(
 ) -> (Vec<KfxFragment>, Vec<KfxFragment>, Vec<KfxFragment>) {
     let mut section_fragments = Vec::new();
     let mut storyline_fragments = Vec::new();
-    let mut content_fragments = Vec::new();
 
     // Generate standalone cover section if needed (c0)
     // Note: cover_fragment_id was assigned in Pass 1 for landmark resolution
@@ -461,13 +490,10 @@ fn build_spine_entities(
             // Set up chapter-start anchor before generating content
             ctx.begin_chapter_export(*chapter_id);
 
-            let (section, storyline, content) =
+            let (section, storyline) =
                 build_chapter_entities_grouped(&chapter, *chapter_id, section_name, ctx);
             section_fragments.push(section);
             storyline_fragments.push(storyline);
-            if let Some(c) = content {
-                content_fragments.push(c);
-            }
 
             // Record which image resources this section depends on, so the
             // container_entity_map can declare the dependency graph that
@@ -483,6 +509,9 @@ fn build_spine_entities(
             }
         }
     }
+
+    // Text accumulated across all chapters; emit the global content chunks.
+    let content_fragments = build_content_fragments(ctx);
 
     (section_fragments, storyline_fragments, content_fragments)
 }
@@ -512,14 +541,119 @@ fn append_resource_fragments(
     fragments: &mut Vec<KfxFragment>,
     ctx: &mut ExportContext,
 ) {
+    // Images actually referenced from emitted Ion (storyline image elements,
+    // cover section templates). Registry membership is not enough: srcs are
+    // registered during tokenization even when the element never reaches the
+    // output (e.g. CSS background images), and an unreachable resource is a
+    // conformance error.
+    let used_resource_symbols = collect_used_symbols(fragments).resources;
+
     for asset_path in book.list_assets() {
         if is_media_asset(book, asset_path)
             && let Ok(data) = book.load_asset(asset_path)
         {
+            if detect_media_format(asset_path, &data).is_font() {
+                // Fonts are bcRawFont ($418) referenced by location from the
+                // root $262 font entities — no external_resource wrapper.
+                // Emitted for every font asset here; the ones no $262 entity
+                // ends up referencing are pruned after font entities are
+                // built (see build_kfx_container), keeping the two resolution
+                // paths from ever disagreeing.
+                fragments.push(build_font_data_fragment(asset_path, data, ctx));
+                continue;
+            }
+            let referenced = ctx
+                .resource_registry
+                .get_name(asset_path)
+                .and_then(|name| ctx.symbols.get(name))
+                .is_some_and(|sym| used_resource_symbols.contains(&sym));
+            if !referenced {
+                continue;
+            }
+            record_media_features(&data, ctx);
             // external_resource ($164) - metadata about the resource
             fragments.push(build_external_resource_fragment(asset_path, &data, ctx));
             // bcRawMedia ($417) - the actual bytes (moved, not copied)
             fragments.push(build_resource_fragment(asset_path, data, ctx));
+        }
+    }
+}
+
+/// Symbols referenced from already-built fragments, by kind.
+#[derive(Default)]
+struct UsedSymbols {
+    /// `resource_name` ($175) values — image resources in use.
+    resources: BTreeSet<u64>,
+    /// `style` ($157) field values — styles in use.
+    styles: BTreeSet<u64>,
+    /// `link_to` ($179) values — anchor symbols in use.
+    anchors: BTreeSet<u64>,
+}
+
+/// Collect every referenced resource/style/anchor symbol from built fragments.
+///
+/// Emitting a fragment nothing references (or referencing one that is never
+/// emitted) is a conformance error, so styles, anchors, and resources are all
+/// emitted from this reference walk rather than from registration state.
+fn collect_used_symbols(fragments: &[KfxFragment]) -> UsedSymbols {
+    fn walk(value: &IonValue, used: &mut UsedSymbols) {
+        match value {
+            IonValue::Struct(fields) => {
+                for (key, val) in fields {
+                    if let IonValue::Symbol(sym) = val {
+                        if *key == KfxSymbol::ResourceName as u64 {
+                            used.resources.insert(*sym);
+                        } else if *key == KfxSymbol::Style as u64 {
+                            used.styles.insert(*sym);
+                        } else if *key == KfxSymbol::LinkTo as u64 {
+                            used.anchors.insert(*sym);
+                        }
+                    }
+                    walk(val, used);
+                }
+            }
+            IonValue::List(items) => {
+                for item in items {
+                    walk(item, used);
+                }
+            }
+            IonValue::Annotated(_, inner) => walk(inner, used),
+            _ => {}
+        }
+    }
+
+    let mut used = UsedSymbols::default();
+    for fragment in fragments {
+        if let crate::kfx::fragment::FragmentData::Ion(value) = &fragment.data {
+            walk(value, &mut used);
+        }
+    }
+    used
+}
+
+/// Record media facts that drive conditional content features ($585).
+fn record_media_features(data: &[u8], ctx: &mut ExportContext) {
+    if !ctx.has_hdv_image
+        && let Some((width, height)) = crate::util::extract_image_dimensions(data)
+        && (width > 1920 || height > 1920)
+    {
+        ctx.has_hdv_image = true;
+    }
+
+    // JPEG restart markers (FF D0-D7) enable segmented decoding; the flag
+    // must reflect their presence in any JPEG payload.
+    if !ctx.jpg_rst_marker_present && data.starts_with(&[0xFF, 0xD8]) {
+        let mut i = 0;
+        while let Some(pos) = memchr::memchr(0xFF, &data[i..]) {
+            let at = i + pos;
+            match data.get(at + 1) {
+                Some(b) if (0xD0..=0xD7).contains(b) => {
+                    ctx.jpg_rst_marker_present = true;
+                    break;
+                }
+                Some(_) => i = at + 1,
+                None => break,
+            }
         }
     }
 }
@@ -535,7 +669,10 @@ fn serialize_book(container_id: &str, fragments: &[KfxFragment], ctx: &ExportCon
     let symtab_ion = build_symbol_table_ion(local_syms);
 
     // Build format capabilities ION
-    let format_caps_ion = build_format_capabilities_ion();
+    let has_text_content = fragments
+        .iter()
+        .any(|f| f.ftype == KfxSymbol::Content as u64);
+    let format_caps_ion = build_format_capabilities_ion(has_text_content);
 
     // Serialize fragments to entities
     let entities = serialize_fragments(fragments, ctx.symbols.local_symbols());

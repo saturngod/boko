@@ -65,6 +65,21 @@ pub(super) fn build_resource_fragment(
     KfxFragment::raw(KfxSymbol::Bcrawmedia as u64, &raw_name, data)
 }
 
+/// Build a bcRawFont fragment ($418) - raw font bytes.
+///
+/// Shares the `resource/{name}` fid the $262 font entity's location field
+/// points at, mirroring `build_resource_fragment` for images.
+pub(super) fn build_font_data_fragment(
+    href: &str,
+    data: Vec<u8>,
+    ctx: &mut ExportContext,
+) -> KfxFragment {
+    let resource_name = generate_resource_name(href, ctx);
+    let raw_name = format!("resource/{}", resource_name);
+    ctx.symbols.get_or_intern(&raw_name);
+    KfxFragment::raw(KfxSymbol::Bcrawfont as u64, &raw_name, data)
+}
+
 /// Build font entity fragments ($262) from @font-face rules.
 ///
 /// Font entities link font_family names (e.g., "cover-Ubuntu") to resource locations.
@@ -141,35 +156,36 @@ pub(super) fn build_font_fragments(book: &Book, ctx: &mut ExportContext) -> Vec<
             ),
         ]);
 
-        // Generate unique fragment name for this font face
-        let frag_name = format!(
-            "font-{}-{}-{}",
-            font_face.font_family,
-            if font_face.font_weight.0 >= 700 {
-                "bold"
-            } else {
-                "normal"
-            },
-            match font_face.font_style {
-                FontStyle::Italic | FontStyle::Oblique => "italic",
-                FontStyle::Normal => "normal",
-            }
-        );
-
-        fragments.push(KfxFragment::new(KfxSymbol::Font, &frag_name, ion));
+        // Font entities are ROOT fragments (unnamed, id = the $262 type
+        // itself, several allowed) in Amazon output; a named $262 decodes as
+        // an unexpected root id in reference tooling.
+        fragments.push(KfxFragment::singleton(KfxSymbol::Font, ion));
     }
 
     fragments
 }
 
 /// Build anchor fragments ($266) for all recorded anchors.
-pub(super) fn build_anchor_fragments(ctx: &mut ExportContext) -> Vec<KfxFragment> {
+pub(super) fn build_anchor_fragments(
+    ctx: &mut ExportContext,
+    used_anchors: &BTreeSet<u64>,
+) -> Vec<KfxFragment> {
     let mut fragments = Vec::new();
+    let is_used = |ctx: &ExportContext, symbol: &str| {
+        ctx.symbols
+            .get(symbol)
+            .is_some_and(|sym| used_anchors.contains(&sym))
+    };
 
     // Get resolved internal anchors from the AnchorRegistry
     let resolved_anchors = ctx.anchor_registry.drain_anchors();
 
     for anchor in resolved_anchors {
+        // Anchors resolved for id'd elements that no link references would be
+        // unreachable fragments; skip them.
+        if !is_used(ctx, &anchor.symbol) {
+            continue;
+        }
         // Intern the anchor symbol to get its ID
         let anchor_symbol_id = ctx.symbols.get_or_intern(&anchor.symbol);
 
@@ -198,10 +214,51 @@ pub(super) fn build_anchor_fragments(ctx: &mut ExportContext) -> Vec<KfxFragment
         fragments.push(KfxFragment::new(KfxSymbol::Anchor, &anchor.symbol, ion));
     }
 
+    // Fallback anchors: symbols handed out to link_to references whose
+    // targets never resolved (broken internal links). A referenced-but-
+    // missing $266 is a conformance error; point them at the first section
+    // instead, mirroring go-to-start behavior for broken links.
+    let unresolved = ctx.anchor_registry.unresolved_symbols();
+    if !unresolved.is_empty() {
+        let fallback_id = ctx
+            .cover_fragment_id
+            .or_else(|| {
+                ctx.section_ids.first().and_then(|_| {
+                    ctx.spine_section_chapters
+                        .first()
+                        .and_then(|&(_, ch)| ctx.chapter_fragments.get(&ch).copied())
+                })
+            })
+            .unwrap_or(crate::kfx::context::IdGenerator::FRAGMENT_MIN_ID);
+        for symbol in unresolved {
+            if !is_used(ctx, &symbol) {
+                continue;
+            }
+            let anchor_symbol_id = ctx.symbols.get_or_intern(&symbol);
+            let ion = IonValue::Struct(vec![
+                (
+                    KfxSymbol::AnchorName as u64,
+                    IonValue::Symbol(anchor_symbol_id),
+                ),
+                (
+                    KfxSymbol::Position as u64,
+                    IonValue::Struct(vec![(
+                        KfxSymbol::Id as u64,
+                        IonValue::Int(fallback_id as i64),
+                    )]),
+                ),
+            ]);
+            fragments.push(KfxFragment::new(KfxSymbol::Anchor, &symbol, ion));
+        }
+    }
+
     // Get external anchors (http/https links) from the AnchorRegistry
     let external_anchors = ctx.anchor_registry.drain_external_anchors();
 
     for anchor in external_anchors {
+        if !is_used(ctx, &anchor.symbol) {
+            continue;
+        }
         // Intern the anchor symbol to get its ID
         let anchor_symbol_id = ctx.symbols.get_or_intern(&anchor.symbol);
 

@@ -72,6 +72,29 @@ pub(super) fn build_book_navigation_fragment_with_positions(
         nav_containers.push(annotated);
     }
 
+    // 4. Approximate page list: virtual page numbers (~1850 positions per
+    // page), so devices show "Page X of Y" for sideloaded books the way
+    // Kindle Previewer output does.
+    let page_entries = build_page_list_entries(ctx);
+    if !page_entries.is_empty() {
+        let page_container = IonValue::Struct(vec![
+            (
+                KfxSymbol::NavType as u64,
+                IonValue::Symbol(KfxSymbol::PageList as u64),
+            ),
+            (
+                KfxSymbol::NavContainerName as u64,
+                IonValue::Symbol(ctx.nav_container_symbols.page_list),
+            ),
+            (KfxSymbol::Entries as u64, IonValue::List(page_entries)),
+        ]);
+        let annotated = IonValue::Annotated(
+            vec![KfxSymbol::NavContainer as u64],
+            Box::new(page_container),
+        );
+        nav_containers.push(annotated);
+    }
+
     // Wrap in reading order structure: [{reading_order_name, nav_containers}]
     let reading_order = IonValue::Struct(vec![
         (
@@ -87,6 +110,51 @@ pub(super) fn build_book_navigation_fragment_with_positions(
     let book_nav = IonValue::List(vec![reading_order]);
 
     KfxFragment::singleton(KfxSymbol::BookNavigation, book_nav)
+}
+
+/// Positions per virtual page (Amazon's typical value).
+const KFX_POSITIONS_PER_PAGE: i64 = 1850;
+
+/// Build the approximate page list: one entry per ~1850 positions, labels
+/// "1".."N", each targeting the (eid, offset) where the page begins.
+pub(super) fn build_page_list_entries(ctx: &ExportContext) -> Vec<IonValue> {
+    let mut entries = Vec::new();
+    let mut next_page_position = 0i64;
+    let mut page = 0i64;
+
+    for (eid, length, start_pid) in page_position_chunks(ctx) {
+        // Emit every page boundary that falls inside this element.
+        while next_page_position < start_pid + length.max(1) {
+            if next_page_position >= start_pid {
+                page += 1;
+                let entry = IonValue::Struct(vec![
+                    (
+                        KfxSymbol::Representation as u64,
+                        IonValue::Struct(vec![(
+                            KfxSymbol::Label as u64,
+                            IonValue::String(page.to_string()),
+                        )]),
+                    ),
+                    (
+                        KfxSymbol::TargetPosition as u64,
+                        IonValue::Struct(vec![
+                            (KfxSymbol::Id as u64, IonValue::Int(eid as i64)),
+                            (
+                                KfxSymbol::Offset as u64,
+                                IonValue::Int(next_page_position - start_pid),
+                            ),
+                        ]),
+                    ),
+                ]);
+                entries.push(IonValue::Annotated(
+                    vec![KfxSymbol::NavUnit as u64],
+                    Box::new(entry),
+                ));
+            }
+            next_page_position += KFX_POSITIONS_PER_PAGE;
+        }
+    }
+    entries
 }
 
 /// Build headings navigation entries grouped by heading level.
@@ -444,10 +512,14 @@ mod tests {
 
     #[test]
     fn test_build_format_capabilities_ion() {
-        let ion = build_format_capabilities_ion();
+        let with_text = build_format_capabilities_ion(true);
+        assert_eq!(&with_text[..4], &[0xe0, 0x01, 0x00, 0xea]);
 
-        // Should start with Ion BVM
-        assert_eq!(&ion[..4], &[0xe0, 0x01, 0x00, 0xea]);
+        // Image-only books must not declare kfxgen.textBlock; the list is
+        // empty and thus shorter.
+        let without_text = build_format_capabilities_ion(false);
+        assert_eq!(&without_text[..4], &[0xe0, 0x01, 0x00, 0xea]);
+        assert!(without_text.len() < with_text.len());
     }
 
     #[test]
@@ -609,7 +681,8 @@ mod tests {
 
     #[test]
     fn test_content_features_fragment() {
-        let frag = build_content_features_fragment();
+        let ctx = ExportContext::new();
+        let frag = build_content_features_fragment(&ctx);
 
         // Should be $585 (content_features) type
         assert_eq!(frag.ftype, KfxSymbol::ContentFeatures as u64);
@@ -627,11 +700,29 @@ mod tests {
                     "content_features should contain features"
                 );
 
-                // Features should be a list with 3 items
+                // Baseline features only (no HDV image / RST-marker JPEG in
+                // this empty context): reflow-style + CanonicalFormat.
                 if let Some((_, IonValue::List(items))) = features {
-                    assert_eq!(items.len(), 3, "should have 3 feature entries");
+                    assert_eq!(items.len(), 2, "should have 2 baseline feature entries");
                 } else {
                     panic!("features should be a list");
+                }
+
+                // Media/content-derived features appear when the passes saw them.
+                let mut hdv_ctx = ExportContext::new();
+                hdv_ctx.has_hdv_image = true;
+                hdv_ctx.jpg_rst_marker_present = true;
+                hdv_ctx.has_tables = true;
+                let hdv_frag = build_content_features_fragment(&hdv_ctx);
+                if let crate::kfx::fragment::FragmentData::Ion(IonValue::Struct(f)) = &hdv_frag.data
+                    && let Some((_, IonValue::List(items))) =
+                        f.iter().find(|(id, _)| *id == KfxSymbol::Features as u64)
+                {
+                    assert_eq!(
+                        items.len(),
+                        6,
+                        "HDV + RST + table + table-viewer flags add four entries"
+                    );
                 }
             } else {
                 panic!("expected Struct");
@@ -737,7 +828,8 @@ mod tests {
     #[test]
     fn test_singleton_uses_null_symbol() {
         // Build a singleton fragment and serialize it
-        let frags = [build_content_features_fragment()];
+        let ctx = ExportContext::new();
+        let frags = [build_content_features_fragment(&ctx)];
         let local_symbols: Vec<String> = vec![];
         let entities = serialize_fragments(&frags, &local_symbols);
 
@@ -944,12 +1036,12 @@ mod tests {
         use crate::ChapterId;
 
         let mut ctx = ExportContext::new();
-        ctx.register_section("c0");
-        ctx.register_section("c1");
 
-        // Simulate two chapters with multiple content IDs each
+        // Simulate two spine chapters with multiple content IDs each
         let chapter1 = ChapterId(1);
         let chapter2 = ChapterId(2);
+        ctx.register_spine_section("c0", chapter1);
+        ctx.register_spine_section("c1", chapter2);
 
         // Add content IDs for each chapter
         ctx.content_ids_by_chapter
@@ -969,11 +1061,12 @@ mod tests {
 
         // Extract and verify the position_id_map entries
         if let crate::kfx::fragment::FragmentData::Ion(IonValue::List(entries)) = &frag.data {
-            // Should have 6 entries (100, 101, 102, 200, 201) + 1 terminator (eid=0)
+            // One entry per page-template eid (90, 95) and content ID
+            // (100, 101, 102, 200, 201), plus the eid=0 terminator.
             assert_eq!(
                 entries.len(),
-                6,
-                "position_id_map should have one entry per content ID plus terminator"
+                8,
+                "position_id_map should cover section templates, content IDs, and terminator"
             );
 
             // Extract all eids
@@ -997,12 +1090,12 @@ mod tests {
                 })
                 .collect();
 
-            // Should contain all content IDs
-            assert!(eids.contains(&100), "should contain content ID 100");
-            assert!(eids.contains(&101), "should contain content ID 101");
-            assert!(eids.contains(&102), "should contain content ID 102");
-            assert!(eids.contains(&200), "should contain content ID 200");
-            assert!(eids.contains(&201), "should contain content ID 201");
+            // Reading order: section template, its content, next section...
+            assert_eq!(
+                eids,
+                vec![90, 100, 101, 102, 95, 200, 201, 0],
+                "entries must follow reading order with the terminator last"
+            );
         } else {
             panic!("expected List data");
         }

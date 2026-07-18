@@ -133,6 +133,7 @@ pub fn build_cover_section(
     ctx.record_section_image_ref(section_name, &resource_name);
 
     // Use default style for the cover image
+    ctx.default_style_used = true;
     let style_symbol = ctx.default_style_symbol;
 
     // Assign a fragment ID for the cover image content

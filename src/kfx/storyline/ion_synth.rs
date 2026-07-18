@@ -46,6 +46,7 @@ pub fn tokens_to_ion(tokens: &TokenStream, ctx: &mut ExportContext) -> IonValue 
 
                     // Inner element uses default style (minimal, no borders)
                     // This matches KPR behavior where inner text has separate style
+                    ctx.default_style_used = true;
                     inner_fields.push((sym!(Style), IonValue::Symbol(ctx.default_style_symbol)));
 
                     // Type: text - inner element holds the actual content
@@ -183,6 +184,9 @@ fn start_element_fields(
     // Style reference - use per-element style if available, else default
     // Required for text rendering on Kindle
     let style_sym = elem.style_symbol.unwrap_or(ctx.default_style_symbol);
+    if style_sym == ctx.default_style_symbol {
+        ctx.default_style_used = true;
+    }
     fields.push((sym!(Style), IonValue::Symbol(style_sym)));
 
     if container_wrapper {
@@ -282,18 +286,16 @@ fn start_element_fields(
         let types: Vec<&str> = epub_type.split_whitespace().collect();
         let is_footnote = types.contains(&"footnote");
         let is_endnote = types.contains(&"endnote") || types.contains(&"rearnote");
-        let is_sidenote = types.contains(&"sidebar") || types.contains(&"marginalia");
+        // Note: epub:type sidebar/marginalia gets no yj.classification.
+        // Kindle Previewer never emits yj.sidenote ($620) — the sidebar-ness
+        // is carried by the element's `yj.semantics.type: sidebar` marker
+        // instead (see the schema's Sidebar strategy).
 
         // Prefer endnote classification if both are present (common in EPUBs)
         if is_endnote {
             fields.push((
                 sym!(YjClassification),
                 IonValue::Symbol(KfxSymbol::YjEndnote as u64),
-            ));
-        } else if is_sidenote {
-            fields.push((
-                sym!(YjClassification),
-                IonValue::Symbol(KfxSymbol::YjSidenote as u64),
             ));
         } else if is_footnote {
             fields.push((
@@ -412,12 +414,11 @@ impl IonBuilder {
         event_fields.push((sym!(Length), IonValue::Int(span.length as i64)));
 
         // Style reference (required for rendering)
-        if let Some(style_sym) = span.style_symbol {
-            event_fields.push((sym!(Style), IonValue::Symbol(style_sym)));
-        } else {
-            // Use default style if no specific style
-            event_fields.push((sym!(Style), IonValue::Symbol(ctx.default_style_symbol)));
+        let style_sym = span.style_symbol.unwrap_or(ctx.default_style_symbol);
+        if style_sym == ctx.default_style_symbol {
+            ctx.default_style_used = true;
         }
+        event_fields.push((sym!(Style), IonValue::Symbol(style_sym)));
 
         // Add span-specific attributes (e.g., link_to for links, yj.display for noterefs)
         for (field_id, value_str) in &span.kfx_attrs {
@@ -454,9 +455,9 @@ impl IonBuilder {
             // These interfere with image display when mixed with image children
             let has_real_text = self.accumulated_text.chars().any(|c| c != '\u{200B}');
             if has_real_text {
-                let (content_idx, _offset) = ctx.append_text(&self.accumulated_text);
+                let (content_name, content_idx) = ctx.append_text(&self.accumulated_text);
                 let content_ref = IonValue::Struct(vec![
-                    (sym!(Name), IonValue::Symbol(ctx.current_content_name)),
+                    (sym!(Name), IonValue::Symbol(content_name)),
                     (sym!(Index), IonValue::Int(content_idx as i64)),
                 ]);
                 self.fields.push((sym!(Content), content_ref));

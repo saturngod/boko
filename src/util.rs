@@ -288,6 +288,10 @@ pub enum MediaFormat {
     Ttf,
     /// OpenType font
     Otf,
+    /// WOFF web font
+    Woff,
+    /// WOFF2 web font
+    Woff2,
     /// Unknown/binary format
     Binary,
 }
@@ -303,6 +307,8 @@ impl MediaFormat {
             MediaFormat::WebP => "image/webp",
             MediaFormat::Ttf => "font/ttf",
             MediaFormat::Otf => "font/otf",
+            MediaFormat::Woff => "font/woff",
+            MediaFormat::Woff2 => "font/woff2",
             MediaFormat::Binary => "application/octet-stream",
         }
     }
@@ -321,7 +327,10 @@ impl MediaFormat {
 
     /// Check if this format represents a font.
     pub fn is_font(self) -> bool {
-        matches!(self, MediaFormat::Ttf | MediaFormat::Otf)
+        matches!(
+            self,
+            MediaFormat::Ttf | MediaFormat::Otf | MediaFormat::Woff | MediaFormat::Woff2
+        )
     }
 }
 
@@ -363,6 +372,12 @@ pub fn detect_media_format(path: &str, data: &[u8]) -> MediaFormat {
     if path_lower.ends_with(".otf") {
         return MediaFormat::Otf;
     }
+    if path_lower.ends_with(".woff") {
+        return MediaFormat::Woff;
+    }
+    if path_lower.ends_with(".woff2") {
+        return MediaFormat::Woff2;
+    }
 
     // Fallback to magic byte detection
     if data.len() >= 4 {
@@ -377,6 +392,13 @@ pub fn detect_media_format(path: &str, data: &[u8]) -> MediaFormat {
         // GIF: 47 49 46 (GIF)
         if data[0] == 0x47 && data[1] == 0x49 && data[2] == 0x46 {
             return MediaFormat::Gif;
+        }
+        // WOFF: "wOFF", WOFF2: "wOF2"
+        if data.starts_with(b"wOFF") {
+            return MediaFormat::Woff;
+        }
+        if data.starts_with(b"wOF2") {
+            return MediaFormat::Woff2;
         }
         // WebP: 52 49 46 46 ... 57 45 42 50 (RIFF...WEBP)
         if data.len() >= 12

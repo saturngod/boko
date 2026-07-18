@@ -131,9 +131,14 @@ pub fn serialize_container(
 
     let container_info_offset = format_caps_offset + format_caps_ion.len();
 
-    // kfxgen info JSON (matches Amazon's format)
+    // kfxgen info trailer. Amazon's grammar is JSON-except-the-field-labels:
+    // `[{key:"...",value:"..."}, ...]` — the literal `key`/`value` labels are
+    // bare, but every name and value is a quoted string. Tooling (e.g. the
+    // KFX Output plugin's kfxlib) patches the bare labels and then parses the
+    // rest as strict JSON, so unquoted values make the whole container
+    // unreadable to it.
     let kfxgen_info = format!(
-        r#"[{{key:kfxgen_package_version,value:boko-{}}},{{key:kfxgen_application_version,value:boko}},{{key:kfxgen_payload_sha1,value:{}}},{{key:kfxgen_acr,value:{}}}]"#,
+        r#"[{{key:"kfxgen_package_version",value:"boko-{}"}},{{key:"kfxgen_application_version",value:"boko"}},{{key:"kfxgen_payload_sha1",value:"{}"}},{{key:"kfxgen_acr",value:"{}"}}]"#,
         env!("CARGO_PKG_VERSION"),
         payload_sha1,
         container_id
