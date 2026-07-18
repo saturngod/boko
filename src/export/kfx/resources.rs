@@ -166,13 +166,26 @@ pub(super) fn build_font_fragments(book: &Book, ctx: &mut ExportContext) -> Vec<
 }
 
 /// Build anchor fragments ($266) for all recorded anchors.
-pub(super) fn build_anchor_fragments(ctx: &mut ExportContext) -> Vec<KfxFragment> {
+pub(super) fn build_anchor_fragments(
+    ctx: &mut ExportContext,
+    used_anchors: &BTreeSet<u64>,
+) -> Vec<KfxFragment> {
     let mut fragments = Vec::new();
+    let is_used = |ctx: &ExportContext, symbol: &str| {
+        ctx.symbols
+            .get(symbol)
+            .is_some_and(|sym| used_anchors.contains(&sym))
+    };
 
     // Get resolved internal anchors from the AnchorRegistry
     let resolved_anchors = ctx.anchor_registry.drain_anchors();
 
     for anchor in resolved_anchors {
+        // Anchors resolved for id'd elements that no link references would be
+        // unreachable fragments; skip them.
+        if !is_used(ctx, &anchor.symbol) {
+            continue;
+        }
         // Intern the anchor symbol to get its ID
         let anchor_symbol_id = ctx.symbols.get_or_intern(&anchor.symbol);
 
@@ -218,6 +231,9 @@ pub(super) fn build_anchor_fragments(ctx: &mut ExportContext) -> Vec<KfxFragment
             })
             .unwrap_or(crate::kfx::context::IdGenerator::FRAGMENT_MIN_ID);
         for symbol in unresolved {
+            if !is_used(ctx, &symbol) {
+                continue;
+            }
             let anchor_symbol_id = ctx.symbols.get_or_intern(&symbol);
             let ion = IonValue::Struct(vec![
                 (
@@ -240,6 +256,9 @@ pub(super) fn build_anchor_fragments(ctx: &mut ExportContext) -> Vec<KfxFragment
     let external_anchors = ctx.anchor_registry.drain_external_anchors();
 
     for anchor in external_anchors {
+        if !is_used(ctx, &anchor.symbol) {
+            continue;
+        }
         // Intern the anchor symbol to get its ID
         let anchor_symbol_id = ctx.symbols.get_or_intern(&anchor.symbol);
 

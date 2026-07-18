@@ -142,13 +142,17 @@ fn build_kfx_container(book: &Book) -> crate::Result<Vec<u8>> {
     fragments.extend(storyline_fragments);
     fragments.extend(content_fragments);
 
+    // Styles and anchors are filtered to what the built Ion actually
+    // references; registration alone does not imply emission.
+    let used = collect_used_symbols(&fragments);
+
     // 2g. Style entities ($157) - generated AFTER chapters since styles are collected during token generation
     // This includes the default style plus any unique styles found in the content
-    fragments.extend(build_style_fragments(&mut ctx));
+    fragments.extend(build_style_fragments(&mut ctx, &used.styles));
 
     // 2h. Anchor fragments - must come after sections/storylines/content/styles
     // This matches the reference KFX entity ordering
-    fragments.extend(build_anchor_fragments(&mut ctx));
+    fragments.extend(build_anchor_fragments(&mut ctx, &used.anchors));
 
     // 2i. Auxiliary data fragments - mark sections as navigation targets
     append_auxiliary_data_fragments(
@@ -535,7 +539,7 @@ fn append_resource_fragments(
     // registered during tokenization even when the element never reaches the
     // output (e.g. CSS background images), and an unreachable resource is a
     // conformance error.
-    let used_resource_symbols = collect_used_resource_symbols(fragments);
+    let used_resource_symbols = collect_used_symbols(fragments).resources;
 
     for asset_path in book.list_assets() {
         if is_media_asset(book, asset_path)
@@ -568,16 +572,35 @@ fn append_resource_fragments(
     }
 }
 
-/// Collect every resource-name symbol referenced from already-built fragments.
-fn collect_used_resource_symbols(fragments: &[KfxFragment]) -> BTreeSet<u64> {
-    fn walk(value: &IonValue, used: &mut BTreeSet<u64>) {
+/// Symbols referenced from already-built fragments, by kind.
+#[derive(Default)]
+struct UsedSymbols {
+    /// `resource_name` ($175) values — image resources in use.
+    resources: BTreeSet<u64>,
+    /// `style` ($157) field values — styles in use.
+    styles: BTreeSet<u64>,
+    /// `link_to` ($179) values — anchor symbols in use.
+    anchors: BTreeSet<u64>,
+}
+
+/// Collect every referenced resource/style/anchor symbol from built fragments.
+///
+/// Emitting a fragment nothing references (or referencing one that is never
+/// emitted) is a conformance error, so styles, anchors, and resources are all
+/// emitted from this reference walk rather than from registration state.
+fn collect_used_symbols(fragments: &[KfxFragment]) -> UsedSymbols {
+    fn walk(value: &IonValue, used: &mut UsedSymbols) {
         match value {
             IonValue::Struct(fields) => {
                 for (key, val) in fields {
-                    if *key == KfxSymbol::ResourceName as u64
-                        && let IonValue::Symbol(sym) = val
-                    {
-                        used.insert(*sym);
+                    if let IonValue::Symbol(sym) = val {
+                        if *key == KfxSymbol::ResourceName as u64 {
+                            used.resources.insert(*sym);
+                        } else if *key == KfxSymbol::Style as u64 {
+                            used.styles.insert(*sym);
+                        } else if *key == KfxSymbol::LinkTo as u64 {
+                            used.anchors.insert(*sym);
+                        }
                     }
                     walk(val, used);
                 }
@@ -592,7 +615,7 @@ fn collect_used_resource_symbols(fragments: &[KfxFragment]) -> BTreeSet<u64> {
         }
     }
 
-    let mut used = BTreeSet::new();
+    let mut used = UsedSymbols::default();
     for fragment in fragments {
         if let crate::kfx::fragment::FragmentData::Ion(value) = &fragment.data {
             walk(value, &mut used);

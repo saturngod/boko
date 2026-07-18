@@ -594,3 +594,109 @@ fn broken_internal_links_do_not_dangle() {
         );
     }
 }
+
+/// Styles and anchors are emitted only when referenced: an element with an id
+/// that nothing links to must not produce a $266 fragment, and every emitted
+/// $157 style must be referenced from a storyline.
+#[test]
+fn no_unreferenced_styles_or_anchors() {
+    use boko::kfx::container::{
+        extract_doc_symbols, parse_container_header, parse_container_info, parse_index_table,
+        skip_enty_header,
+    };
+    use boko::kfx::ion::{IonParser, IonValue};
+    use boko::kfx::symbols::{KFX_SYMBOL_TABLE, KfxSymbol};
+    use common::{Doc, EpubBuilder, Nav};
+
+    let epub = EpubBuilder::new("Orphan Book")
+        .doc(Doc::new(
+            "text/ch1.xhtml",
+            "One",
+            // The span has a style but collapses to nothing linkable; the id'd
+            // paragraph is a potential anchor target that nothing references.
+            "<p id=\"lonely\">unlinked target</p><p><span class=\"x\"></span>after empty span</p>",
+        ))
+        .nav(vec![Nav::new("One", "text/ch1.xhtml")])
+        .build();
+
+    let mut src = boko::Book::from_bytes(&epub, Format::Epub).expect("import epub");
+    let kfx = common::export_to_bytes(&mut src, Format::Kfx);
+
+    let header = parse_container_header(&kfx[..18]).unwrap();
+    let info = parse_container_info(
+        &kfx[header.container_info_offset
+            ..header.container_info_offset + header.container_info_length],
+    )
+    .unwrap();
+    let doc_symbols = match info.doc_symbols {
+        Some((off, len)) if len > 0 => extract_doc_symbols(&kfx[off..off + len]),
+        _ => Vec::new(),
+    };
+    let base = KFX_SYMBOL_TABLE.len() as u64;
+    let (io_, il) = info.index.unwrap();
+
+    let mut referenced_styles: std::collections::BTreeSet<u64> = Default::default();
+    let mut emitted_styles: Vec<String> = Vec::new();
+    let mut anchor_count = 0usize;
+
+    fn walk(v: &IonValue, styles: &mut std::collections::BTreeSet<u64>) {
+        match v {
+            IonValue::Struct(fields) => {
+                for (k, val) in fields {
+                    if *k == KfxSymbol::Style as u64
+                        && let IonValue::Symbol(s) = val
+                    {
+                        styles.insert(*s);
+                    }
+                    walk(val, styles);
+                }
+            }
+            IonValue::List(items) => items.iter().for_each(|i| walk(i, styles)),
+            IonValue::Annotated(_, inner) => walk(inner, styles),
+            _ => {}
+        }
+    }
+
+    for loc in parse_index_table(&kfx[io_..io_ + il], header.header_len) {
+        let payload = skip_enty_header(&kfx[loc.offset..loc.offset + loc.length]);
+        if loc.type_id == KfxSymbol::Storyline as u32 || loc.type_id == KfxSymbol::Section as u32 {
+            if let Ok(v) = IonParser::new(payload).parse() {
+                walk(&v, &mut referenced_styles);
+            }
+        } else if loc.type_id == KfxSymbol::Style as u32 {
+            let name = if loc.id as u64 >= base {
+                doc_symbols
+                    .get((loc.id as u64 - base) as usize)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            emitted_styles.push(name);
+        } else if loc.type_id == KfxSymbol::Anchor as u32 {
+            anchor_count += 1;
+        }
+    }
+
+    assert_eq!(
+        anchor_count, 0,
+        "no links exist, so no $266 anchors should be emitted"
+    );
+    // Every emitted style must be referenced (resolve names back to symbols).
+    let referenced_names: std::collections::BTreeSet<String> = referenced_styles
+        .iter()
+        .filter_map(|s| {
+            if *s >= base {
+                doc_symbols.get((*s - base) as usize).cloned()
+            } else {
+                None
+            }
+        })
+        .collect();
+    for name in &emitted_styles {
+        assert!(
+            referenced_names.contains(name),
+            "style {name:?} emitted but never referenced (referenced: {referenced_names:?})"
+        );
+    }
+}

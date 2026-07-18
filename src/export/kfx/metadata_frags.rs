@@ -4,16 +4,22 @@ use super::*;
 ///
 /// KFX requires every storyline element to have a style reference.
 /// This generates all collected styles from the registry, including the default.
-pub(super) fn build_style_fragments(ctx: &mut ExportContext) -> Vec<KfxFragment> {
+pub(super) fn build_style_fragments(
+    ctx: &mut ExportContext,
+    used_styles: &std::collections::BTreeSet<u64>,
+) -> Vec<KfxFragment> {
     // Drain all styles from the registry to generate Ion fragments
     let style_pairs = ctx.style_registry.drain_to_ion();
 
     style_pairs
         .into_iter()
         .filter(|(name, _)| {
-            // The default style is registered unconditionally; only ship it
-            // when something actually referenced it.
-            name != "s0" || ctx.default_style_used
+            // Registration does not imply usage: styles registered for spans
+            // or elements that were dropped during synthesis must not ship as
+            // unreferenced fragments.
+            ctx.symbols
+                .get(name)
+                .is_some_and(|sym| used_styles.contains(&sym))
         })
         .map(|(name, ion)| KfxFragment::new(KfxSymbol::Style, &name, ion))
         .collect()
