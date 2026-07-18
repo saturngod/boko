@@ -512,10 +512,14 @@ mod tests {
 
     #[test]
     fn test_build_format_capabilities_ion() {
-        let ion = build_format_capabilities_ion();
+        let with_text = build_format_capabilities_ion(true);
+        assert_eq!(&with_text[..4], &[0xe0, 0x01, 0x00, 0xea]);
 
-        // Should start with Ion BVM
-        assert_eq!(&ion[..4], &[0xe0, 0x01, 0x00, 0xea]);
+        // Image-only books must not declare kfxgen.textBlock; the list is
+        // empty and thus shorter.
+        let without_text = build_format_capabilities_ion(false);
+        assert_eq!(&without_text[..4], &[0xe0, 0x01, 0x00, 0xea]);
+        assert!(without_text.len() < with_text.len());
     }
 
     #[test]

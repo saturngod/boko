@@ -669,7 +669,10 @@ fn serialize_book(container_id: &str, fragments: &[KfxFragment], ctx: &ExportCon
     let symtab_ion = build_symbol_table_ion(local_syms);
 
     // Build format capabilities ION
-    let format_caps_ion = build_format_capabilities_ion();
+    let has_text_content = fragments
+        .iter()
+        .any(|f| f.ftype == KfxSymbol::Content as u64);
+    let format_caps_ion = build_format_capabilities_ion(has_text_content);
 
     // Serialize fragments to entities
     let entities = serialize_fragments(fragments, ctx.symbols.local_symbols());
