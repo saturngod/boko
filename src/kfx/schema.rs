@@ -427,14 +427,32 @@ impl KfxSchema {
             },
         );
 
-        // Sidebar
+        // Sidebar. Exported as a plain container carrying a
+        // `yj.semantics.type: sidebar` marker: Kindle Previewer never emits
+        // the $280 element type (it renders asides as styled containers or
+        // single-cell tables), so unknown-to-modern-firmware element types
+        // are avoided while boko round-trips keep the role. Import still
+        // recognizes the legacy $280 element type.
         self.register_element(
             KfxSymbol::Sidebar,
-            Strategy::Structure {
+            Strategy::StructureWithSemanticType {
                 role: Role::Sidebar,
-                kfx_type: KfxSymbol::Sidebar,
+                kfx_type: KfxSymbol::Container,
+                semantic_type: "sidebar",
             },
             vec![],
+        );
+        // register_element only wires the import side for this strategy;
+        // the export mapping (and the marker-based import via
+        // role_for_semantic_type) needs the explicit entry, same pattern as
+        // TableCell/BlockQuote.
+        self.export_strategy_table.insert(
+            Role::Sidebar,
+            Strategy::StructureWithSemanticType {
+                role: Role::Sidebar,
+                kfx_type: KfxSymbol::Container,
+                semantic_type: "sidebar",
+            },
         );
 
         // Horizontal rule

@@ -636,16 +636,21 @@ mod tests {
                     panic!("features should be a list");
                 }
 
-                // Media-derived features appear when the resource pass saw them.
+                // Media/content-derived features appear when the passes saw them.
                 let mut hdv_ctx = ExportContext::new();
                 hdv_ctx.has_hdv_image = true;
                 hdv_ctx.jpg_rst_marker_present = true;
+                hdv_ctx.has_tables = true;
                 let hdv_frag = build_content_features_fragment(&hdv_ctx);
                 if let crate::kfx::fragment::FragmentData::Ion(IonValue::Struct(f)) = &hdv_frag.data
                     && let Some((_, IonValue::List(items))) =
                         f.iter().find(|(id, _)| *id == KfxSymbol::Features as u64)
                 {
-                    assert_eq!(items.len(), 4, "HDV + RST flags add two entries");
+                    assert_eq!(
+                        items.len(),
+                        6,
+                        "HDV + RST + table + table-viewer flags add four entries"
+                    );
                 }
             } else {
                 panic!("expected Struct");

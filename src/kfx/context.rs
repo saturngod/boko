@@ -691,6 +691,10 @@ pub struct ExportContext {
     /// pass.
     pub jpg_rst_marker_present: bool,
 
+    /// The book contains table elements (drives the `yj_table` and
+    /// `yj_table_viewer` content features). Set during storyline export.
+    pub has_tables: bool,
+
     /// Chapters that need chapter-start anchors.
     chapters_needing_anchor: HashSet<ChapterId>,
 
@@ -774,6 +778,7 @@ impl ExportContext {
             cover_content_id: None,
             has_hdv_image: false,
             jpg_rst_marker_present: false,
+            has_tables: false,
             chapters_needing_anchor: HashSet::new(),
             pending_chapter_anchor: None,
             first_content_ids: HashMap::new(),

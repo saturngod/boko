@@ -282,18 +282,16 @@ fn start_element_fields(
         let types: Vec<&str> = epub_type.split_whitespace().collect();
         let is_footnote = types.contains(&"footnote");
         let is_endnote = types.contains(&"endnote") || types.contains(&"rearnote");
-        let is_sidenote = types.contains(&"sidebar") || types.contains(&"marginalia");
+        // Note: epub:type sidebar/marginalia gets no yj.classification.
+        // Kindle Previewer never emits yj.sidenote ($620) — the sidebar-ness
+        // is carried by the element's `yj.semantics.type: sidebar` marker
+        // instead (see the schema's Sidebar strategy).
 
         // Prefer endnote classification if both are present (common in EPUBs)
         if is_endnote {
             fields.push((
                 sym!(YjClassification),
                 IonValue::Symbol(KfxSymbol::YjEndnote as u64),
-            ));
-        } else if is_sidenote {
-            fields.push((
-                sym!(YjClassification),
-                IonValue::Symbol(KfxSymbol::YjSidenote as u64),
             ));
         } else if is_footnote {
             fields.push((
