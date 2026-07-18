@@ -552,11 +552,32 @@ pub(super) fn emit_definition_list(
             stream.push(KfxToken::EndElement); // end dt inner Paragraph
             stream.push(KfxToken::EndElement); // end dt Container
 
-            // Emit the paired dd content
+            // Emit the paired dd content. The wrapper already holds the dt
+            // element child, so any inline flow among the dd's children must
+            // be run-wrapped or the wrapper becomes a hybrid element
+            // (ref + children) — the shape the reference model forbids.
             if let Some((dd_id, _)) = dd_info {
-                // Emit dd's children directly (they're already Paragraphs)
+                let is_inline_flow = |role: Role| {
+                    matches!(role, Role::Text | Role::Break | Role::Link | Role::Inline)
+                };
+                let mut run_open = false;
                 for dd_child in chapter.children(dd_id) {
+                    let child_is_flow = chapter
+                        .node(dd_child)
+                        .is_some_and(|n| is_inline_flow(n.role));
+                    if child_is_flow && !run_open {
+                        let mut run = ElementStart::new(Role::Text);
+                        run.style_symbol = Some(wrapper_style);
+                        stream.push(KfxToken::StartElement(run));
+                        run_open = true;
+                    } else if !child_is_flow && run_open {
+                        stream.push(KfxToken::EndElement);
+                        run_open = false;
+                    }
                     walk_node_for_export(chapter, dd_child, sch, ctx, stream);
+                }
+                if run_open {
+                    stream.push(KfxToken::EndElement);
                 }
 
                 i += 1; // Skip the dd, we've processed it

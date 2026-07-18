@@ -1150,6 +1150,47 @@ mod content_model {
         assert!(field(quote_ion, KfxSymbol::Content).is_none());
     }
 
+    /// Definition-list wrappers (dt container + dd content) must not mix the
+    /// dt element child with bare dd text on one element — dd inline flow is
+    /// wrapped in its own run element (glossaries were the largest remaining
+    /// source of hybrid elements).
+    #[test]
+    fn definition_list_dd_text_gets_run_wrapped() {
+        let mut chapter = Chapter::new();
+        let dl = chapter.alloc_node(Node::new(Role::DefinitionList));
+        chapter.append_child(chapter.root(), dl);
+        let dt = chapter.alloc_node(Node::new(Role::DefinitionTerm));
+        chapter.append_child(dl, dt);
+        text_child(&mut chapter, dt, "term");
+        let dd = chapter.alloc_node(Node::new(Role::DefinitionDescription));
+        chapter.append_child(dl, dd);
+        text_child(&mut chapter, dd, "the definition text");
+
+        let (ion, _ctx) = export(&chapter);
+        // Walk the whole tree: no struct may carry both Content and ContentList.
+        fn assert_no_hybrid(v: &IonValue) {
+            match v {
+                IonValue::Struct(fields) => {
+                    let has_ref = fields.iter().any(|(k, _)| *k == KfxSymbol::Content as u64);
+                    let has_children = fields
+                        .iter()
+                        .any(|(k, _)| *k == KfxSymbol::ContentList as u64);
+                    assert!(
+                        !(has_ref && has_children),
+                        "hybrid element (ref + children): {fields:?}"
+                    );
+                    for (_, val) in fields {
+                        assert_no_hybrid(val);
+                    }
+                }
+                IonValue::List(items) => items.iter().for_each(assert_no_hybrid),
+                IonValue::Annotated(_, inner) => assert_no_hybrid(inner),
+                _ => {}
+            }
+        }
+        assert_no_hybrid(&ion);
+    }
+
     /// Simple paragraphs keep the compact single-ref encoding.
     #[test]
     fn simple_paragraph_keeps_single_ref() {
