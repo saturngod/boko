@@ -201,6 +201,41 @@ pub(super) fn build_anchor_fragments(ctx: &mut ExportContext) -> Vec<KfxFragment
         fragments.push(KfxFragment::new(KfxSymbol::Anchor, &anchor.symbol, ion));
     }
 
+    // Fallback anchors: symbols handed out to link_to references whose
+    // targets never resolved (broken internal links). A referenced-but-
+    // missing $266 is a conformance error; point them at the first section
+    // instead, mirroring go-to-start behavior for broken links.
+    let unresolved = ctx.anchor_registry.unresolved_symbols();
+    if !unresolved.is_empty() {
+        let fallback_id = ctx
+            .cover_fragment_id
+            .or_else(|| {
+                ctx.section_ids.first().and_then(|_| {
+                    ctx.spine_section_chapters
+                        .first()
+                        .and_then(|&(_, ch)| ctx.chapter_fragments.get(&ch).copied())
+                })
+            })
+            .unwrap_or(crate::kfx::context::IdGenerator::FRAGMENT_MIN_ID);
+        for symbol in unresolved {
+            let anchor_symbol_id = ctx.symbols.get_or_intern(&symbol);
+            let ion = IonValue::Struct(vec![
+                (
+                    KfxSymbol::AnchorName as u64,
+                    IonValue::Symbol(anchor_symbol_id),
+                ),
+                (
+                    KfxSymbol::Position as u64,
+                    IonValue::Struct(vec![(
+                        KfxSymbol::Id as u64,
+                        IonValue::Int(fallback_id as i64),
+                    )]),
+                ),
+            ]);
+            fragments.push(KfxFragment::new(KfxSymbol::Anchor, &symbol, ion));
+        }
+    }
+
     // Get external anchors (http/https links) from the AnchorRegistry
     let external_anchors = ctx.anchor_registry.drain_external_anchors();
 

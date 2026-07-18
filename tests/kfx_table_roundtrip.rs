@@ -505,3 +505,91 @@ fn unused_default_style_is_not_emitted() {
         "unreferenced default style s0 must not be emitted: {style_names:?}"
     );
 }
+
+/// Every anchor symbol referenced from a style event ($179 link_to) must have
+/// a matching $266 anchor fragment — a link to a missing target must not
+/// leave a dangling reference (fallback anchor to the book start instead).
+#[test]
+fn broken_internal_links_do_not_dangle() {
+    use boko::kfx::container::{
+        extract_doc_symbols, parse_container_header, parse_container_info, parse_index_table,
+        skip_enty_header,
+    };
+    use boko::kfx::ion::{IonParser, IonValue};
+    use boko::kfx::symbols::{KFX_SYMBOL_TABLE, KfxSymbol};
+    use common::{Doc, EpubBuilder, Nav};
+
+    let epub = EpubBuilder::new("Broken Link Book")
+        .doc(Doc::new(
+            "text/ch1.xhtml",
+            "One",
+            "<p>see <a href=\"#nonexistent-target\">the appendix</a> for more</p>",
+        ))
+        .nav(vec![Nav::new("One", "text/ch1.xhtml")])
+        .build();
+
+    let mut src = boko::Book::from_bytes(&epub, Format::Epub).expect("import epub");
+    let kfx = common::export_to_bytes(&mut src, Format::Kfx);
+
+    let header = parse_container_header(&kfx[..18]).unwrap();
+    let info = parse_container_info(
+        &kfx[header.container_info_offset
+            ..header.container_info_offset + header.container_info_length],
+    )
+    .unwrap();
+    let doc_symbols = match info.doc_symbols {
+        Some((off, len)) if len > 0 => extract_doc_symbols(&kfx[off..off + len]),
+        _ => Vec::new(),
+    };
+    let base = KFX_SYMBOL_TABLE.len() as u64;
+    let (io_, il) = info.index.unwrap();
+
+    let mut referenced: std::collections::BTreeSet<u64> = Default::default();
+    let mut anchor_fids: std::collections::BTreeSet<String> = Default::default();
+
+    fn walk(v: &IonValue, referenced: &mut std::collections::BTreeSet<u64>) {
+        match v {
+            IonValue::Struct(fields) => {
+                for (k, val) in fields {
+                    if *k == KfxSymbol::LinkTo as u64
+                        && let IonValue::Symbol(s) = val
+                    {
+                        referenced.insert(*s);
+                    }
+                    walk(val, referenced);
+                }
+            }
+            IonValue::List(items) => items.iter().for_each(|i| walk(i, referenced)),
+            IonValue::Annotated(_, inner) => walk(inner, referenced),
+            _ => {}
+        }
+    }
+
+    for loc in parse_index_table(&kfx[io_..io_ + il], header.header_len) {
+        let payload = skip_enty_header(&kfx[loc.offset..loc.offset + loc.length]);
+        if loc.type_id == KfxSymbol::Storyline as u32 {
+            if let Ok(v) = IonParser::new(payload).parse() {
+                walk(&v, &mut referenced);
+            }
+        } else if loc.type_id == KfxSymbol::Anchor as u32 && loc.id as u64 >= base {
+            if let Some(name) = doc_symbols.get((loc.id as u64 - base) as usize) {
+                anchor_fids.insert(name.clone());
+            }
+        }
+    }
+
+    assert!(
+        !referenced.is_empty(),
+        "the link should produce a link_to reference"
+    );
+    for sym in &referenced {
+        let name = doc_symbols
+            .get((*sym - base) as usize)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            anchor_fids.contains(&name),
+            "link_to references anchor {name:?} but no $266 fragment exists (have: {anchor_fids:?})"
+        );
+    }
+}

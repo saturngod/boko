@@ -158,6 +158,9 @@ pub(super) fn build_cover_storyline(chapter: &Chapter, ctx: &mut ExportContext) 
 
                 // Register style and get symbol
                 let style_symbol = ctx.register_style_id(node.style, &chapter.styles);
+                if style_symbol == ctx.default_style_symbol {
+                    ctx.default_style_used = true;
+                }
 
                 // Generate unique container ID
                 let container_id = ctx.fragment_ids.next_id();

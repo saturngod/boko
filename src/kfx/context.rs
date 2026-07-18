@@ -567,6 +567,23 @@ impl AnchorRegistry {
         std::mem::take(&mut self.resolved)
     }
 
+    /// Symbols handed out to links that never resolved to a position.
+    ///
+    /// Call after draining resolved anchors: whatever was registered (via
+    /// node, chapter, or href lookups) but never resolved needs a fallback
+    /// $266 fragment, or the emitted `link_to` references dangle.
+    pub fn unresolved_symbols(&self) -> Vec<String> {
+        let mut symbols: BTreeSet<&String> = BTreeSet::new();
+        symbols.extend(self.node_to_symbol.values());
+        symbols.extend(self.chapter_to_symbol.values());
+        symbols.extend(self.href_to_symbol.values());
+        symbols
+            .into_iter()
+            .filter(|s| !self.resolved_symbols.contains(*s))
+            .cloned()
+            .collect()
+    }
+
     /// Drain all external anchors for entity emission.
     pub fn drain_external_anchors(&mut self) -> Vec<ExternalAnchor> {
         std::mem::take(&mut self.external_anchors)

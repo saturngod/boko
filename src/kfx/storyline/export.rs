@@ -472,6 +472,9 @@ pub(super) fn emit_definition_list(
             } else {
                 ctx.default_style_symbol
             };
+            if wrapper_style == ctx.default_style_symbol {
+                ctx.default_style_used = true;
+            }
             wrapper_elem.style_symbol = Some(wrapper_style);
             stream.push(KfxToken::StartElement(wrapper_elem));
 

@@ -183,10 +183,10 @@ fn start_element_fields(
 
     // Style reference - use per-element style if available, else default
     // Required for text rendering on Kindle
-    if elem.style_symbol.is_none() {
+    let style_sym = elem.style_symbol.unwrap_or(ctx.default_style_symbol);
+    if style_sym == ctx.default_style_symbol {
         ctx.default_style_used = true;
     }
-    let style_sym = elem.style_symbol.unwrap_or(ctx.default_style_symbol);
     fields.push((sym!(Style), IonValue::Symbol(style_sym)));
 
     if container_wrapper {
@@ -414,13 +414,11 @@ impl IonBuilder {
         event_fields.push((sym!(Length), IonValue::Int(span.length as i64)));
 
         // Style reference (required for rendering)
-        if let Some(style_sym) = span.style_symbol {
-            event_fields.push((sym!(Style), IonValue::Symbol(style_sym)));
-        } else {
-            // Use default style if no specific style
+        let style_sym = span.style_symbol.unwrap_or(ctx.default_style_symbol);
+        if style_sym == ctx.default_style_symbol {
             ctx.default_style_used = true;
-            event_fields.push((sym!(Style), IonValue::Symbol(ctx.default_style_symbol)));
         }
+        event_fields.push((sym!(Style), IonValue::Symbol(style_sym)));
 
         // Add span-specific attributes (e.g., link_to for links, yj.display for noterefs)
         for (field_id, value_str) in &span.kfx_attrs {
