@@ -169,6 +169,26 @@ fn build_kfx_container(book: &Book) -> crate::Result<Vec<u8>> {
     // These link font_family names to resource locations (from @font-face rules)
     fragments.extend(build_font_fragments(book, &mut ctx));
 
+    // Prune font payloads no $262 entity references: every font asset was
+    // emitted as bcRawFont above, and the font entities' location fields are
+    // the single source of truth for which are reachable.
+    let referenced_fonts: BTreeSet<String> = fragments
+        .iter()
+        .filter(|f| f.ftype == KfxSymbol::Font as u64)
+        .filter_map(|f| match &f.data {
+            crate::kfx::fragment::FragmentData::Ion(IonValue::Struct(fields)) => fields
+                .iter()
+                .find(|(k, _)| *k == KfxSymbol::Location as u64)
+                .and_then(|(_, v)| match v {
+                    IonValue::String(loc) => Some(loc.clone()),
+                    _ => None,
+                }),
+            _ => None,
+        })
+        .collect();
+    fragments
+        .retain(|f| f.ftype != KfxSymbol::Bcrawfont as u64 || referenced_fonts.contains(&f.fid));
+
     // Rebuild content_features ($585) now that the resource pass has
     // determined the media-derived flags (HDV images, JPEG restart markers);
     // the copy pushed before chapters was a placeholder for ordering.
@@ -521,19 +541,6 @@ fn append_resource_fragments(
     fragments: &mut Vec<KfxFragment>,
     ctx: &mut ExportContext,
 ) {
-    // Fonts referenced from @font-face rules; anything else is unreachable
-    // in KFX (nothing can point at it) and the reference omits it.
-    let font_faces = book.font_faces();
-    let font_is_referenced = |asset_path: &str| {
-        font_faces.iter().any(|ff| {
-            ff.src == asset_path
-                || std::path::Path::new(&ff.src)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|f| asset_path.ends_with(f))
-        })
-    };
-
     // Images actually referenced from emitted Ion (storyline image elements,
     // cover section templates). Registry membership is not enough: srcs are
     // registered during tokenization even when the element never reaches the
@@ -548,11 +555,11 @@ fn append_resource_fragments(
             if detect_media_format(asset_path, &data).is_font() {
                 // Fonts are bcRawFont ($418) referenced by location from the
                 // root $262 font entities — no external_resource wrapper.
-                // Wrapping them as $417 + image-typed $164 makes reference
-                // tooling flag them as bad/unreferenced images.
-                if font_is_referenced(asset_path) {
-                    fragments.push(build_font_data_fragment(asset_path, data, ctx));
-                }
+                // Emitted for every font asset here; the ones no $262 entity
+                // ends up referencing are pruned after font entities are
+                // built (see build_kfx_container), keeping the two resolution
+                // paths from ever disagreeing.
+                fragments.push(build_font_data_fragment(asset_path, data, ctx));
                 continue;
             }
             let referenced = ctx

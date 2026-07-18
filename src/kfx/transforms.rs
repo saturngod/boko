@@ -348,6 +348,8 @@ pub fn format_to_kfx_symbol(format: MediaFormat) -> u64 {
         MediaFormat::WebP => KfxSymbol::Jpg as u64,
         MediaFormat::Ttf => KfxSymbol::Jpg as u64,
         MediaFormat::Otf => KfxSymbol::Jpg as u64,
+        MediaFormat::Woff => KfxSymbol::Jpg as u64,
+        MediaFormat::Woff2 => KfxSymbol::Jpg as u64,
         MediaFormat::Binary => KfxSymbol::Jpg as u64,
     }
 }
