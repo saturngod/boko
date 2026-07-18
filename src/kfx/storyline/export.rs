@@ -201,19 +201,74 @@ pub(super) fn walk_node_for_export(
         elem.set_semantic(SemanticTarget::EpubType, epub_type.to_string());
     }
 
+    let run_style_symbol = elem.style_symbol;
     stream.push(KfxToken::StartElement(elem));
 
-    // Emit text content if present
-    if !node.text.is_empty() {
-        let text = chapter.text(node.text);
-        if !text.is_empty() {
-            stream.push(KfxToken::Text(text.to_string()));
-        }
-    }
+    // Reference content model: an element never carries BOTH its own text
+    // and element children. When inline flow (text, breaks, links, spans)
+    // interleaves with element children (images, nested blocks), each run of
+    // inline flow is wrapped in its own text element with its own content
+    // ref — Kindle Previewer's encoding. The hybrid shape (one ref plus
+    // children) mis-accounts reading positions and never occurs in
+    // Amazon-produced books.
+    let is_inline_flow =
+        |role: Role| matches!(role, Role::Text | Role::Break | Role::Link | Role::Inline);
+    let children: Vec<NodeId> = chapter.children(node_id).collect();
+    let has_own_text = !node.text.is_empty() && !chapter.text(node.text).is_empty();
+    let has_flow = has_own_text
+        || children
+            .iter()
+            .any(|&c| chapter.node(c).is_some_and(|n| is_inline_flow(n.role)));
+    let has_elements = children
+        .iter()
+        .any(|&c| chapter.node(c).is_some_and(|n| !is_inline_flow(n.role)));
 
-    // Walk children
-    for child in chapter.children(node_id) {
-        walk_node_for_export(chapter, child, sch, ctx, stream);
+    if !(has_flow && has_elements) {
+        // Uniform content: emit text and children directly (single-ref or
+        // pure-children element).
+        if !node.text.is_empty() {
+            let text = chapter.text(node.text);
+            if !text.is_empty() {
+                stream.push(KfxToken::Text(text.to_string()));
+            }
+        }
+        for child in children {
+            walk_node_for_export(chapter, child, sch, ctx, stream);
+        }
+    } else {
+        // Mixed content: wrap each contiguous inline-flow run in a text
+        // element. Inline-flow nodes emit tokens without creating elements,
+        // so recursion inside the run wrapper does the right thing.
+        let mut run_open = false;
+        let open_run = |stream: &mut TokenStream, run_open: &mut bool| {
+            if !*run_open {
+                let mut run = ElementStart::new(Role::Text);
+                run.style_symbol = run_style_symbol;
+                stream.push(KfxToken::StartElement(run));
+                *run_open = true;
+            }
+        };
+        let close_run = |stream: &mut TokenStream, run_open: &mut bool| {
+            if *run_open {
+                stream.push(KfxToken::EndElement);
+                *run_open = false;
+            }
+        };
+
+        if has_own_text {
+            open_run(stream, &mut run_open);
+            stream.push(KfxToken::Text(chapter.text(node.text).to_string()));
+        }
+        for child in children {
+            let child_is_flow = chapter.node(child).is_some_and(|n| is_inline_flow(n.role));
+            if child_is_flow {
+                open_run(stream, &mut run_open);
+            } else {
+                close_run(stream, &mut run_open);
+            }
+            walk_node_for_export(chapter, child, sch, ctx, stream);
+        }
+        close_run(stream, &mut run_open);
     }
 
     stream.push(KfxToken::EndElement);
