@@ -408,6 +408,7 @@ fn register_nav_and_resource_symbols(book: &Book, ctx: &mut ExportContext) {
     ctx.nav_container_symbols.toc = ctx.symbols.get_or_intern("toc");
     ctx.nav_container_symbols.headings = ctx.symbols.get_or_intern("headings");
     ctx.nav_container_symbols.landmarks = ctx.symbols.get_or_intern("landmarks");
+    ctx.nav_container_symbols.page_list = ctx.symbols.get_or_intern("page_list");
 
     // Register resource paths and create short names
     // IMPORTANT: Short names must be interned during Pass 1 to ensure

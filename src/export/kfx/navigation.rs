@@ -72,6 +72,29 @@ pub(super) fn build_book_navigation_fragment_with_positions(
         nav_containers.push(annotated);
     }
 
+    // 4. Approximate page list: virtual page numbers (~1850 positions per
+    // page), so devices show "Page X of Y" for sideloaded books the way
+    // Kindle Previewer output does.
+    let page_entries = build_page_list_entries(ctx);
+    if !page_entries.is_empty() {
+        let page_container = IonValue::Struct(vec![
+            (
+                KfxSymbol::NavType as u64,
+                IonValue::Symbol(KfxSymbol::PageList as u64),
+            ),
+            (
+                KfxSymbol::NavContainerName as u64,
+                IonValue::Symbol(ctx.nav_container_symbols.page_list),
+            ),
+            (KfxSymbol::Entries as u64, IonValue::List(page_entries)),
+        ]);
+        let annotated = IonValue::Annotated(
+            vec![KfxSymbol::NavContainer as u64],
+            Box::new(page_container),
+        );
+        nav_containers.push(annotated);
+    }
+
     // Wrap in reading order structure: [{reading_order_name, nav_containers}]
     let reading_order = IonValue::Struct(vec![
         (
@@ -87,6 +110,51 @@ pub(super) fn build_book_navigation_fragment_with_positions(
     let book_nav = IonValue::List(vec![reading_order]);
 
     KfxFragment::singleton(KfxSymbol::BookNavigation, book_nav)
+}
+
+/// Positions per virtual page (Amazon's typical value).
+const KFX_POSITIONS_PER_PAGE: i64 = 1850;
+
+/// Build the approximate page list: one entry per ~1850 positions, labels
+/// "1".."N", each targeting the (eid, offset) where the page begins.
+pub(super) fn build_page_list_entries(ctx: &ExportContext) -> Vec<IonValue> {
+    let mut entries = Vec::new();
+    let mut next_page_position = 0i64;
+    let mut page = 0i64;
+
+    for (eid, length, start_pid) in page_position_chunks(ctx) {
+        // Emit every page boundary that falls inside this element.
+        while next_page_position < start_pid + length.max(1) {
+            if next_page_position >= start_pid {
+                page += 1;
+                let entry = IonValue::Struct(vec![
+                    (
+                        KfxSymbol::Representation as u64,
+                        IonValue::Struct(vec![(
+                            KfxSymbol::Label as u64,
+                            IonValue::String(page.to_string()),
+                        )]),
+                    ),
+                    (
+                        KfxSymbol::TargetPosition as u64,
+                        IonValue::Struct(vec![
+                            (KfxSymbol::Id as u64, IonValue::Int(eid as i64)),
+                            (
+                                KfxSymbol::Offset as u64,
+                                IonValue::Int(next_page_position - start_pid),
+                            ),
+                        ]),
+                    ),
+                ]);
+                entries.push(IonValue::Annotated(
+                    vec![KfxSymbol::NavUnit as u64],
+                    Box::new(entry),
+                ));
+            }
+            next_page_position += KFX_POSITIONS_PER_PAGE;
+        }
+    }
+    entries
 }
 
 /// Build headings navigation entries grouped by heading level.

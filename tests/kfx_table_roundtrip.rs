@@ -316,3 +316,130 @@ fn sidebar_exports_as_container_with_marker() {
     }
     assert!(saw_sidebar, "sidebar role lost through KFX round-trip");
 }
+
+/// Scan the book_navigation ($389) for an approximate page list ($237),
+/// returning (label, eid, offset) triples.
+fn scan_page_list(kfx: &[u8]) -> Vec<(String, i64, i64)> {
+    use boko::kfx::container::{
+        parse_container_header, parse_container_info, parse_index_table, skip_enty_header,
+    };
+    use boko::kfx::ion::{IonParser, IonValue};
+    use boko::kfx::symbols::KfxSymbol;
+
+    let header = parse_container_header(&kfx[..18]).expect("container header");
+    let info = parse_container_info(
+        &kfx[header.container_info_offset
+            ..header.container_info_offset + header.container_info_length],
+    )
+    .expect("container info");
+    let (index_offset, index_length) = info.index.expect("index table");
+    let entities = parse_index_table(
+        &kfx[index_offset..index_offset + index_length],
+        header.header_len,
+    );
+
+    let mut pages = Vec::new();
+    for loc in entities {
+        if loc.type_id != KfxSymbol::BookNavigation as u32 {
+            continue;
+        }
+        let payload = skip_enty_header(&kfx[loc.offset..loc.offset + loc.length]);
+        let Ok(value) = IonParser::new(payload).parse() else {
+            continue;
+        };
+
+        // Walk: find nav containers whose nav_type == PageList, collect entries.
+        fn walk(v: &IonValue, pages: &mut Vec<(String, i64, i64)>, in_page_list: bool) {
+            match v {
+                IonValue::Struct(fields) => {
+                    let is_page_list = fields.iter().any(|(k, val)| {
+                        *k == KfxSymbol::NavType as u64
+                            && matches!(val, IonValue::Symbol(s) if *s == KfxSymbol::PageList as u64)
+                    });
+                    if in_page_list || is_page_list {
+                        // page entry: {representation: {label}, target_position: {id, offset}}
+                        let mut label = None;
+                        let mut eid = None;
+                        let mut off = 0;
+                        for (k, val) in fields {
+                            if *k == KfxSymbol::Representation as u64
+                                && let IonValue::Struct(r) = val
+                            {
+                                for (rk, rv) in r {
+                                    if *rk == KfxSymbol::Label as u64
+                                        && let IonValue::String(s) = rv
+                                    {
+                                        label = Some(s.clone());
+                                    }
+                                }
+                            }
+                            if *k == KfxSymbol::TargetPosition as u64
+                                && let IonValue::Struct(t) = val
+                            {
+                                for (tk, tv) in t {
+                                    if let IonValue::Int(n) = tv {
+                                        if *tk == KfxSymbol::Id as u64 {
+                                            eid = Some(*n);
+                                        } else if *tk == KfxSymbol::Offset as u64 {
+                                            off = *n;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let (Some(l), Some(e)) = (label, eid) {
+                            pages.push((l, e, off));
+                        }
+                    }
+                    for (_, val) in fields {
+                        walk(val, pages, in_page_list || is_page_list);
+                    }
+                }
+                IonValue::List(items) => {
+                    for item in items {
+                        walk(item, pages, in_page_list);
+                    }
+                }
+                IonValue::Annotated(_, inner) => walk(inner, pages, in_page_list),
+                _ => {}
+            }
+        }
+        walk(&value, &mut pages, false);
+    }
+    pages
+}
+
+/// Books get an approximate page list (~1850 positions per page) so devices
+/// show virtual page numbers, like Kindle Previewer output.
+#[test]
+fn kfx_carries_approximate_page_list() {
+    use common::{Doc, EpubBuilder, Nav};
+
+    // ~6000 characters of text -> expect ceil(total/1850) >= 3 pages.
+    let para = "Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod. ".repeat(12);
+    let body: String = (0..7)
+        .map(|i| format!("<p>chunk {i}: {para}</p>"))
+        .collect();
+    let epub = EpubBuilder::new("Paged Book")
+        .doc(Doc::new("text/ch1.xhtml", "One", &body))
+        .nav(vec![Nav::new("One", "text/ch1.xhtml")])
+        .build();
+
+    let mut src = boko::Book::from_bytes(&epub, Format::Epub).expect("import epub");
+    let kfx = common::export_to_bytes(&mut src, Format::Kfx);
+
+    let pages = scan_page_list(&kfx);
+    assert!(
+        pages.len() >= 3,
+        "expected an approximate page list, got {} pages",
+        pages.len()
+    );
+    // Labels are sequential 1..N.
+    for (i, (label, _, _)) in pages.iter().enumerate() {
+        assert_eq!(label, &(i + 1).to_string(), "page labels must be 1..N");
+    }
+    // First page targets the start of content.
+    assert_eq!(pages[0].2, 0, "first page starts at offset 0");
+    // Offsets are non-negative and eids are positive.
+    assert!(pages.iter().all(|(_, e, o)| *e > 0 && *o >= 0));
+}
