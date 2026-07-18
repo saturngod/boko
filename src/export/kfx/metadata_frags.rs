@@ -182,6 +182,20 @@ pub(super) fn build_content_features_fragment(ctx: &ExportContext) -> KfxFragmen
         ));
     }
 
+    // Sections above 65536 positions overflow the renderer's default position
+    // handling (crashes when paging deep into a long chapter, and on
+    // "go to page"). Declaring reflow-section-size enables the device's
+    // large-section support; the value follows Amazon's formula.
+    let max_section_pids = max_section_position_count(ctx);
+    if max_section_pids > 65536 {
+        let size = (((max_section_pids - 65536) / 16384) + 2).min(256);
+        features.push(feature_entry(
+            "com.amazon.yjconversion",
+            "reflow-section-size",
+            size,
+        ));
+    }
+
     let content_features =
         IonValue::Struct(vec![(KfxSymbol::Features as u64, IonValue::List(features))]);
 

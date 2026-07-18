@@ -314,6 +314,23 @@ pub(super) fn build_container_entity_map_fragment(
     KfxFragment::singleton(KfxSymbol::ContainerEntityMap, ion)
 }
 
+/// Largest per-section position count in the book.
+///
+/// Sections above 65536 positions need the `reflow-section-size` content
+/// feature declared (see `build_content_features_fragment`); without it the
+/// renderer's position handling overflows deep into the section — paging
+/// crashes partway through long chapters, and "go to page" crashes outright.
+pub(super) fn max_section_position_count(ctx: &ExportContext) -> i64 {
+    let mut per_section: Vec<i64> = Vec::new();
+    for chunk in position_chunks(ctx) {
+        if per_section.len() <= chunk.section {
+            per_section.resize(chunk.section + 1, 0);
+        }
+        per_section[chunk.section] += chunk.length;
+    }
+    per_section.into_iter().max().unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
