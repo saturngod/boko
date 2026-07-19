@@ -317,6 +317,87 @@ fn box_align_rides_block_styles_not_style_events() {
     }
 }
 
+/// Adjoining vertical margins must be collapsed statically, like Kindle
+/// Previewer output: the Kindle renderer does not collapse margins, so an
+/// uncollapsed `margin: 1em 0` paragraph sequence renders double gaps.
+/// The collapsed value (max of the adjoining margins, resolved absolutely)
+/// rides the following block's margin-top; only the section's last block
+/// keeps a margin-bottom.
+#[test]
+fn adjoining_margins_collapse_statically() {
+    use common::{Doc, EpubBuilder, Nav};
+
+    let epub = EpubBuilder::new("Collapse Book")
+        .css(".big { margin-bottom: 3em; } .after { margin-top: 2em; }")
+        .doc(Doc::new(
+            "text/ch1.xhtml",
+            "One",
+            "<p>First paragraph with default margins.</p>\
+             <p>Second paragraph with default margins.</p>\
+             <p class=\"big\">Three-em bottom margin here.</p>\
+             <p class=\"after\">Two-em top margin loses to the three.</p>\
+             <p>Last paragraph keeps its bottom margin.</p>",
+        ))
+        .nav(vec![Nav::new("One", "text/ch1.xhtml")])
+        .build();
+
+    let mut book = boko::Book::from_bytes(&epub, Format::Epub).expect("import epub");
+    let kfx = common::export_to_bytes(&mut book, Format::Kfx);
+
+    // Collect every (margin-top, margin-bottom) pair from emitted styles,
+    // in lh units.
+    let dim = |fields: &[(u64, IonValue)], sym: KfxSymbol| -> Option<f64> {
+        let IonValue::Struct(d) = get_field(fields, sym)? else {
+            return None;
+        };
+        let value = get_field(d, KfxSymbol::Value)?;
+        let unit = get_field(d, KfxSymbol::Unit)?.as_symbol()?;
+        assert_eq!(
+            unit,
+            KfxSymbol::Lh as u64,
+            "vertical margins must be in lh units"
+        );
+        value
+            .as_float()
+            .or_else(|| value.as_int().map(|i| i as f64))
+            .or_else(|| match value {
+                IonValue::Decimal(s) => s.parse().ok(),
+                _ => None,
+            })
+    };
+
+    let mut margin_bottoms = 0;
+    let mut saw_collapsed_3em = false;
+    for style in parse_entities(&kfx, KfxSymbol::Style as u32) {
+        let IonValue::Struct(fields) = &style else {
+            continue;
+        };
+        if dim(fields, KfxSymbol::MarginBottom).is_some() {
+            margin_bottoms += 1;
+        }
+        if let Some(mt) = dim(fields, KfxSymbol::MarginTop) {
+            // max(3em, 2em) = 3em = 2.5lh — the collapsed gap on the
+            // following block.
+            if (mt - 2.5).abs() < 1e-3 {
+                saw_collapsed_3em = true;
+            }
+            assert!(
+                (mt - 2.0 / 1.2).abs() > 1e-3,
+                "an uncollapsed 2em margin-top survived (2em should lose to \
+                 the preceding 3em margin-bottom)"
+            );
+        }
+    }
+    assert!(
+        saw_collapsed_3em,
+        "the collapsed 3em gap must ride the following block's margin-top"
+    );
+    assert_eq!(
+        margin_bottoms, 1,
+        "only the section's last block keeps a margin-bottom"
+    );
+}
+
 /// `box_align: center` must require an author's explicit `margin: auto`.
 /// Margins that were never set are the CSS initial `0`, not `auto` — gold
 /// masters never center a `width: 50%` block with unset margins (it sits

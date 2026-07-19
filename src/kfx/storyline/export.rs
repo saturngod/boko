@@ -31,10 +31,16 @@ pub fn ir_to_tokens(chapter: &Chapter, ctx: &mut ExportContext) -> TokenStream {
     // one ExportContext is reused across chapters.
     ctx.reset_style_memo();
 
+    // Pre-compute static margin collapsing: the Kindle renderer does not
+    // collapse adjoining margins, so the collapsed values are baked into
+    // per-position style overrides (see collapse.rs).
+    let adjust = super::collapse::compute_margin_collapse(chapter);
+
     walk_node_for_export(
         chapter,
         chapter.root(),
         crate::style::StyleId::DEFAULT,
+        &adjust,
         sch,
         ctx,
         &mut stream,
@@ -51,6 +57,7 @@ pub(super) fn walk_node_for_export(
     chapter: &Chapter,
     node_id: NodeId,
     parent_style: crate::style::StyleId,
+    adjust: &super::collapse::MarginAdjustMap,
     sch: &crate::kfx::schema::KfxSchema,
     ctx: &mut ExportContext,
     stream: &mut TokenStream,
@@ -63,7 +70,7 @@ pub(super) fn walk_node_for_export(
     // Root node: just walk children
     if node.role == Role::Root {
         for child in chapter.children(node_id) {
-            walk_node_for_export(chapter, child, parent_style, sch, ctx, stream);
+            walk_node_for_export(chapter, child, parent_style, adjust, sch, ctx, stream);
         }
         return;
     }
@@ -90,7 +97,7 @@ pub(super) fn walk_node_for_export(
     // Definition lists: group dt+dd pairs into wrapper elements
     // HTML has dt/dd as flat siblings, but KFX needs them grouped for float to work
     if node.role == Role::DefinitionList {
-        emit_definition_list(chapter, node_id, parent_style, sch, ctx, stream);
+        emit_definition_list(chapter, node_id, parent_style, adjust, sch, ctx, stream);
         return;
     }
 
@@ -113,7 +120,12 @@ pub(super) fn walk_node_for_export(
 
     // Register the node's style and get a KFX style symbol
     // This converts IR ComputedStyle → KFX style and deduplicates
-    let style_symbol = ctx.register_style_id(node.style, parent_style, &chapter.styles);
+    let style_symbol = match adjust.get(&node_id) {
+        Some(&adj) => {
+            ctx.register_style_id_adjusted(node.style, parent_style, &chapter.styles, adj)
+        }
+        None => ctx.register_style_id(node.style, parent_style, &chapter.styles),
+    };
     elem.style_symbol = Some(style_symbol);
 
     // Check if this element needs container wrapping for borders to render
@@ -251,7 +263,7 @@ pub(super) fn walk_node_for_export(
             }
         }
         for child in children {
-            walk_node_for_export(chapter, child, node.style, sch, ctx, stream);
+            walk_node_for_export(chapter, child, node.style, adjust, sch, ctx, stream);
         }
     } else {
         // Mixed content: wrap each contiguous inline-flow run in a text
@@ -284,7 +296,7 @@ pub(super) fn walk_node_for_export(
             } else {
                 close_run(stream, &mut run_open);
             }
-            walk_node_for_export(chapter, child, node.style, sch, ctx, stream);
+            walk_node_for_export(chapter, child, node.style, adjust, sch, ctx, stream);
         }
         close_run(stream, &mut run_open);
     }
@@ -496,6 +508,7 @@ pub(super) fn emit_definition_list(
     chapter: &Chapter,
     node_id: NodeId,
     parent_style: crate::style::StyleId,
+    adjust: &super::collapse::MarginAdjustMap,
     sch: &crate::kfx::schema::KfxSchema,
     ctx: &mut ExportContext,
     stream: &mut TokenStream,
@@ -568,7 +581,7 @@ pub(super) fn emit_definition_list(
             stream.push(KfxToken::StartElement(dt_inner));
 
             for dt_child in chapter.children(child_id) {
-                walk_node_for_export(chapter, dt_child, child.style, sch, ctx, stream);
+                walk_node_for_export(chapter, dt_child, child.style, adjust, sch, ctx, stream);
             }
 
             stream.push(KfxToken::EndElement); // end dt inner Paragraph
@@ -596,7 +609,7 @@ pub(super) fn emit_definition_list(
                         stream.push(KfxToken::EndElement);
                         run_open = false;
                     }
-                    walk_node_for_export(chapter, dd_child, dd_style_id, sch, ctx, stream);
+                    walk_node_for_export(chapter, dd_child, dd_style_id, adjust, sch, ctx, stream);
                 }
                 if run_open {
                     stream.push(KfxToken::EndElement);
@@ -609,7 +622,7 @@ pub(super) fn emit_definition_list(
             stream.push(KfxToken::EndElement);
         } else {
             // Non-dt child (orphan dd or other), emit normally
-            walk_node_for_export(chapter, child_id, node.style, sch, ctx, stream);
+            walk_node_for_export(chapter, child_id, node.style, adjust, sch, ctx, stream);
         }
 
         i += 1;

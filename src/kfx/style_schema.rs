@@ -424,9 +424,11 @@ impl StyleSchema {
                 ("center".into(), KfxValue::Symbol(KfxSymbol::Center)),
                 ("right".into(), KfxValue::Symbol(KfxSymbol::Right)),
                 ("justify".into(), KfxValue::Symbol(KfxSymbol::Justify)),
-                // Start/End are distinct for RTL language support
-                ("start".into(), KfxValue::Symbol(KfxSymbol::Start)),
-                ("end".into(), KfxValue::Symbol(KfxSymbol::End)),
+                // Logical start/end fold to the physical sides (LTR):
+                // reference output never emits the Start/End symbols and
+                // KFX consumers reject them in styles.
+                ("start".into(), KfxValue::Symbol(KfxSymbol::Left)),
+                ("end".into(), KfxValue::Symbol(KfxSymbol::Right)),
             ]),
         });
 
@@ -1453,6 +1455,14 @@ fn parse_color_component(s: &str) -> Option<u8> {
 fn fmt_dim(v: f64, unit: &str) -> String {
     let rounded = (v * 1e6).round() / 1e6;
     format!("{}{}", rounded, unit)
+}
+
+/// Convert an absolute vertical margin (root-em) to the lh value the given
+/// element's style emits — used by the margin-collapse pass to override
+/// margins with position-dependent collapsed values.
+pub(crate) fn margin_abs_em_to_lh(s: &ir_style::ComputedStyle, abs_em: f64) -> f64 {
+    let em = abs_em / s.font_size_abs.0 as f64;
+    em / (emitted_line_height_lh(s) * 1.2)
 }
 
 /// The element's line-height as emitted (in lh units): `normal` is 1lh;
@@ -2779,14 +2789,15 @@ mod tests {
         let schema = StyleSchema::standard();
         let rule = schema.get_first("text-align").unwrap();
 
-        // Start/End should be distinct from Left/Right for RTL support
+        // Logical start/end fold to the physical sides: reference output
+        // never emits the Start/End symbols and KFX consumers reject them.
         assert!(matches!(
             rule.transform.apply("start"),
-            Some(KfxValue::Symbol(KfxSymbol::Start))
+            Some(KfxValue::Symbol(KfxSymbol::Left))
         ));
         assert!(matches!(
             rule.transform.apply("end"),
-            Some(KfxValue::Symbol(KfxSymbol::End))
+            Some(KfxValue::Symbol(KfxSymbol::Right))
         ));
         assert!(matches!(
             rule.transform.apply("left"),

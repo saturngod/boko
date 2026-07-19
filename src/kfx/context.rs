@@ -710,6 +710,10 @@ pub struct ExportContext {
     /// registers under a different symbol than its block form).
     ir_inline_style_memo: FxHashMap<(StyleId, StyleId), u64>,
 
+    /// Memo for `register_style_id_adjusted` (same lifecycle): the key adds
+    /// the margin-collapse override bits to the (style, parent) pair.
+    ir_adjusted_style_memo: FxHashMap<(StyleId, StyleId, Option<u32>, Option<u32>), u64>,
+
     /// Anchor registry for link target resolution.
     pub anchor_registry: AnchorRegistry,
 
@@ -823,6 +827,7 @@ impl ExportContext {
             style_registry: StyleRegistry::new(default_style_symbol),
             ir_style_memo: FxHashMap::default(),
             ir_inline_style_memo: FxHashMap::default(),
+            ir_adjusted_style_memo: FxHashMap::default(),
             anchor_registry: AnchorRegistry::new(),
             landmark_fragments: HashMap::new(),
             nav_container_symbols: NavContainerSymbols::default(),
@@ -858,6 +863,7 @@ impl ExportContext {
     pub fn reset_style_memo(&mut self) {
         self.ir_style_memo.clear();
         self.ir_inline_style_memo.clear();
+        self.ir_adjusted_style_memo.clear();
     }
 
     /// Prepare context for processing a new chapter.
@@ -976,6 +982,74 @@ impl ExportContext {
             self.default_style_symbol
         };
         self.ir_style_memo.insert((style_id, parent_id), symbol);
+        symbol
+    }
+
+    /// Register an IR style with margin-collapse overrides applied: the
+    /// built KFX style's margin-top/bottom are replaced with the collapsed
+    /// values (in lh of the element's line box) or removed when collapsed
+    /// to zero. Memoized by (style, parent, override bits) — collapsed
+    /// sequences repeat, so identical adjusted styles dedup.
+    pub fn register_style_id_adjusted(
+        &mut self,
+        style_id: StyleId,
+        parent_id: StyleId,
+        style_pool: &crate::style::StylePool,
+        adjust: crate::kfx::storyline::MarginAdjust,
+    ) -> u64 {
+        if adjust.is_identity() {
+            return self.register_style_id(style_id, parent_id, style_pool);
+        }
+        let key = (
+            style_id,
+            parent_id,
+            adjust.top_abs_em.map(f32::to_bits),
+            adjust.bottom_abs_em.map(f32::to_bits),
+        );
+        if let Some(&symbol) = self.ir_adjusted_style_memo.get(&key) {
+            return symbol;
+        }
+
+        let default = crate::style::ComputedStyle::default();
+        let ir_style = style_pool.get(style_id);
+        let parent = style_pool.get(parent_id).unwrap_or(&default);
+        let ir_style_ref = ir_style.unwrap_or(&default);
+
+        let schema = crate::kfx::style_schema::StyleSchema::standard();
+        let mut builder = crate::kfx::style_registry::StyleBuilder::new(schema);
+        builder.ingest_ir_style_with_parent(ir_style_ref, parent);
+        let mut kfx_style = builder.build();
+
+        use crate::kfx::style_schema::KfxValue;
+        use crate::kfx::symbols::KfxSymbol;
+        let mut apply = |symbol: KfxSymbol, abs_em: Option<f32>| {
+            if let Some(v) = abs_em {
+                if v == 0.0 {
+                    kfx_style.remove(symbol);
+                } else {
+                    let lh = crate::kfx::style_schema::margin_abs_em_to_lh(ir_style_ref, v as f64);
+                    // Round like extract_ir_field's dimension formatting.
+                    let lh = (lh * 1e6).round() / 1e6;
+                    kfx_style.set(
+                        symbol,
+                        KfxValue::Dimensioned {
+                            value: lh,
+                            unit: KfxSymbol::Lh,
+                        },
+                    );
+                }
+            }
+        };
+        apply(KfxSymbol::MarginTop, adjust.top_abs_em);
+        apply(KfxSymbol::MarginBottom, adjust.bottom_abs_em);
+
+        let symbol = if kfx_style.is_empty() {
+            self.default_style_used = true;
+            self.default_style_symbol
+        } else {
+            self.style_registry.register(kfx_style, &mut self.symbols)
+        };
+        self.ir_adjusted_style_memo.insert(key, symbol);
         symbol
     }
 
