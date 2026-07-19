@@ -225,6 +225,38 @@ fn font_size_is_never_percent() {
     );
 }
 
+/// An empty chapter must still produce a (possibly empty) content_list —
+/// a null content_list is rejected by KFX consumers ("unknown content_list
+/// data type: NoneType").
+#[test]
+fn empty_chapter_storyline_has_list_content_list() {
+    use common::{Doc, EpubBuilder, Nav};
+
+    let epub = EpubBuilder::new("Empty Chapter Book")
+        .doc(Doc::new("text/blank.xhtml", "Blank", ""))
+        .doc(Doc::new("text/ch1.xhtml", "One", "<p>text</p>"))
+        .nav(vec![
+            Nav::new("Blank", "text/blank.xhtml"),
+            Nav::new("One", "text/ch1.xhtml"),
+        ])
+        .build();
+
+    let mut book = boko::Book::from_bytes(&epub, Format::Epub).expect("import epub");
+    let kfx = common::export_to_bytes(&mut book, Format::Kfx);
+
+    let storylines = parse_entities(&kfx, KfxSymbol::Storyline as u32);
+    assert!(storylines.len() >= 2, "expected a storyline per chapter");
+    for storyline in &storylines {
+        let IonValue::Struct(fields) = storyline else {
+            panic!("storyline is not a struct");
+        };
+        match get_field(fields, KfxSymbol::ContentList) {
+            Some(IonValue::List(_)) => {}
+            other => panic!("content_list must be a list, got: {other:?}"),
+        }
+    }
+}
+
 /// Books without a source identifier still get a deterministic content_id
 /// (seeded from title+author): the Kindle keys sideloaded cover thumbnails
 /// by content_id, so an id-less book can never show its cover.

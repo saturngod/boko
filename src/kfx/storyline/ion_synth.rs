@@ -536,11 +536,12 @@ impl IonBuilder {
             }
 
             IonValue::Struct(self.fields)
-        } else if !self.children.is_empty() {
-            // Root level: return list of children
-            IonValue::List(self.children)
         } else {
-            IonValue::Null
+            // Root level: return the children as the storyline content_list.
+            // An empty chapter must still yield an empty list — a null
+            // content_list is rejected by KFX consumers ("unknown
+            // content_list data type: NoneType").
+            IonValue::List(self.children)
         }
     }
 }
