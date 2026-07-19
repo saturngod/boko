@@ -349,6 +349,45 @@ fn empty_chapter_storyline_has_list_content_list() {
     }
 }
 
+/// `visibility` must encode as an Ion boolean (true = visible, false =
+/// hidden), matching reference KFX; readers flag symbol values as
+/// unexpected style data.
+#[test]
+fn visibility_encodes_as_boolean() {
+    use common::{Doc, EpubBuilder, Nav};
+
+    let epub = EpubBuilder::new("Visibility Book")
+        .css(".h { visibility: hidden; }")
+        .doc(Doc::new(
+            "text/ch1.xhtml",
+            "One",
+            "<p>shown</p><p class=\"h\">hidden paragraph</p>",
+        ))
+        .nav(vec![Nav::new("One", "text/ch1.xhtml")])
+        .build();
+
+    let mut book = boko::Book::from_bytes(&epub, Format::Epub).expect("import epub");
+    let kfx = common::export_to_bytes(&mut book, Format::Kfx);
+
+    let mut saw_visibility = false;
+    for style in parse_entities(&kfx, KfxSymbol::Style as u32) {
+        let IonValue::Struct(fields) = &style else {
+            continue;
+        };
+        if let Some(value) = get_field(fields, KfxSymbol::Visibility) {
+            saw_visibility = true;
+            assert!(
+                matches!(value, IonValue::Bool(false)),
+                "visibility: hidden must encode as Ion bool false, got: {value:?}"
+            );
+        }
+    }
+    assert!(
+        saw_visibility,
+        "hidden paragraph should emit a visibility property"
+    );
+}
+
 /// Consecutive empty anchor targets must not produce anchor positions with
 /// offsets into dropped marker text. An empty target element emits no
 /// content; a second anchor in the same run used to sit at offset 1 past

@@ -1027,15 +1027,17 @@ impl StyleSchema {
             transform: ValueTransform::Identity,
         });
 
-        // Visibility
+        // Visibility. Reference KFX encodes this as an Ion boolean
+        // (true = visible, false = hidden), not a symbol — readers flag
+        // symbol values as unexpected style data.
         schema.register(StylePropertyRule {
             ir_key: "visibility",
             ir_field: Some(IrField::Visibility),
             kfx_symbol: KfxSymbol::Visibility,
             transform: ValueTransform::Map(vec![
-                ("visible".into(), KfxValue::Symbol(KfxSymbol::Show)),
-                ("hidden".into(), KfxValue::Symbol(KfxSymbol::Hide)),
-                ("collapse".into(), KfxValue::Symbol(KfxSymbol::Hide)),
+                ("visible".into(), KfxValue::Bool(true)),
+                ("hidden".into(), KfxValue::Bool(false)),
+                ("collapse".into(), KfxValue::Bool(false)),
             ]),
         });
 
@@ -2939,13 +2941,18 @@ mod tests {
         let schema = StyleSchema::standard();
         let rule = schema.get_first("visibility").unwrap();
 
+        // Reference KFX encodes visibility as an Ion boolean, not a symbol.
         assert!(matches!(
             rule.transform.apply("visible"),
-            Some(KfxValue::Symbol(KfxSymbol::Show))
+            Some(KfxValue::Bool(true))
         ));
         assert!(matches!(
             rule.transform.apply("hidden"),
-            Some(KfxValue::Symbol(KfxSymbol::Hide))
+            Some(KfxValue::Bool(false))
+        ));
+        assert!(matches!(
+            rule.transform.apply("collapse"),
+            Some(KfxValue::Bool(false))
         ));
     }
 
