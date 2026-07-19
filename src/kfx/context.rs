@@ -547,6 +547,26 @@ impl AnchorRegistry {
             .or_insert((fragment_id, offset));
     }
 
+    /// Zero every recorded offset that points into `fragment_id`.
+    ///
+    /// Called when an element's accumulated text turns out to be
+    /// anchor-marker zero-width spaces only and is dropped from the output:
+    /// offsets counted against that phantom text (e.g. a second anchor after
+    /// a marker) would point past the element's actual (empty) content,
+    /// which readers cannot locate.
+    pub fn clamp_offsets_at(&mut self, fragment_id: u64) {
+        for pos in self.node_positions.values_mut() {
+            if pos.0 == fragment_id {
+                pos.1 = 0;
+            }
+        }
+        for anchor in &mut self.resolved {
+            if anchor.fragment_id == fragment_id {
+                anchor.offset = 0;
+            }
+        }
+    }
+
     /// Record the position of a chapter start.
     pub fn record_chapter_position(&mut self, chapter: ChapterId, fragment_id: u64) {
         self.chapter_positions.entry(chapter).or_insert(fragment_id);

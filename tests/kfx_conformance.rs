@@ -349,6 +349,78 @@ fn empty_chapter_storyline_has_list_content_list() {
     }
 }
 
+/// Consecutive empty anchor targets must not produce anchor positions with
+/// offsets into dropped marker text. An empty target element emits no
+/// content; a second anchor in the same run used to sit at offset 1 past
+/// nothing, which readers cannot locate ("locate_offset failed", broken
+/// in-book navigation). All anchors into an empty element resolve at 0.
+#[test]
+fn anchors_into_empty_targets_have_zero_offset() {
+    use common::{Doc, EpubBuilder, Nav};
+
+    let epub = EpubBuilder::new("Anchor Book")
+        .doc(Doc::new(
+            "text/ch1.xhtml",
+            "One",
+            "<div><a id=\"first\"></a><a id=\"second\"></a></div>\
+             <p>go to <a href=\"#first\">first</a> and <a href=\"#second\">second</a></p>",
+        ))
+        .nav(vec![Nav::new("One", "text/ch1.xhtml")])
+        .build();
+
+    let mut book = boko::Book::from_bytes(&epub, Format::Epub).expect("import epub");
+    let kfx = common::export_to_bytes(&mut book, Format::Kfx);
+
+    // Content-bearing eids (those with a content ref or style events have
+    // locatable text; anchors may carry offsets only into those).
+    let mut text_eids = std::collections::BTreeSet::new();
+    fn collect_text_eids(v: &IonValue, out: &mut std::collections::BTreeSet<i64>) {
+        match v {
+            IonValue::Struct(fields) => {
+                let id = get_field(fields, KfxSymbol::Id).and_then(|v| v.as_int());
+                if let Some(id) = id
+                    && get_field(fields, KfxSymbol::Content).is_some()
+                {
+                    out.insert(id);
+                }
+                for (_, val) in fields {
+                    collect_text_eids(val, out);
+                }
+            }
+            IonValue::List(items) => items.iter().for_each(|i| collect_text_eids(i, out)),
+            IonValue::Annotated(_, inner) => collect_text_eids(inner, out),
+            _ => {}
+        }
+    }
+    for storyline in parse_entities(&kfx, KfxSymbol::Storyline as u32) {
+        collect_text_eids(&storyline, &mut text_eids);
+    }
+
+    let mut checked = 0;
+    for anchor in parse_entities(&kfx, KfxSymbol::Anchor as u32) {
+        let IonValue::Struct(fields) = &anchor else {
+            continue;
+        };
+        let Some(IonValue::Struct(pos)) = get_field(fields, KfxSymbol::Position) else {
+            continue;
+        };
+        let id = get_field(pos, KfxSymbol::Id)
+            .and_then(|v| v.as_int())
+            .unwrap_or(-1);
+        let offset = get_field(pos, KfxSymbol::Offset)
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
+        checked += 1;
+        if offset > 0 {
+            assert!(
+                text_eids.contains(&id),
+                "anchor offset {offset} points into eid {id}, which has no content"
+            );
+        }
+    }
+    assert!(checked > 0, "expected anchor entities in the output");
+}
+
 /// Books without a source identifier still get a deterministic content_id
 /// (seeded from title+author): the Kindle keys sideloaded cover thumbnails
 /// by content_id, so an id-less book can never show its cover.

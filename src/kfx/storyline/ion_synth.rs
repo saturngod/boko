@@ -479,6 +479,17 @@ impl IonBuilder {
             // Skip if the only content is zero-width spaces (anchor markers from empty ID elements)
             // These interfere with image display when mixed with image children
             let has_real_text = self.accumulated_text.chars().any(|c| c != '\u{200B}');
+
+            // Dropping marker-only text orphans any anchor offset that was
+            // counted against it (a second anchor in the same empty run sits
+            // at offset 1 past nothing): clamp them back to the element
+            // start, which is where an empty target resolves.
+            if !has_real_text
+                && self.children.is_empty()
+                && let Some(container_id) = self.container_id
+            {
+                ctx.anchor_registry.clamp_offsets_at(container_id);
+            }
             if has_real_text {
                 let (content_name, content_idx) = ctx.append_text(&self.accumulated_text);
                 let content_ref = IonValue::Struct(vec![
