@@ -120,6 +120,13 @@ Fuzzing the import parsers (requires nightly and [cargo-fuzz](https://github.com
 
     cargo +nightly fuzz run from_bytes
 
+## Credits
+
+- [KFX Input/Output plugins](https://www.mobileread.com/forums/showthread.php?t=291290) by John Howell (jhowell) — kfxlib powers `tools/kfxcheck.py` and served as the KFX conformance reference
+- [calibre](https://calibre-ebook.com/) by Kovid Goyal and contributors
+- [epubcheck](https://github.com/w3c/epubcheck) by the DAISY Consortium / W3C
+- [Standard Ebooks](https://standardebooks.org/) — public-domain test fixtures
+
 ## License
 
 [GPL-3.0-or-later](LICENSE).
