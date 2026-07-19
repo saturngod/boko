@@ -57,6 +57,10 @@ pub struct EpubImporter {
     /// compilation ([`Importer::load_chapters`]) can share it through `&self`.
     css_cache: RwLock<HashMap<String, Arc<Stylesheet>>>,
 
+    /// Fonts listed in META-INF/encryption.xml as obfuscated, keyed by
+    /// archive path. Deobfuscated transparently in [`load_asset`].
+    obfuscated_fonts: HashMap<String, FontObfuscation>,
+
     // --- Link resolution ---
     /// Maps path (without fragment) -> ChapterId
     path_to_chapter: HashMap<String, ChapterId>,
@@ -116,7 +120,11 @@ impl Importer for EpubImporter {
     }
 
     fn load_asset(&self, path: &str) -> crate::Result<Vec<u8>> {
-        self.read_entry(path)
+        let data = self.read_entry(path)?;
+        if let Some(obfuscation) = self.obfuscated_fonts.get(path) {
+            return Ok(deobfuscate_font(data, obfuscation));
+        }
+        Ok(data)
     }
 
     fn load_stylesheet(&self, path: &str) -> Option<Arc<Stylesheet>> {
@@ -315,6 +323,17 @@ impl EpubImporter {
             metadata.cover_image = Some(crate::import::resolve_relative_path(&opf_path, href));
         }
 
+        // Font obfuscation manifest (META-INF/encryption.xml), if any. Every
+        // dc:identifier is a key candidate: the obfuscation key derives from
+        // the package unique-identifier, which is not always the first (or
+        // only) identifier declared.
+        let obfuscated_fonts = read_entry(&source, &zip_index, "META-INF/encryption.xml")
+            .map(|xml| {
+                let identifiers = collect_identifiers(&opf_str);
+                parse_encryption_xml(&xml, &identifiers, &opf_base)
+            })
+            .unwrap_or_default();
+
         Ok(Self {
             source,
             zip_index,
@@ -327,6 +346,7 @@ impl EpubImporter {
             path_to_chapter,
             anchor_map: RwLock::new(HashMap::new()),
             css_cache: RwLock::new(HashMap::new()),
+            obfuscated_fonts,
         })
     }
 
@@ -371,6 +391,198 @@ fn read_entry(
             context: format!("unsupported compression method: {}", method),
         }),
     }
+}
+
+// ============================================================================
+// Font deobfuscation (OCF §Resource Obfuscation)
+// ============================================================================
+
+/// How an asset is obfuscated: candidate XOR keys (one per identifier the
+/// key could derive from) and how many leading bytes they cover.
+pub(crate) struct FontObfuscation {
+    candidates: Vec<Vec<u8>>,
+    prefix_len: usize,
+}
+
+const IDPF_ALGORITHM: &str = "http://www.idpf.org/2008/embedding";
+const ADOBE_ALGORITHM: &str = "http://ns.adobe.com/pdf/enc#RC";
+
+/// Every dc:identifier value in the OPF. The obfuscation key derives from
+/// the package unique-identifier, which is not reliably the first
+/// identifier, so all of them become key candidates (validated by font
+/// magic on use).
+fn collect_identifiers(opf_str: &str) -> Vec<String> {
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+
+    let mut reader = Reader::from_str(opf_str);
+    let mut identifiers = Vec::new();
+    let mut in_identifier = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) if e.name().local_name().as_ref() == b"identifier" => {
+                in_identifier = true;
+            }
+            Ok(Event::Text(t)) if in_identifier => {
+                let text = t.xml_content().unwrap_or_default().trim().to_string();
+                if !text.is_empty() {
+                    identifiers.push(text);
+                }
+            }
+            Ok(Event::End(e)) if e.name().local_name().as_ref() == b"identifier" => {
+                in_identifier = false;
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    identifiers
+}
+
+/// Parse META-INF/encryption.xml into a path → obfuscation map.
+///
+/// Only the two font-obfuscation schemes are handled (IDPF and Adobe);
+/// entries with other algorithms (true DRM) are ignored — those assets pass
+/// through untouched, as before. Each referenced URI is indexed both as
+/// written (container-root-relative per spec) and resolved against the OPF
+/// directory (a common real-world deviation).
+fn parse_encryption_xml(
+    xml: &[u8],
+    identifiers: &[String],
+    opf_base: &str,
+) -> HashMap<String, FontObfuscation> {
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+
+    let content = String::from_utf8_lossy(xml);
+    let mut reader = Reader::from_str(&content);
+
+    let mut fonts = HashMap::new();
+    let mut current_algorithm: Option<&'static str> = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let name = e.name();
+                let local = name.local_name();
+                if local.as_ref() == b"EncryptionMethod" {
+                    current_algorithm = e.attributes().flatten().find_map(|a| {
+                        if a.key.local_name().as_ref() != b"Algorithm" {
+                            return None;
+                        }
+                        let value: &[u8] = &a.value;
+                        match value {
+                            v if v == IDPF_ALGORITHM.as_bytes() => Some(IDPF_ALGORITHM),
+                            v if v == ADOBE_ALGORITHM.as_bytes() => Some(ADOBE_ALGORITHM),
+                            _ => None,
+                        }
+                    });
+                } else if local.as_ref() == b"CipherReference"
+                    && let Some(algorithm) = current_algorithm
+                    && let Some(uri) = e.attributes().flatten().find_map(|a| {
+                        (a.key.local_name().as_ref() == b"URI")
+                            .then(|| String::from_utf8_lossy(&a.value).to_string())
+                    })
+                {
+                    // URIs may be percent-encoded; archive names are literal.
+                    let path = percent_encoding::percent_decode_str(&uri)
+                        .decode_utf8_lossy()
+                        .to_string();
+                    let (candidates, prefix_len): (Vec<Vec<u8>>, usize) = match algorithm {
+                        IDPF_ALGORITHM => {
+                            (identifiers.iter().map(|id| idpf_key(id)).collect(), 1040)
+                        }
+                        _ => (
+                            identifiers.iter().filter_map(|id| adobe_key(id)).collect(),
+                            1024,
+                        ),
+                    };
+                    let candidates: Vec<Vec<u8>> =
+                        candidates.into_iter().filter(|k| !k.is_empty()).collect();
+                    if !candidates.is_empty() {
+                        for key_path in [path.clone(), format!("{opf_base}{path}")] {
+                            fonts.insert(
+                                key_path,
+                                FontObfuscation {
+                                    candidates: candidates.clone(),
+                                    prefix_len,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(e)) if e.name().local_name().as_ref() == b"EncryptedData" => {
+                current_algorithm = None;
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    fonts
+}
+
+/// IDPF key: SHA-1 of the unique identifier with whitespace removed.
+fn idpf_key(identifier: &str) -> Vec<u8> {
+    let cleaned: String = identifier
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '\t' | '\r' | '\n'))
+        .collect();
+    if cleaned.is_empty() {
+        return Vec::new();
+    }
+    sha1_smol::Sha1::from(cleaned.as_bytes())
+        .digest()
+        .bytes()
+        .to_vec()
+}
+
+/// Adobe key: the 16 bytes of the identifier's UUID (hex digits only).
+fn adobe_key(identifier: &str) -> Option<Vec<u8>> {
+    let hex: String = identifier
+        .rsplit(':')
+        .next()
+        .unwrap_or(identifier)
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    (0..16)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+        .collect()
+}
+
+const FONT_MAGICS: [&[u8]; 6] = [
+    &[0x00, 0x01, 0x00, 0x00], // TrueType
+    b"OTTO",                   // CFF OpenType
+    b"true",                   // legacy TrueType
+    b"ttcf",                   // TrueType collection
+    b"wOFF",
+    b"wOF2",
+];
+
+/// XOR the obfuscated prefix back to plain bytes, trying each candidate key
+/// until the result looks like a font. If none do, the key derives from an
+/// identifier that is no longer in the OPF and the original bytes are
+/// returned unchanged — no worse than before.
+fn deobfuscate_font(data: Vec<u8>, obfuscation: &FontObfuscation) -> Vec<u8> {
+    // Already plain? Some books list unobfuscated fonts in encryption.xml.
+    if FONT_MAGICS.iter().any(|magic| data.starts_with(magic)) {
+        return data;
+    }
+    let end = obfuscation.prefix_len.min(data.len());
+    for key in &obfuscation.candidates {
+        let mut attempt = data.clone();
+        for (i, byte) in attempt[..end].iter_mut().enumerate() {
+            *byte ^= key[i % key.len()];
+        }
+        if FONT_MAGICS.iter().any(|magic| attempt.starts_with(magic)) {
+            return attempt;
+        }
+    }
+    data
 }
 
 fn compression_to_u16(method: zip::CompressionMethod) -> u16 {
