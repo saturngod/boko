@@ -61,9 +61,19 @@ fn presentational_hints(
             | "center"
     );
     let cellish = matches!(name, "td" | "th" | "tr" | "tbody" | "thead" | "tfoot");
-    if !aligned && !cellish {
+    let font = name == "font";
+    // MOBI-7 spacing convention: height= is vertical space before the
+    // block, width= is the first-line indent.
+    let mobi_spaced = matches!(name, "p" | "div" | "blockquote");
+    if !aligned && !cellish && !font && !mobi_spaced {
         return None;
     }
+    let clean_len = |v: &str| {
+        !v.is_empty()
+            && v.len() <= 12
+            && v.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '%' || c == '-')
+    };
     let mut css = String::new();
     for attr in attrs {
         match attr.name.local.as_ref() {
@@ -81,6 +91,72 @@ fn presentational_hints(
                     css.push_str("vertical-align: ");
                     css.push_str(&v);
                     css.push(';');
+                }
+            }
+            // Legacy <font> element — the styling mechanism of old MOBI
+            // books (syntax-highlight colors, sized code and headings).
+            "size" if font => {
+                let v = attr.value.trim();
+                // Absolute 1-7 or relative +N/-N from the base size 3,
+                // mapped onto the browser scale.
+                let base: i32 = if let Some(rest) = v.strip_prefix('+') {
+                    3 + rest.parse::<i32>().unwrap_or(0)
+                } else if let Some(rest) = v.strip_prefix('-') {
+                    3 - rest.parse::<i32>().unwrap_or(0)
+                } else {
+                    v.parse().unwrap_or(3)
+                };
+                let em = match base.clamp(1, 7) {
+                    1 => "0.625",
+                    2 => "0.8125",
+                    3 => "1",
+                    4 => "1.125",
+                    5 => "1.5",
+                    6 => "2",
+                    _ => "3",
+                };
+                css.push_str("font-size: ");
+                css.push_str(em);
+                css.push_str("em;");
+            }
+            "color" if font => {
+                let v = attr.value.trim();
+                if !v.is_empty() {
+                    css.push_str("color: ");
+                    css.push_str(v);
+                    css.push(';');
+                }
+            }
+            "face" if font => {
+                let v = attr.value.trim();
+                if !v.is_empty() && v.chars().all(|c| !c.is_control() && c != ';') {
+                    css.push_str("font-family: ");
+                    css.push_str(v);
+                    css.push(';');
+                }
+            }
+            // MOBI-7 convention: a height=/width= attribute marks a
+            // legacy-spaced block — ALL of its vertical spacing comes from
+            // the attribute (paragraphs carry no implicit margins in that
+            // model), so both margins are pinned: top to the attribute
+            // value, bottom to zero.
+            "height" if mobi_spaced => {
+                let v = attr.value.trim();
+                if clean_len(v) {
+                    css.push_str("margin-top: ");
+                    css.push_str(v);
+                    css.push_str(";margin-bottom: 0;");
+                }
+            }
+            "width" if mobi_spaced => {
+                let v = attr.value.trim();
+                if clean_len(v) {
+                    css.push_str("text-indent: ");
+                    css.push_str(v);
+                    css.push_str(";margin-bottom: 0;");
+                    if !attrs.iter().any(|a| a.name.local.as_ref() == "height") {
+                        css.push_str("margin-top: 0;");
+                    }
                 }
             }
             _ => {}

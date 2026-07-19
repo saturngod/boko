@@ -407,13 +407,20 @@ pub fn compute_styles_indexed(
         font_size_declared |= matches!(decl, Declaration::FontSize(_));
         apply_declaration(style, decl);
     };
-    if let Some(hints) = presentational {
-        for decl in &hints.declarations {
-            apply(&mut style, decl);
-        }
-    }
+    // Presentational hints sit between the user-agent and author origins:
+    // any author rule overrides them, but they beat UA defaults (and
+    // inherited values). They're injected when the first non-UA normal
+    // declaration is reached; `matched` is sorted importance-then-origin,
+    // so UA normal declarations come first.
+    let mut hints_pending = presentational.is_some_and(|h| !h.declarations.is_empty());
     let mut inline_normal_pending = inline_style.is_some_and(|i| !i.declarations.is_empty());
     for m in matched.iter() {
+        if hints_pending && (m.important || m.origin != Origin::UserAgent) {
+            for decl in &presentational.expect("checked above").declarations {
+                apply(&mut style, decl);
+            }
+            hints_pending = false;
+        }
         if m.important && inline_normal_pending {
             for decl in &inline_style.expect("checked above").declarations {
                 apply(&mut style, decl);
@@ -428,6 +435,12 @@ pub fn compute_styles_indexed(
             &rule.declarations[m.decl as usize]
         };
         apply(&mut style, decl);
+    }
+    if hints_pending {
+        // Only UA rules (or nothing) matched; the hints still apply.
+        for decl in &presentational.expect("checked above").declarations {
+            apply(&mut style, decl);
+        }
     }
     if let Some(inline) = inline_style {
         if inline_normal_pending {
