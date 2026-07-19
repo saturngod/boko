@@ -510,6 +510,7 @@ fn apply_declaration(style: &mut ComputedStyle, decl: &Declaration) {
         Declaration::TextDecoration(d) => {
             style.text_decoration_underline = d.underline;
             style.text_decoration_line_through = d.line_through;
+            style.overline = d.overline;
         }
         Declaration::TextDecorationStyle(s) => style.underline_style = *s,
         Declaration::TextDecorationColor(c) => style.underline_color = Some(*c),

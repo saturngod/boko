@@ -113,6 +113,8 @@ pub enum KfxValue {
     /// same KFX symbol (e.g. orphans + widows merging into
     /// `keep_lines_together: { first: N, last: M }`).
     StructFields(Vec<(KfxSymbol, i64)>),
+    /// A list of symbols (e.g. `layout_hints: [treat_as_title]`).
+    SymbolList(Vec<u64>),
 }
 
 impl KfxValue {
@@ -120,6 +122,9 @@ impl KfxValue {
     pub fn to_ion(&self) -> IonValue {
         match self {
             KfxValue::Symbol(sym) => IonValue::Symbol(*sym as u64),
+            KfxValue::SymbolList(syms) => {
+                IonValue::List(syms.iter().map(|&s| IonValue::Symbol(s)).collect())
+            }
             KfxValue::SymbolId(id) => IonValue::Symbol(*id),
             KfxValue::Integer(n) => IonValue::Int(*n),
             KfxValue::Float(f) => IonValue::Float(*f),
@@ -2370,6 +2375,40 @@ pub fn import_kfx_style(
 ) -> ir_style::ComputedStyle {
     let mut style = ir_style::ComputedStyle::default();
     let mut applied: Vec<IrField> = Vec::new();
+
+    // Reference KFX folds four equal border sides into uniform shorthand
+    // symbols; expand them into the per-side symbols the rules know.
+    let mut expanded: Vec<(u64, IonValue)> = Vec::with_capacity(props.len());
+    for (kfx_symbol, kfx_value) in props {
+        let sides: Option<[KfxSymbol; 4]> = match *kfx_symbol {
+            s if s == KfxSymbol::BorderStyle as u64 => Some([
+                KfxSymbol::BorderStyleTop,
+                KfxSymbol::BorderStyleLeft,
+                KfxSymbol::BorderStyleBottom,
+                KfxSymbol::BorderStyleRight,
+            ]),
+            s if s == KfxSymbol::BorderWeight as u64 => Some([
+                KfxSymbol::BorderWeightTop,
+                KfxSymbol::BorderWeightLeft,
+                KfxSymbol::BorderWeightBottom,
+                KfxSymbol::BorderWeightRight,
+            ]),
+            s if s == KfxSymbol::BorderColor as u64 => Some([
+                KfxSymbol::BorderColorTop,
+                KfxSymbol::BorderColorLeft,
+                KfxSymbol::BorderColorBottom,
+                KfxSymbol::BorderColorRight,
+            ]),
+            _ => None,
+        };
+        match sides {
+            Some(sides) => {
+                expanded.extend(sides.iter().map(|&side| (side as u64, kfx_value.clone())))
+            }
+            None => expanded.push((*kfx_symbol, kfx_value.clone())),
+        }
+    }
+    let props = &expanded[..];
 
     for (kfx_symbol, kfx_value) in props {
         for rule in schema.rules_by_kfx_symbol(*kfx_symbol) {

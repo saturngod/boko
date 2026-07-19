@@ -13,6 +13,8 @@ pub struct TextDecorationValue {
     pub underline: bool,
     /// Whether the `line-through` (strikethrough) line is present.
     pub line_through: bool,
+    /// Whether the `overline` line is present.
+    pub overline: bool,
 }
 
 pub(crate) fn parse_color(input: &mut Parser<'_, '_>) -> Option<Color> {
@@ -325,6 +327,7 @@ pub(crate) fn parse_text_decoration(input: &mut Parser<'_, '_>) -> Option<TextDe
         match token.as_ref() {
             "underline" => result.underline = true,
             "line-through" => result.line_through = true,
+            "overline" => result.overline = true,
             "none" => {}
             _ => continue,
         }

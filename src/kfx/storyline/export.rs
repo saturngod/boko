@@ -17,6 +17,37 @@ pub(super) fn needs_container_wrapper(style: &ComputedStyle) -> bool {
     has_top || has_bottom || has_left || has_right
 }
 
+/// The layout hint a node's style should carry (`layout_hints:
+/// [treat_as_title]` etc). Reference KFX puts these in style structs, not on
+/// content nodes; they affect Kindle's rendering of headings, figures and
+/// captions.
+fn layout_hint_for(chapter: &Chapter, node_id: NodeId, role: Role) -> Option<KfxSymbol> {
+    match role {
+        Role::Heading(_) => Some(KfxSymbol::TreatAsTitle),
+        Role::Figure => Some(KfxSymbol::Figure),
+        Role::Caption => Some(KfxSymbol::Caption),
+        _ => {
+            let epub_type = chapter.semantics.epub_type(node_id)?;
+            let has_title_type = epub_type.split_whitespace().any(|t| {
+                matches!(
+                    t,
+                    "title" | "fulltitle" | "subtitle" | "covertitle" | "halftitle"
+                )
+            });
+            let has_caption_type = epub_type
+                .split_whitespace()
+                .any(|t| matches!(t, "caption" | "figcaption"));
+            if has_title_type {
+                Some(KfxSymbol::TreatAsTitle)
+            } else if has_caption_type {
+                Some(KfxSymbol::Caption)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// Convert an IR chapter to a TokenStream.
 ///
 /// This is the first stage of export: walking the IR tree and emitting tokens.
@@ -120,11 +151,12 @@ pub(super) fn walk_node_for_export(
 
     // Register the node's style and get a KFX style symbol
     // This converts IR ComputedStyle → KFX style and deduplicates
-    let style_symbol = match adjust.get(&node_id) {
-        Some(&adj) => {
-            ctx.register_style_id_adjusted(node.style, parent_style, &chapter.styles, adj)
-        }
-        None => ctx.register_style_id(node.style, parent_style, &chapter.styles),
+    let hint = layout_hint_for(chapter, node_id, node.role);
+    let adj = adjust.get(&node_id).copied().unwrap_or_default();
+    let style_symbol = if hint.is_some() || !adj.is_identity() {
+        ctx.register_style_id_adjusted(node.style, parent_style, &chapter.styles, adj, hint)
+    } else {
+        ctx.register_style_id(node.style, parent_style, &chapter.styles)
     };
     elem.style_symbol = Some(style_symbol);
 

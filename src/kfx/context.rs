@@ -712,7 +712,17 @@ pub struct ExportContext {
 
     /// Memo for `register_style_id_adjusted` (same lifecycle): the key adds
     /// the margin-collapse override bits to the (style, parent) pair.
-    ir_adjusted_style_memo: FxHashMap<(StyleId, StyleId, Option<u32>, Option<u32>), u64>,
+    #[allow(clippy::type_complexity)]
+    ir_adjusted_style_memo: FxHashMap<
+        (
+            StyleId,
+            StyleId,
+            Option<u32>,
+            Option<u32>,
+            Option<crate::kfx::symbols::KfxSymbol>,
+        ),
+        u64,
+    >,
 
     /// Anchor registry for link target resolution.
     pub anchor_registry: AnchorRegistry,
@@ -996,8 +1006,9 @@ impl ExportContext {
         parent_id: StyleId,
         style_pool: &crate::style::StylePool,
         adjust: crate::kfx::storyline::MarginAdjust,
+        layout_hint: Option<crate::kfx::symbols::KfxSymbol>,
     ) -> u64 {
-        if adjust.is_identity() {
+        if adjust.is_identity() && layout_hint.is_none() {
             return self.register_style_id(style_id, parent_id, style_pool);
         }
         let key = (
@@ -1005,6 +1016,7 @@ impl ExportContext {
             parent_id,
             adjust.top_abs_em.map(f32::to_bits),
             adjust.bottom_abs_em.map(f32::to_bits),
+            layout_hint,
         );
         if let Some(&symbol) = self.ir_adjusted_style_memo.get(&key) {
             return symbol;
@@ -1042,6 +1054,13 @@ impl ExportContext {
         };
         apply(KfxSymbol::MarginTop, adjust.top_abs_em);
         apply(KfxSymbol::MarginBottom, adjust.bottom_abs_em);
+
+        if let Some(hint) = layout_hint {
+            kfx_style.set(
+                KfxSymbol::LayoutHints,
+                KfxValue::SymbolList(vec![hint as u64]),
+            );
+        }
 
         let symbol = if kfx_style.is_empty() {
             self.default_style_used = true;

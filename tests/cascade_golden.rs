@@ -103,7 +103,10 @@ fn descendant_book() -> EpubBuilder {
 // differently — the emitted declarations are unchanged.
 const FP_EPICTETUS: &str = "3a0d32eb32fabb726c2fb4a35114622ce92375b2";
 const FP_CLASS: &str = "0011593d1051d42ce417aa0bd9d63012fdaf42b7";
-const FP_DESCENDANT: &str = "76e77d1c07d7156e03e6549241d920c6d935aae2";
+// Updated when the UA stylesheet's blockquote/figure/dd margins moved from
+// the browser-literal 40px to 2.5em (same length at the default font size,
+// but it scales with the font instead of freezing at a device-pixel size).
+const FP_DESCENDANT: &str = "1794dcb313c9799f0c5c9fff01c8ffedfd886c68";
 
 #[test]
 fn cascade_output_is_stable_epictetus() {

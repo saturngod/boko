@@ -145,6 +145,10 @@ fn hash_kfx_value<H: Hasher>(value: &KfxValue, hasher: &mut H) {
             (*field as u64).hash(hasher);
             value.hash(hasher);
         }
+        KfxValue::SymbolList(syms) => {
+            10u8.hash(hasher);
+            syms.hash(hasher);
+        }
         KfxValue::StructFields(fields) => {
             for (field, value) in fields {
                 (*field as u64).hash(hasher);
@@ -360,7 +364,53 @@ impl<'a> StyleBuilder<'a> {
 
     /// Build the final computed style.
     pub fn build(self) -> ComputedStyle {
-        self.style
+        let mut style = self.style;
+        // Reference KFX folds four equal border sides into the uniform
+        // shorthand symbol (border_style/border_weight/border_color)
+        // instead of four longhands.
+        for (sides, uniform) in [
+            (
+                [
+                    KfxSymbol::BorderStyleTop,
+                    KfxSymbol::BorderStyleLeft,
+                    KfxSymbol::BorderStyleBottom,
+                    KfxSymbol::BorderStyleRight,
+                ],
+                KfxSymbol::BorderStyle,
+            ),
+            (
+                [
+                    KfxSymbol::BorderWeightTop,
+                    KfxSymbol::BorderWeightLeft,
+                    KfxSymbol::BorderWeightBottom,
+                    KfxSymbol::BorderWeightRight,
+                ],
+                KfxSymbol::BorderWeight,
+            ),
+            (
+                [
+                    KfxSymbol::BorderColorTop,
+                    KfxSymbol::BorderColorLeft,
+                    KfxSymbol::BorderColorBottom,
+                    KfxSymbol::BorderColorRight,
+                ],
+                KfxSymbol::BorderColor,
+            ),
+        ] {
+            let values: Vec<Option<&KfxValue>> = sides.iter().map(|&s| style.get(s)).collect();
+            if let [Some(a), Some(b), Some(c), Some(d)] = values[..]
+                && a == b
+                && b == c
+                && c == d
+            {
+                let value = a.clone();
+                for &side in &sides {
+                    style.remove(side);
+                }
+                style.set(uniform, value);
+            }
+        }
+        style
     }
 }
 
