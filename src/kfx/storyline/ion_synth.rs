@@ -472,6 +472,29 @@ impl IonBuilder {
 
             // Add nested children as content_list if present
             if !self.children.is_empty() {
+                // Block-children typing rule: a text-typed element may hold
+                // inline-class children (text runs, images) but never block
+                // ones — Previewer output has no $269 parents with list or
+                // table children; such parents are containers.
+                let has_block_child = self.children.iter().any(|child| {
+                    let IonValue::Struct(fields) = child else {
+                        return false;
+                    };
+                    fields.iter().any(|(k, v)| {
+                        *k == sym!(Type)
+                            && matches!(v, IonValue::Symbol(t)
+                                if *t != KfxSymbol::Text as u64 && *t != KfxSymbol::Image as u64)
+                    })
+                });
+                if has_block_child && !has_real_text {
+                    for (k, v) in self.fields.iter_mut() {
+                        if *k == sym!(Type)
+                            && matches!(v, IonValue::Symbol(t) if *t == KfxSymbol::Text as u64)
+                        {
+                            *v = IonValue::Symbol(KfxSymbol::Container as u64);
+                        }
+                    }
+                }
                 self.fields
                     .push((sym!(ContentList), IonValue::List(self.children)));
             }

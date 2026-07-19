@@ -996,3 +996,223 @@ fn test_anchor_inside_container_wrapper_uses_outer_id() {
         content_ids[0], content_ids[1]
     );
 }
+
+// ============================================================================
+// Reference content model: split runs, block-children typing
+// ============================================================================
+
+mod content_model {
+    use super::*;
+    use crate::kfx::symbols::KfxSymbol;
+
+    fn field(fields: &[(u64, IonValue)], id: KfxSymbol) -> Option<&IonValue> {
+        fields.iter().find(|(k, _)| *k == id as u64).map(|(_, v)| v)
+    }
+
+    fn as_struct(v: &IonValue) -> &[(u64, IonValue)] {
+        match v {
+            IonValue::Struct(f) => f,
+            other => panic!("expected struct, got {other:?}"),
+        }
+    }
+
+    fn text_child(chapter: &mut Chapter, parent: NodeId, text: &str) {
+        let range = chapter.append_text(text);
+        let mut node = Node::new(Role::Text);
+        node.text = range;
+        let id = chapter.alloc_node(node);
+        chapter.append_child(parent, id);
+    }
+
+    fn image_child(chapter: &mut Chapter, parent: NodeId, src: &str) -> NodeId {
+        let id = chapter.alloc_node(Node::new(Role::Image));
+        chapter.append_child(parent, id);
+        chapter.semantics.set_src(id, src);
+        id
+    }
+
+    fn export(chapter: &Chapter) -> (IonValue, ExportContext) {
+        let mut ctx = ExportContext::new();
+        let tokens = ir_to_tokens(chapter, &mut ctx);
+        let ion = tokens_to_ion(&tokens, &mut ctx);
+        (ion, ctx)
+    }
+
+    /// A paragraph with a mid-text inline image splits into sibling text
+    /// elements (each with its own content ref) around the image; the parent
+    /// keeps NO content ref (the reference model — Previewer never emits an
+    /// element with both a content ref and children).
+    #[test]
+    fn inline_image_splits_text_into_sibling_runs() {
+        let mut chapter = Chapter::new();
+        let para = chapter.alloc_node(Node::new(Role::Paragraph));
+        chapter.append_child(chapter.root(), para);
+        text_child(&mut chapter, para, "before ");
+        image_child(&mut chapter, para, "img.png");
+        text_child(&mut chapter, para, " after");
+
+        let (ion, mut ctx) = export(&chapter);
+        let IonValue::List(elems) = ion else {
+            panic!("expected list")
+        };
+        let para_ion = as_struct(&elems[0]);
+        assert!(
+            field(para_ion, KfxSymbol::Content).is_none(),
+            "split parent must not carry a content ref"
+        );
+        let IonValue::List(kids) = field(para_ion, KfxSymbol::ContentList).expect("children")
+        else {
+            panic!("children must be a list")
+        };
+        assert_eq!(kids.len(), 3, "run, image, run: {kids:#?}");
+
+        let run1 = as_struct(&kids[0]);
+        assert!(
+            field(run1, KfxSymbol::Content).is_some(),
+            "run1 has own ref"
+        );
+        let img = as_struct(&kids[1]);
+        assert!(field(img, KfxSymbol::ResourceName).is_some(), "image child");
+        let run2 = as_struct(&kids[2]);
+        assert!(
+            field(run2, KfxSymbol::Content).is_some(),
+            "run2 has own ref"
+        );
+
+        // The two runs' text landed in the content chunks in order.
+        let chunks = ctx.take_content_chunks();
+        let all: Vec<&String> = chunks.iter().flat_map(|(_, segs)| segs).collect();
+        assert_eq!(all, ["before ", " after"]);
+    }
+
+    /// A styled span after an inline image gets run-relative event offsets.
+    #[test]
+    fn events_after_inline_image_are_run_relative() {
+        let mut chapter = Chapter::new();
+        let para = chapter.alloc_node(Node::new(Role::Paragraph));
+        chapter.append_child(chapter.root(), para);
+        text_child(&mut chapter, para, "before ");
+        image_child(&mut chapter, para, "img.png");
+        // <a href> span in the second run
+        let link = chapter.alloc_node(Node::new(Role::Link));
+        chapter.append_child(para, link);
+        chapter.semantics.set_href(link, "http://x/");
+        text_child(&mut chapter, link, "click");
+
+        let (ion, _ctx) = export(&chapter);
+        let IonValue::List(elems) = ion else { panic!() };
+        let para_ion = as_struct(&elems[0]);
+        let IonValue::List(kids) = field(para_ion, KfxSymbol::ContentList).expect("children")
+        else {
+            panic!()
+        };
+        assert_eq!(kids.len(), 3, "run, image, run: {kids:#?}");
+        let run2 = as_struct(&kids[2]);
+        let IonValue::List(events) =
+            field(run2, KfxSymbol::StyleEvents).expect("run2 has the link event")
+        else {
+            panic!()
+        };
+        let ev = as_struct(&events[0]);
+        assert!(
+            matches!(field(ev, KfxSymbol::Offset), Some(IonValue::Int(0))),
+            "offset is relative to the run, not the paragraph: {ev:?}"
+        );
+        assert!(matches!(
+            field(ev, KfxSymbol::Length),
+            Some(IonValue::Int(5))
+        ));
+    }
+
+    /// A text-typed element containing a block child (a list) becomes a
+    /// container: Previewer never emits text-typed parents with block
+    /// children ($269 -> $276 does not occur in reference output).
+    #[test]
+    fn block_child_forces_container_type() {
+        let mut chapter = Chapter::new();
+        let quote = chapter.alloc_node(Node::new(Role::BlockQuote));
+        chapter.append_child(chapter.root(), quote);
+        text_child(&mut chapter, quote, "intro ");
+        let list = chapter.alloc_node(Node::new(Role::UnorderedList));
+        chapter.append_child(quote, list);
+        let li = chapter.alloc_node(Node::new(Role::ListItem));
+        chapter.append_child(list, li);
+        text_child(&mut chapter, li, "item");
+
+        let (ion, _ctx) = export(&chapter);
+        let IonValue::List(elems) = ion else { panic!() };
+        let quote_ion = as_struct(&elems[0]);
+        let container = KfxSymbol::Container as u64;
+        assert!(
+            matches!(field(quote_ion, KfxSymbol::Type), Some(IonValue::Symbol(t)) if *t == container),
+            "block child must force container type: {quote_ion:?}"
+        );
+        assert!(field(quote_ion, KfxSymbol::Content).is_none());
+    }
+
+    /// Definition-list wrappers (dt container + dd content) must not mix the
+    /// dt element child with bare dd text on one element — dd inline flow is
+    /// wrapped in its own run element (glossaries were the largest remaining
+    /// source of hybrid elements).
+    #[test]
+    fn definition_list_dd_text_gets_run_wrapped() {
+        let mut chapter = Chapter::new();
+        let dl = chapter.alloc_node(Node::new(Role::DefinitionList));
+        chapter.append_child(chapter.root(), dl);
+        let dt = chapter.alloc_node(Node::new(Role::DefinitionTerm));
+        chapter.append_child(dl, dt);
+        text_child(&mut chapter, dt, "term");
+        let dd = chapter.alloc_node(Node::new(Role::DefinitionDescription));
+        chapter.append_child(dl, dd);
+        text_child(&mut chapter, dd, "the definition text");
+
+        let (ion, _ctx) = export(&chapter);
+        // Walk the whole tree: no struct may carry both Content and ContentList.
+        fn assert_no_hybrid(v: &IonValue) {
+            match v {
+                IonValue::Struct(fields) => {
+                    let has_ref = fields.iter().any(|(k, _)| *k == KfxSymbol::Content as u64);
+                    let has_children = fields
+                        .iter()
+                        .any(|(k, _)| *k == KfxSymbol::ContentList as u64);
+                    assert!(
+                        !(has_ref && has_children),
+                        "hybrid element (ref + children): {fields:?}"
+                    );
+                    for (_, val) in fields {
+                        assert_no_hybrid(val);
+                    }
+                }
+                IonValue::List(items) => items.iter().for_each(assert_no_hybrid),
+                IonValue::Annotated(_, inner) => assert_no_hybrid(inner),
+                _ => {}
+            }
+        }
+        assert_no_hybrid(&ion);
+    }
+
+    /// Simple paragraphs keep the compact single-ref encoding.
+    #[test]
+    fn simple_paragraph_keeps_single_ref() {
+        let mut chapter = Chapter::new();
+        let para = chapter.alloc_node(Node::new(Role::Paragraph));
+        chapter.append_child(chapter.root(), para);
+        text_child(&mut chapter, para, "just text");
+
+        let (ion, _ctx) = export(&chapter);
+        let IonValue::List(elems) = ion else { panic!() };
+        let para_ion = as_struct(&elems[0]);
+        assert!(
+            field(para_ion, KfxSymbol::Content).is_some(),
+            "own ref kept"
+        );
+        assert!(
+            field(para_ion, KfxSymbol::ContentList).is_none(),
+            "no synthesized children"
+        );
+        let text_type = KfxSymbol::Text as u64;
+        assert!(
+            matches!(field(para_ion, KfxSymbol::Type), Some(IonValue::Symbol(t)) if *t == text_type)
+        );
+    }
+}
