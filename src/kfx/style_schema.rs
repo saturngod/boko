@@ -76,18 +76,6 @@ const KP_LAYOUT_VIEWPORT_PX: f64 = 512.0;
 /// CSS reference pixels per em/rem.
 const PX_PER_EM: f64 = 16.0;
 
-/// Resolve a parsed CSS length to an em-equivalent for lh-unit conversion.
-/// Returns `None` for units that cannot be resolved (keeps caller honest).
-fn css_length_as_em(num: f64, unit: &str) -> Option<f64> {
-    match unit {
-        "em" | "rem" => Some(num),
-        "%" => Some(num / 100.0),
-        "px" => Some(num / PX_PER_EM),
-        "pt" => Some(num / 12.0),
-        _ => None,
-    }
-}
-
 /// KFX value representation for transforms.
 #[derive(Debug, Clone, PartialEq)]
 pub enum KfxValue {
@@ -1491,7 +1479,7 @@ fn raw_line_height_em(s: &ir_style::ComputedStyle) -> Option<f64> {
         ir_style::Length::Auto => None,
         ir_style::Length::Em(x) => Some(x as f64),
         ir_style::Length::Percent(p) => Some(p as f64 / 100.0),
-        ir_style::Length::Px(x) => Some(x as f64 / 16.0 / abs),
+        ir_style::Length::Px(x) => Some(x as f64 / PX_PER_EM / abs),
         ir_style::Length::Rem(x) => Some(x as f64 / abs),
     }
 }
@@ -1507,8 +1495,8 @@ fn vertical_spacing_lh(len: ir_style::Length, s: &ir_style::ComputedStyle) -> Op
         ir_style::Length::Auto => return None,
         ir_style::Length::Em(x) => x as f64,
         ir_style::Length::Rem(x) => x as f64 / abs,
-        ir_style::Length::Px(x) => x as f64 / 16.0 / abs,
-        ir_style::Length::Percent(p) => p as f64 / 100.0 * 512.0 / 16.0 / abs,
+        ir_style::Length::Px(x) => x as f64 / PX_PER_EM / abs,
+        ir_style::Length::Percent(p) => p as f64 / 100.0 * KP_LAYOUT_VIEWPORT_PX / PX_PER_EM / abs,
     };
     if em == 0.0 {
         return None;
@@ -1527,7 +1515,7 @@ fn horizontal_spacing(len: ir_style::Length, s: &ir_style::ComputedStyle) -> Opt
         ir_style::Length::Percent(p) if p != 0.0 => Some(fmt_dim(p as f64, "%")),
         ir_style::Length::Em(x) if x != 0.0 => Some(fmt_dim(x as f64, "em")),
         ir_style::Length::Rem(x) if x != 0.0 => Some(fmt_dim(x as f64 / abs, "em")),
-        ir_style::Length::Px(x) if x != 0.0 => Some(fmt_dim(x as f64 / 16.0 / abs, "em")),
+        ir_style::Length::Px(x) if x != 0.0 => Some(fmt_dim(x as f64 / PX_PER_EM / abs, "em")),
         _ => None,
     }
 }
