@@ -48,6 +48,35 @@ fn layout_hint_for(chapter: &Chapter, node_id: NodeId, role: Role) -> Option<Kfx
     }
 }
 
+/// The first authored link color inside the node's inline flow, packed as
+/// ARGB. Reference output carries it on the containing block as
+/// link_unvisited_style/link_visited_style; recursion stops at nested
+/// blocks (they carry their own).
+fn link_color_for(chapter: &Chapter, node_id: NodeId) -> Option<u32> {
+    fn scan(chapter: &Chapter, id: NodeId, depth: u32) -> Option<u32> {
+        let node = chapter.node(id)?;
+        let inline = matches!(
+            node.role,
+            Role::Link | Role::Inline | Role::Text | Role::Break
+        );
+        if depth > 0 && !inline {
+            return None;
+        }
+        if node.role == Role::Link
+            && let Some(style) = chapter.styles.get(node.style)
+            && let Some(c) = style.color
+        {
+            return Some(
+                ((c.a as u32) << 24) | ((c.r as u32) << 16) | ((c.g as u32) << 8) | c.b as u32,
+            );
+        }
+        chapter
+            .children(id)
+            .find_map(|child| scan(chapter, child, depth + 1))
+    }
+    scan(chapter, node_id, 0)
+}
+
 /// Convert an IR chapter to a TokenStream.
 ///
 /// This is the first stage of export: walking the IR tree and emitting tokens.
@@ -153,8 +182,16 @@ pub(super) fn walk_node_for_export(
     // This converts IR ComputedStyle → KFX style and deduplicates
     let hint = layout_hint_for(chapter, node_id, node.role);
     let adj = adjust.get(&node_id).copied().unwrap_or_default();
-    let style_symbol = if hint.is_some() || !adj.is_identity() {
-        ctx.register_style_id_adjusted(node.style, parent_style, &chapter.styles, adj, hint)
+    let link_color = link_color_for(chapter, node_id);
+    let style_symbol = if hint.is_some() || !adj.is_identity() || link_color.is_some() {
+        ctx.register_style_id_adjusted(
+            node.style,
+            parent_style,
+            &chapter.styles,
+            adj,
+            hint,
+            link_color,
+        )
     } else {
         ctx.register_style_id(node.style, parent_style, &chapter.styles)
     };

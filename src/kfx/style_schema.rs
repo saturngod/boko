@@ -637,7 +637,9 @@ impl StyleSchema {
             kfx_symbol: KfxSymbol::Hyphens,
             transform: ValueTransform::Map(vec![
                 ("auto".into(), KfxValue::Symbol(KfxSymbol::Auto)),
-                ("manual".into(), KfxValue::Symbol(KfxSymbol::Manual)),
+                // Reference output folds `manual` (break only at &shy;) to
+                // none — KFX has no manual mode.
+                ("manual".into(), KfxValue::Symbol(KfxSymbol::None)),
                 ("none".into(), KfxValue::Symbol(KfxSymbol::None)),
             ]),
         });
@@ -3046,9 +3048,10 @@ mod tests {
             rule.transform.apply("auto"),
             Some(KfxValue::Symbol(KfxSymbol::Auto))
         ));
+        // manual folds to none like reference output (KFX has no manual mode).
         assert!(matches!(
             rule.transform.apply("manual"),
-            Some(KfxValue::Symbol(KfxSymbol::Manual))
+            Some(KfxValue::Symbol(KfxSymbol::None))
         ));
         assert!(matches!(
             rule.transform.apply("none"),

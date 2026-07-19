@@ -720,6 +720,7 @@ pub struct ExportContext {
             Option<u32>,
             Option<u32>,
             Option<crate::kfx::symbols::KfxSymbol>,
+            Option<u32>,
         ),
         u64,
     >,
@@ -1101,8 +1102,9 @@ impl ExportContext {
         style_pool: &crate::style::StylePool,
         adjust: crate::kfx::storyline::MarginAdjust,
         layout_hint: Option<crate::kfx::symbols::KfxSymbol>,
+        link_color: Option<u32>,
     ) -> u64 {
-        if adjust.is_identity() && layout_hint.is_none() {
+        if adjust.is_identity() && layout_hint.is_none() && link_color.is_none() {
             return self.register_style_id(style_id, parent_id, style_pool);
         }
         let key = (
@@ -1111,6 +1113,7 @@ impl ExportContext {
             adjust.top_abs_em.map(f32::to_bits),
             adjust.bottom_abs_em.map(f32::to_bits),
             layout_hint,
+            link_color,
         );
         if let Some(&symbol) = self.ir_adjusted_style_memo.get(&key) {
             return symbol;
@@ -1154,6 +1157,21 @@ impl ExportContext {
                 KfxSymbol::LayoutHints,
                 KfxValue::SymbolList(vec![hint as u64]),
             );
+        }
+
+        // Blocks containing colored links carry the link color as
+        // link_unvisited_style/link_visited_style, like reference output —
+        // event styles alone don't restyle the link text on device.
+        if let Some(argb) = link_color {
+            for symbol in [KfxSymbol::LinkUnvisitedStyle, KfxSymbol::LinkVisitedStyle] {
+                kfx_style.set(
+                    symbol,
+                    KfxValue::StructField {
+                        field: KfxSymbol::TextColor,
+                        value: argb as i64,
+                    },
+                );
+            }
         }
 
         let symbol = if kfx_style.is_empty() {
