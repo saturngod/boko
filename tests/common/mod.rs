@@ -271,6 +271,12 @@ impl EpubBuilder {
         self
     }
 
+    #[allow(dead_code)]
+    pub fn identifier(mut self, identifier: &str) -> Self {
+        self.identifier = identifier.into();
+        self
+    }
+
     pub fn direction(mut self, dir: &str) -> Self {
         self.direction = Some(dir.into());
         self

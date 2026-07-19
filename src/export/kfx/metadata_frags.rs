@@ -88,17 +88,19 @@ pub(super) fn build_book_metadata_fragment(
         None
     });
 
-    // Generate book_id from identifier (deterministic per publication)
-    let book_id = if !meta.identifier.is_empty() {
-        Some(generate_book_id(&meta.identifier))
+    // Generate book_id/content_id deterministically per publication. Books
+    // without an identifier fall back to a title+author seed rather than
+    // omitting the ids: the Kindle keys sideloaded-book cover thumbnails by
+    // content_id, so an id-less book can never show its cover. The
+    // identifier stays the sole seed when present, keeping existing books'
+    // ids (and their on-device thumbnails) stable.
+    let id_seed = if !meta.identifier.is_empty() {
+        meta.identifier.clone()
     } else {
-        None
+        format!("{}\n{}", meta.title, meta.authors.join("&"))
     };
-    let content_id = if !meta.identifier.is_empty() {
-        Some(generate_content_id(&meta.identifier))
-    } else {
-        None
-    };
+    let book_id = Some(generate_book_id(&id_seed));
+    let content_id = Some(generate_content_id(&id_seed));
 
     let meta_ctx = MetadataContext {
         version: Some(env!("CARGO_PKG_VERSION")),

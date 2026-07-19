@@ -225,6 +225,68 @@ fn font_size_is_never_percent() {
     );
 }
 
+/// Books without a source identifier still get a deterministic content_id
+/// (seeded from title+author): the Kindle keys sideloaded cover thumbnails
+/// by content_id, so an id-less book can never show its cover.
+#[test]
+fn identifierless_book_gets_content_id() {
+    use common::{Doc, EpubBuilder, Nav};
+
+    let build = || {
+        EpubBuilder::new("No Identifier Book")
+            .identifier("")
+            .doc(Doc::new("text/ch1.xhtml", "One", "<p>text</p>"))
+            .nav(vec![Nav::new("One", "text/ch1.xhtml")])
+            .build()
+    };
+    let extract_content_id = |epub: &[u8]| -> String {
+        let mut book = boko::Book::from_bytes(epub, Format::Epub).expect("import epub");
+        assert!(
+            book.metadata().identifier.is_empty(),
+            "fixture must lack an identifier"
+        );
+        let kfx = common::export_to_bytes(&mut book, Format::Kfx);
+        let symbols = doc_symbols(&kfx);
+        for meta in parse_entities(&kfx, KfxSymbol::BookMetadata as u32) {
+            let IonValue::Struct(fields) = &meta else {
+                continue;
+            };
+            let Some(IonValue::List(cats)) = get_field(fields, KfxSymbol::CategorisedMetadata)
+            else {
+                continue;
+            };
+            for cat in cats {
+                let IonValue::Struct(cf) = cat else { continue };
+                let Some(IonValue::List(entries)) = get_field(cf, KfxSymbol::Metadata) else {
+                    continue;
+                };
+                for entry in entries {
+                    let IonValue::Struct(ef) = entry else {
+                        continue;
+                    };
+                    let key = get_field(ef, KfxSymbol::Key);
+                    let is_content_id = match key {
+                        Some(IonValue::String(s)) => s == "content_id",
+                        Some(IonValue::Symbol(s)) => resolve_symbol(&symbols, *s) == "content_id",
+                        _ => false,
+                    };
+                    if is_content_id
+                        && let Some(IonValue::String(v)) = get_field(ef, KfxSymbol::Value)
+                    {
+                        return v.clone();
+                    }
+                }
+            }
+        }
+        panic!("no content_id in book_metadata");
+    };
+
+    let id1 = extract_content_id(&build());
+    let id2 = extract_content_id(&build());
+    assert_eq!(id1.len(), 32, "content_id shape: {id1}");
+    assert_eq!(id1, id2, "content_id must be deterministic");
+}
+
 /// End-to-end: the full kfxcheck validation (structural checks, position and
 /// location map verification, trial EPUB conversion via kfxlib) must report
 /// zero errors for a real EPUB conversion. Skipped when `uv` or the kfxlib
