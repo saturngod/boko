@@ -156,11 +156,15 @@ pub(super) fn build_cover_storyline(chapter: &Chapter, ctx: &mut ExportContext) 
                 let resource_name = ctx.resource_registry.get_or_create_name(src);
                 let resource_name_symbol = ctx.symbols.get_or_intern(&resource_name);
 
-                // Register style and get symbol
-                let style_symbol = ctx.register_style_id(node.style, &chapter.styles);
-                if style_symbol == ctx.default_style_symbol {
-                    ctx.default_style_used = true;
-                }
+                // Use the default (empty) style, not the node's CSS style:
+                // scale-fit page templates carry all positioning themselves
+                // (fixed dims + scale_fit + float center), and readers require
+                // the image element to add no properties of its own — any
+                // leftover (max-width, borders, font shorthand) is flagged as
+                // an unexpected image style. Kindle Previewer does the same:
+                // its scale-fit images reference an empty style.
+                let style_symbol = ctx.default_style_symbol;
+                ctx.default_style_used = true;
 
                 // Generate unique container ID
                 let container_id = ctx.fragment_ids.next_id();

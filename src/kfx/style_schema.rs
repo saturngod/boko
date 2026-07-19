@@ -61,6 +61,14 @@ pub enum ValueTransform {
     /// Preserve the original CSS unit as a KFX dimensioned value.
     /// Example: "10px" → { value: 10, unit: px }, "1.5em" → { value: 1.5, unit: em }
     PreserveUnit,
+
+    /// Like [`ValueTransform::PreserveUnit`], but percentage values become
+    /// `em` (value/100): "100%" → { value: 1, unit: em }. For font-size,
+    /// percent and em are equivalent under CSS inheritance, and reference
+    /// KFX (Kindle Previewer) only ever emits em/rem font sizes — a percent
+    /// font-size breaks font-size inheritance in KFX consumers, which prune
+    /// inherited percentage values.
+    PreserveUnitPercentAsEm,
 }
 
 /// KFX value representation for transforms.
@@ -372,10 +380,11 @@ impl StyleSchema {
             ir_key: "font-size",
             ir_field: Some(IrField::FontSize),
             kfx_symbol: KfxSymbol::FontSize,
-            // PreserveUnit, not Dimensioned{Rem}: Dimensioned relabels the
-            // number with its unit symbol without converting, which would
-            // turn "24px" into 24rem (~38x too large on device).
-            transform: ValueTransform::PreserveUnit,
+            // PreserveUnit (not Dimensioned{Rem}: that relabels the number
+            // with its unit symbol without converting, turning "24px" into
+            // 24rem, ~38x too large on device) — with percent folded to em,
+            // which reference KFX requires for font-size.
+            transform: ValueTransform::PreserveUnitPercentAsEm,
         });
 
         // font-variant: small-caps -> glyph_transform: small_caps
@@ -1215,6 +1224,27 @@ impl ValueTransform {
                     unit: kfx_unit,
                 })
             }
+
+            ValueTransform::PreserveUnitPercentAsEm => {
+                let (num, css_unit) = parse_css_length(raw)?;
+                if css_unit == "%" {
+                    return Some(KfxValue::Dimensioned {
+                        value: num / 100.0,
+                        unit: KfxSymbol::Em,
+                    });
+                }
+                let kfx_unit = match css_unit.as_str() {
+                    "px" => KfxSymbol::Px,
+                    "em" => KfxSymbol::Em,
+                    "rem" => KfxSymbol::Rem,
+                    "pt" => KfxSymbol::Pt,
+                    _ => KfxSymbol::Px, // Default fallback
+                };
+                Some(KfxValue::Dimensioned {
+                    value: num,
+                    unit: kfx_unit,
+                })
+            }
         }
     }
 }
@@ -1653,7 +1683,9 @@ impl ValueTransform {
                 None
             }
 
-            ValueTransform::Dimensioned { .. } | ValueTransform::PreserveUnit => {
+            ValueTransform::Dimensioned { .. }
+            | ValueTransform::PreserveUnit
+            | ValueTransform::PreserveUnitPercentAsEm => {
                 // Parse {value: N, unit: sym} struct
                 // Value may be Int (whole numbers), Float, or Decimal (Amazon uses all three)
                 let fields = value.as_struct()?;

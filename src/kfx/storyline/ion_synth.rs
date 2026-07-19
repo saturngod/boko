@@ -52,6 +52,16 @@ pub fn tokens_to_ion(tokens: &TokenStream, ctx: &mut ExportContext) -> IonValue 
                     // Type: text - inner element holds the actual content
                     inner_fields.push((sym!(Type), IonValue::Symbol(KfxSymbol::Text as u64)));
 
+                    // The semantic marker rides on the inner $269 text element:
+                    // readers only consume `yj.semantics.*` keys on $269, so a
+                    // marker on the $270 wrapper would be flagged (and ignored)
+                    // as unexpected data.
+                    if let Some(semantic_type) = semantic_type_for(elem) {
+                        let field_id = ctx.symbols.get_or_intern("yj.semantics.type");
+                        let value_id = ctx.symbols.get_or_intern(semantic_type);
+                        inner_fields.push((field_id, IonValue::Symbol(value_id)));
+                    }
+
                     // Push inner text builder and mark it as inner wrapper
                     // Store outer_id so anchors inside use the top-level container for navigation
                     let mut inner_builder = IonBuilder::with_fields(inner_fields, inner_id);
@@ -143,6 +153,19 @@ pub fn tokens_to_ion(tokens: &TokenStream, ctx: &mut ExportContext) -> IonValue 
     }
 }
 
+/// The `yj.semantics.type` marker value for an element, if its export
+/// strategy carries one. A header cell overrides the strategy's "table_cell"
+/// with "table_header_cell" so the th/td distinction survives the round trip.
+fn semantic_type_for(elem: &ElementStart) -> Option<&'static str> {
+    if elem.is_header_cell {
+        Some("table_header_cell")
+    } else {
+        schema()
+            .export_strategy(elem.role)
+            .and_then(|s| s.semantic_type())
+    }
+}
+
 /// Build the Ion field list for a `StartElement` token.
 ///
 /// Shared by both `tokens_to_ion` paths: the container-wrapper path (outer
@@ -204,12 +227,14 @@ fn start_element_fields(
     // (e.g., BlockQuote → yj.semantics.type: block_quote). A header cell
     // overrides the strategy's "table_cell" with "table_header_cell" so the
     // th/td distinction survives the round trip.
-    let semantic_type = if elem.is_header_cell {
-        Some("table_header_cell")
+    //
+    // When this element is border-wrapped, the marker is emitted on the inner
+    // $269 text element instead (see tokens_to_ion): readers only consume
+    // `yj.semantics.*` keys on $269, never on the $270 wrapper container.
+    let semantic_type = if container_wrapper {
+        None
     } else {
-        schema()
-            .export_strategy(elem.role)
-            .and_then(|s| s.semantic_type())
+        semantic_type_for(elem)
     };
     if let Some(semantic_type) = semantic_type {
         // Both field name and value are local symbols
@@ -487,12 +512,23 @@ impl IonBuilder {
                     })
                 });
                 if has_block_child && !has_real_text {
+                    let mut promoted = false;
                     for (k, v) in self.fields.iter_mut() {
                         if *k == sym!(Type)
                             && matches!(v, IonValue::Symbol(t) if *t == KfxSymbol::Text as u64)
                         {
                             *v = IonValue::Symbol(KfxSymbol::Container as u64);
+                            promoted = true;
                         }
+                    }
+                    // Containers admit no semantic markers: readers only
+                    // consume `yj.semantics.*` on $269 text elements and
+                    // flag them as unexpected data on $270. Previewer
+                    // likewise renders block-holding asides/quotes as plain
+                    // styled containers, so drop the marker with the type.
+                    if promoted {
+                        let marker_id = ctx.symbols.get_or_intern("yj.semantics.type");
+                        self.fields.retain(|(k, _)| *k != marker_id);
                     }
                 }
                 self.fields

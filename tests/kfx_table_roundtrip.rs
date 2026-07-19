@@ -267,11 +267,103 @@ fn bordered_table_keeps_table_structure_in_kfx() {
     assert!(saw_row, "table rows lost through KFX round-trip");
 }
 
-/// Sidebars export as plain containers carrying a `yj.semantics.type: sidebar`
-/// marker — never the $280 element type or $620 classification, which
-/// Amazon-produced books don't use — while the role survives the round trip.
+/// Collect the element `type` of every storyline struct that carries a
+/// `yj.semantics.type` marker. Readers only consume `yj.semantics.*` keys on
+/// $269 text elements — a marker on any other type is flagged as unexpected
+/// data — so conformant output must pair every marker with `type: text`.
+fn scan_marker_carrier_types(kfx: &[u8]) -> Vec<(u64, String)> {
+    use boko::kfx::container::{
+        extract_doc_symbols, parse_container_header, parse_container_info, parse_index_table,
+        skip_enty_header,
+    };
+    use boko::kfx::ion::{IonParser, IonValue};
+    use boko::kfx::symbols::{KFX_SYMBOL_TABLE, KfxSymbol};
+
+    let header = parse_container_header(&kfx[..18]).expect("container header");
+    let info = parse_container_info(
+        &kfx[header.container_info_offset
+            ..header.container_info_offset + header.container_info_length],
+    )
+    .expect("container info");
+    let doc_symbols = match info.doc_symbols {
+        Some((off, len)) if len > 0 => extract_doc_symbols(&kfx[off..off + len]),
+        _ => Vec::new(),
+    };
+    let (index_offset, index_length) = info.index.expect("index table");
+    let entities = parse_index_table(
+        &kfx[index_offset..index_offset + index_length],
+        header.header_len,
+    );
+
+    let base = KFX_SYMBOL_TABLE.len() as u64;
+    let resolve = |id: u64| -> String {
+        if id < base {
+            KFX_SYMBOL_TABLE[id as usize].to_string()
+        } else {
+            doc_symbols
+                .get((id - base) as usize)
+                .cloned()
+                .unwrap_or_default()
+        }
+    };
+    let semantics_field: Vec<u64> = doc_symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.as_str() == "yj.semantics.type")
+        .map(|(i, _)| i as u64 + base)
+        .collect();
+
+    fn walk(
+        v: &IonValue,
+        carriers: &mut Vec<(u64, String)>,
+        semantics_field: &[u64],
+        resolve: &dyn Fn(u64) -> String,
+    ) {
+        match v {
+            IonValue::Struct(fields) => {
+                let elem_type = fields.iter().find_map(|(k, val)| match val {
+                    IonValue::Symbol(s) if *k == KfxSymbol::Type as u64 => Some(*s),
+                    _ => None,
+                });
+                for (k, val) in fields {
+                    if semantics_field.contains(k)
+                        && let IonValue::Symbol(s) = val
+                    {
+                        carriers.push((elem_type.unwrap_or(0), resolve(*s)));
+                    }
+                    walk(val, carriers, semantics_field, resolve);
+                }
+            }
+            IonValue::List(items) => {
+                for item in items {
+                    walk(item, carriers, semantics_field, resolve);
+                }
+            }
+            IonValue::Annotated(_, inner) => walk(inner, carriers, semantics_field, resolve),
+            _ => {}
+        }
+    }
+
+    let mut carriers = Vec::new();
+    for loc in entities {
+        if loc.type_id != KfxSymbol::Storyline as u32 {
+            continue;
+        }
+        let entity = &kfx[loc.offset..loc.offset + loc.length];
+        let payload = skip_enty_header(entity);
+        if let Ok(value) = IonParser::new(payload).parse() {
+            walk(&value, &mut carriers, &semantics_field, &resolve);
+        }
+    }
+    carriers
+}
+
+/// Inline-content sidebars export as $269 text elements carrying a
+/// `yj.semantics.type: sidebar` marker — never the $280 element type or $620
+/// classification, which Amazon-produced books don't use — and the role
+/// survives the round trip via the marker.
 #[test]
-fn sidebar_exports_as_container_with_marker() {
+fn inline_sidebar_keeps_marker_on_text_element() {
     use boko::kfx::symbols::KfxSymbol;
     use common::{Doc, EpubBuilder, Nav};
 
@@ -280,7 +372,7 @@ fn sidebar_exports_as_container_with_marker() {
             "text/ch1.xhtml",
             "Aside",
             "<p>body text</p>\
-             <aside epub:type=\"sidebar\"><p>note box</p></aside>",
+             <aside epub:type=\"sidebar\">just an inline note</aside>",
         ))
         .nav(vec![Nav::new("Aside", "text/ch1.xhtml")])
         .build();
@@ -299,7 +391,17 @@ fn sidebar_exports_as_container_with_marker() {
     );
     assert!(
         markers.contains("sidebar"),
-        "sidebar must carry the yj.semantics.type marker: {markers:?}"
+        "inline sidebar must carry the yj.semantics.type marker: {markers:?}"
+    );
+
+    // The marker must ride a $269 text element, where readers consume it.
+    let carriers = scan_marker_carrier_types(&kfx);
+    assert!(
+        carriers
+            .iter()
+            .filter(|(_, m)| m == "sidebar")
+            .all(|(t, _)| *t == KfxSymbol::Text as u64),
+        "sidebar marker must ride type: text elements only: {carriers:?}"
     );
 
     // Role survives the round trip via the marker.
@@ -315,6 +417,45 @@ fn sidebar_exports_as_container_with_marker() {
         }
     }
     assert!(saw_sidebar, "sidebar role lost through KFX round-trip");
+}
+
+/// Block-holding sidebars are promoted to $270 containers by the no-hybrid
+/// content-model rule, and containers admit no semantic markers (readers
+/// flag `yj.semantics.*` on $270 as unexpected data). The marker is dropped
+/// with the promotion — matching Kindle Previewer, which renders block
+/// asides as plain styled containers.
+#[test]
+fn block_sidebar_drops_marker_with_container_promotion() {
+    use boko::kfx::symbols::KfxSymbol;
+    use common::{Doc, EpubBuilder, Nav};
+
+    let epub = EpubBuilder::new("Block Sidebar Book")
+        .doc(Doc::new(
+            "text/ch1.xhtml",
+            "Aside",
+            "<p>body text</p>\
+             <aside epub:type=\"sidebar\"><p>note box</p><p>second para</p></aside>",
+        ))
+        .nav(vec![Nav::new("Aside", "text/ch1.xhtml")])
+        .build();
+
+    let mut src = boko::Book::from_bytes(&epub, Format::Epub).expect("import epub");
+    let kfx = common::export_to_bytes(&mut src, Format::Kfx);
+
+    let (types, _, _) = scan_storylines(&kfx);
+    assert!(
+        !types.contains(&(KfxSymbol::Sidebar as u64)),
+        "sidebar must not use the $280 element type: {types:?}"
+    );
+
+    // No marker may survive on the promoted $270 container — and since every
+    // marker must ride $269, the invariant covers all roles (block quotes,
+    // table cells) in this book too.
+    let carriers = scan_marker_carrier_types(&kfx);
+    assert!(
+        carriers.iter().all(|(t, _)| *t == KfxSymbol::Text as u64),
+        "yj.semantics.type markers must ride type: text elements only: {carriers:?}"
+    );
 }
 
 /// Scan the book_navigation ($389) for an approximate page list ($237),
