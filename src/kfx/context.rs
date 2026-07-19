@@ -1037,7 +1037,15 @@ impl ExportContext {
         } else {
             builder.ingest_ir_style_with_parent(ir_style, parent);
         }
-        builder.build()
+        let mut kfx_style = builder.build();
+        // Block backgrounds paint the box, not the text run: reference
+        // output uses fill_color on block styles (text_background_color is
+        // for inline style_events; see register_inline_style_id).
+        use crate::kfx::symbols::KfxSymbol;
+        if let Some(value) = kfx_style.remove(KfxSymbol::TextBackgroundColor) {
+            kfx_style.set(KfxSymbol::FillColor, value);
+        }
+        kfx_style
     }
 
     /// Register an IR style and return its KFX style symbol. `parent` is the

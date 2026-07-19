@@ -65,6 +65,9 @@ fn link_color_for(chapter: &Chapter, node_id: NodeId) -> Option<u32> {
         if node.role == Role::Link
             && let Some(style) = chapter.styles.get(node.style)
             && let Some(c) = style.color
+            // Black links are default ink; reference output only carries
+            // actually-colored links (black would break night mode).
+            && (c.r, c.g, c.b) != (0, 0, 0)
         {
             return Some(
                 ((c.a as u32) << 24) | ((c.r as u32) << 16) | ((c.g as u32) << 8) | c.b as u32,

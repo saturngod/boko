@@ -1448,6 +1448,11 @@ fn parse_color_component(s: &str) -> Option<u8> {
 // IR Field Extraction (Bidirectional Schema Bridge)
 // ============================================================================
 
+/// `Some(())` when the color is present and not pure black (default ink).
+fn non_black(c: Option<crate::style::Color>) -> Option<()> {
+    c.and_then(|c| ((c.r, c.g, c.b) != (0, 0, 0)).then_some(()))
+}
+
 /// Format a dimension with unit, rounding away float noise.
 fn fmt_dim(v: f64, unit: &str) -> String {
     let rounded = (v * 1e6).round() / 1e6;
@@ -1744,6 +1749,14 @@ pub fn extract_ir_field(
         IrField::Color => {
             if ir_style.color == parent.color {
                 None
+            } else if parent.color.is_none()
+                && ir_style
+                    .color
+                    .is_some_and(|c| c.r == 0 && c.g == 0 && c.b == 0)
+            {
+                // Authored black on default-ink context: reference output
+                // drops it — explicit black forces black text in night mode.
+                None
             } else {
                 shared("color")
             }
@@ -1772,10 +1785,20 @@ pub fn extract_ir_field(
         IrField::BorderWidthRight => shared("border-width-right"),
         IrField::BorderWidthBottom => shared("border-width-bottom"),
         IrField::BorderWidthLeft => shared("border-width-left"),
-        IrField::BorderColorTop => shared("border-top-color"),
-        IrField::BorderColorRight => shared("border-right-color"),
-        IrField::BorderColorBottom => shared("border-bottom-color"),
-        IrField::BorderColorLeft => shared("border-left-color"),
+        // Black border colors are the renderer's default ink; reference
+        // output never emits them (explicit black breaks night mode).
+        IrField::BorderColorTop => {
+            non_black(ir_style.border_color_top).and_then(|_| shared("border-top-color"))
+        }
+        IrField::BorderColorRight => {
+            non_black(ir_style.border_color_right).and_then(|_| shared("border-right-color"))
+        }
+        IrField::BorderColorBottom => {
+            non_black(ir_style.border_color_bottom).and_then(|_| shared("border-bottom-color"))
+        }
+        IrField::BorderColorLeft => {
+            non_black(ir_style.border_color_left).and_then(|_| shared("border-left-color"))
+        }
         IrField::BorderRadiusTopLeft => shared("border-top-left-radius"),
         IrField::BorderRadiusTopRight => shared("border-top-right-radius"),
         IrField::BorderRadiusBottomLeft => shared("border-bottom-left-radius"),

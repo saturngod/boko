@@ -370,9 +370,17 @@ tr {
 td, th {
   display: table-cell;
   /* Reference KFX cell hygiene: body text-indent must not leak into
-     cells, and cell content must not overflow the table width. */
+     cells, and cell content must not overflow the table width. Cells
+     reset to left alignment (reference output forces it; justified
+     narrow cells render badly) — th re-centers below. */
   text-indent: 0;
   max-width: 100%;
+  text-align: left;
+  vertical-align: middle;
+}
+
+th {
+  text-align: center;
 }
 
 pre, xmp, plaintext, listing {
