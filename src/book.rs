@@ -79,6 +79,16 @@ impl Book {
         Ok(Self::from_backend(backend))
     }
 
+    /// Swap the importer backend, returning the old one.
+    ///
+    /// Cached chapters are dropped: they were produced by the old backend
+    /// and may not reflect the new one's view (e.g. rewritten asset paths
+    /// after [`optimize`](Self::optimize)).
+    pub(crate) fn replace_backend(&mut self, backend: Box<dyn Importer>) -> Box<dyn Importer> {
+        self.ir_cache.write().unwrap_or_else(|e| e.into_inner()).clear();
+        std::mem::replace(&mut self.backend, backend)
+    }
+
     fn from_backend(backend: Box<dyn Importer>) -> Self {
         Self {
             backend,

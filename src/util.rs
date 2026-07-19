@@ -551,6 +551,50 @@ pub fn extract_xml_encoding(bytes: &[u8]) -> Option<&str> {
 }
 
 // ============================================================================
+// Image Transcoding
+// ============================================================================
+
+/// Re-encode a raster image (PNG or JPEG) as JPEG at the given quality
+/// (1-100), for shrinking oversized images. Alpha is flattened onto white.
+///
+/// Returns `None` when the input fails to decode; callers keep the original
+/// bytes. Callers are also expected to keep the original when the result is
+/// not (meaningfully) smaller — PNG regularly beats JPEG on line art and
+/// flat-color images, and an already well-compressed JPEG gains nothing, so
+/// a size check, not a format rule, decides.
+#[cfg(feature = "optimize-images")]
+pub fn reencode_image_as_jpeg(data: &[u8], quality: u8) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(data).ok()?;
+
+    // Flatten transparency onto white: JPEG has no alpha, and Kindle pages
+    // are white; compositing beats dropping the channel outright.
+    let rgb = match img {
+        image::DynamicImage::ImageRgb8(rgb) => rgb,
+        other => {
+            let rgba = other.into_rgba8();
+            let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
+            for (out, px) in rgb.pixels_mut().zip(rgba.pixels()) {
+                let [r, g, b, a] = px.0;
+                let over = |c: u8| ((c as u32 * a as u32 + 255 * (255 - a as u32)) / 255) as u8;
+                out.0 = [over(r), over(g), over(b)];
+            }
+            rgb
+        }
+    };
+
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+        .encode(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .ok()?;
+    Some(out.into_inner())
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

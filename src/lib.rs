@@ -46,6 +46,7 @@ pub mod import;
 pub(crate) mod io;
 pub(crate) mod markdown;
 pub mod model;
+pub mod optimize;
 mod resolved;
 pub mod style;
 

@@ -45,6 +45,11 @@ enum Command {
         #[arg(short = 't', long = "to", value_enum, ignore_case = true)]
         to_format: Option<FormatArg>,
 
+        /// Optimize the output for size (re-encode oversized images,
+        /// keeping originals whenever re-encoding doesn't shrink them)
+        #[arg(short = 'O', long)]
+        optimize: bool,
+
         /// Suppress output messages
         #[arg(short, long)]
         quiet: bool,
@@ -111,8 +116,16 @@ fn main() -> ExitCode {
             output,
             from_format,
             to_format,
+            optimize,
             quiet,
-        } => convert(&input, output.as_deref(), from_format, to_format, quiet),
+        } => convert(
+            &input,
+            output.as_deref(),
+            from_format,
+            to_format,
+            optimize,
+            quiet,
+        ),
         Command::Dump {
             file,
             json,
@@ -489,6 +502,7 @@ fn convert(
     output: Option<&str>,
     from_format: Option<FormatArg>,
     to_format: Option<FormatArg>,
+    optimize: bool,
     quiet: bool,
 ) -> Result<(), String> {
     // Check if reading from stdin
@@ -549,7 +563,7 @@ fn convert(
     }
 
     // Open the book (from file or stdin)
-    let book = if from_stdin {
+    let mut book = if from_stdin {
         use std::io::Read;
         let mut data = Vec::new();
         std::io::stdin()
@@ -566,6 +580,21 @@ fn convert(
             Book::open(input).map_err(|e| format!("Failed to open input '{input}': {e}"))?
         }
     };
+
+    if optimize {
+        let report = book.optimize();
+        if !quiet {
+            for pass in &report.passes {
+                eprintln!(
+                    "Optimize {}: {} asset{} shrunk, saved {:.1} KB",
+                    pass.pass,
+                    pass.assets_changed,
+                    if pass.assets_changed == 1 { "" } else { "s" },
+                    pass.bytes_saved as f64 / 1024.0,
+                );
+            }
+        }
+    }
 
     if to_stdout {
         // Write to stdout

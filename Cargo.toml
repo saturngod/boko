@@ -20,7 +20,10 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["cli", "parallel"]
-cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:ion-rs"]
+cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:ion-rs", "optimize-images"]
+# Image shrinking for `Book::optimize` (recompress/transcode raster images).
+# Optional so the wasm build stays small; included in the CLI by default.
+optimize-images = ["dep:image"]
 wasm = ["wasm-bindgen", "console_error_panic_hook"]
 # Parallel chapter compilation via rayon. Native-only: the dependency is
 # declared under the non-wasm target table below, so enabling this feature on
@@ -48,6 +51,10 @@ smallvec = "1.15"
 
 # Derive Display/Error/From for the typed error enum (compile-time only).
 thiserror = "2"
+
+# Raster decode + JPEG encode for the image-shrinking optimize pass.
+# Optional: pulled in by the `optimize-images` feature, excluded from wasm.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 
 html5ever = "0.39"
 cssparser = "0.36"
@@ -88,6 +95,8 @@ js-sys = "0.3"
 tempfile = "3.14"
 proptest = "1.6"
 criterion = "0.8"
+# Synthesizes image fixtures for the optimize-images tests.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [[bin]]
 name = "boko"
