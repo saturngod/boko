@@ -607,7 +607,12 @@ impl Azw3Importer {
             transform::transform_kindle_refs(&content, &self.kf8.elems, html_text, &file_starts);
 
         // Strip Amazon-specific attributes (aid, data-Amzn*)
-        let cleaned = transform::strip_kindle_attributes_fast(&transformed);
+        let mut cleaned = transform::strip_kindle_attributes_fast(&transformed);
+
+        // Fix stray solidi between attributes (`src="x.gif"/ alt=""`, a real
+        // AZW3 markup quirk that glues the next attribute into the value
+        // under the XML parse path).
+        crate::mobi::filepos::fix_stray_attribute_solidus(&mut cleaned);
 
         Ok(cleaned)
     }
