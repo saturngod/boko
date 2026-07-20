@@ -248,16 +248,49 @@ fn mathml_survives_into_kfx_as_text() {
     let mut book = boko::Book::from_bytes(&epub, Format::Epub).expect("import epub");
     let kfx = common::export_to_bytes(&mut book, Format::Kfx);
 
-    // The equation's text (its alttext) is present in the KFX content — Ion
-    // stores strings as UTF-8, so a raw scan finds it.
     let text = String::from_utf8_lossy(&kfx);
+    // The equation is a classified `math` container carrying its source MathML
+    // (rendered live on capable firmware) plus a spoken alt_text and a readable
+    // text fallback — not dropped, not flattened into the prose.
     assert!(
         text.contains("E equals m c squared"),
-        "math must reach KFX as its text fallback, not be dropped"
+        "math alt_text/fallback must reach the KFX"
+    );
+    assert!(
+        text.contains("<math") && text.contains("</math>"),
+        "the source MathML must be carried as an annotation"
     );
     // The surrounding prose stays intact around it.
     assert!(text.contains("Einstein wrote"));
     assert!(text.contains("in 1905."));
+}
+
+/// Math inside an inline element (`<span>…<math/>…</span>`) must not be
+/// dropped. The inline flattener can't nest a math container mid-style-event,
+/// so it emits the equation's readable linearization inline instead of losing
+/// it. (Regression: math inside spans previously vanished entirely.)
+#[test]
+fn math_inside_span_is_not_dropped() {
+    use common::{Doc, EpubBuilder, Nav};
+
+    let epub = EpubBuilder::new("Span Math")
+        .doc(Doc::new(
+            "text/ch1.xhtml",
+            "One",
+            "<p>Let <span>the value <math xmlns=\"http://www.w3.org/1998/Math/MathML\" \
+             alttext=\"z sub three\"><msub><mi>z</mi><mn>3</mn></msub></math> vary</span>.</p>",
+        ))
+        .nav(vec![Nav::new("One", "text/ch1.xhtml")])
+        .build();
+
+    let mut book = boko::Book::from_bytes(&epub, Format::Epub).expect("import epub");
+    let kfx = common::export_to_bytes(&mut book, Format::Kfx);
+    let text = String::from_utf8_lossy(&kfx);
+    assert!(
+        text.contains("z sub three"),
+        "math inside a span must survive (as inline readable text), not be dropped"
+    );
+    assert!(text.contains("the value") && text.contains("vary"));
 }
 
 /// A floated large-font span at a paragraph's start (the CSS dropcap idiom)
