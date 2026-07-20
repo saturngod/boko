@@ -231,6 +231,13 @@ pub struct ComputedStyle {
     pub border_collapse: BorderCollapse,
     /// `border-spacing` between table cells; `Length::Auto` means unset.
     pub border_spacing: Length,
+
+    /// Dropcap span line height in text lines (0 = not a dropcap). Set by
+    /// the dropcap-detection pass on the paragraph; drives the KFX
+    /// `dropcap_lines`/`dropcap_chars` properties.
+    pub dropcap_lines: u8,
+    /// Number of leading characters rendered as the dropcap (0 = none).
+    pub dropcap_chars: u8,
 }
 
 impl Default for ComputedStyle {
@@ -308,6 +315,8 @@ impl Default for ComputedStyle {
             overflow_wrap: Default::default(),
             border_collapse: Default::default(),
             border_spacing: Default::default(),
+            dropcap_lines: 0,
+            dropcap_chars: 0,
         }
     }
 }

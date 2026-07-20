@@ -186,6 +186,11 @@ pub(super) fn walk_node_for_export(
     let hint = layout_hint_for(chapter, node_id, node.role);
     let adj = adjust.get(&node_id).copied().unwrap_or_default();
     let link_color = link_color_for(chapter, node_id);
+    // Dropcap paragraphs suppress their leading span's float/large font.
+    let is_dropcap = chapter
+        .styles
+        .get(node.style)
+        .is_some_and(|s| s.dropcap_chars > 0);
     let style_symbol = if hint.is_some() || !adj.is_identity() || link_color.is_some() {
         ctx.register_style_id_adjusted(
             node.style,
@@ -306,6 +311,11 @@ pub(super) fn walk_node_for_export(
     let run_style_symbol = elem.style_symbol;
     stream.push(KfxToken::StartElement(elem));
 
+    // Arm dropcap suppression for this block's first inline run.
+    if is_dropcap {
+        ctx.dropcap_suppress = true;
+    }
+
     // Reference content model: an element never carries BOTH its own text
     // and element children. When inline flow (text, breaks, links, spans)
     // interleaves with element children (images, nested blocks), each run of
@@ -372,6 +382,10 @@ pub(super) fn walk_node_for_export(
         }
         close_run(stream, &mut run_open);
     }
+
+    // Clear any unconsumed dropcap arming (e.g. a dropcap block whose first
+    // run was plain text) so it can't leak into a later block.
+    ctx.dropcap_suppress = false;
 
     stream.push(KfxToken::EndElement);
 }
@@ -523,10 +537,18 @@ pub(super) fn emit_flattened_segments(
             );
 
             // Set style (innermost). Inline runs use the inline projection:
-            // block-only properties (box_align) never ride style_events.
+            // block-only properties (box_align) never ride style_events. The
+            // first run of a dropcap paragraph additionally drops its float
+            // and large font (the native dropcap replaces them).
             if let Some(style_id) = segment.state.style {
-                let style_symbol =
-                    ctx.register_inline_style_id(style_id, parent_style, &chapter.styles);
+                let suppress = ctx.dropcap_suppress;
+                ctx.dropcap_suppress = false;
+                let style_symbol = ctx.register_inline_style_id_inner(
+                    style_id,
+                    parent_style,
+                    &chapter.styles,
+                    suppress,
+                );
                 span.style_symbol = Some(style_symbol);
             }
 

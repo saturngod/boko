@@ -225,6 +225,64 @@ fn font_size_is_never_percent() {
     );
 }
 
+/// A floated large-font span at a paragraph's start (the CSS dropcap idiom)
+/// is rendered as a native KFX dropcap: `dropcap_lines`/`dropcap_chars` on
+/// the paragraph style, matching Kindle Previewer, instead of a floated box
+/// that reflows badly on device.
+#[test]
+fn css_dropcap_becomes_native_kfx_dropcap() {
+    use common::{Doc, EpubBuilder, Nav};
+
+    let epub = EpubBuilder::new("Dropcap Book")
+        .css(".dropcap { float: left; font-size: 3.4em; line-height: 3em; }")
+        .doc(Doc::new(
+            "text/ch1.xhtml",
+            "One",
+            "<p><span class=\"dropcap\">T</span>he kid looked at Tobin \
+             but the expriest sat without expression.</p>",
+        ))
+        .nav(vec![Nav::new("One", "text/ch1.xhtml")])
+        .build();
+
+    let mut book = boko::Book::from_bytes(&epub, Format::Epub).expect("import epub");
+    let kfx = common::export_to_bytes(&mut book, Format::Kfx);
+
+    let mut lines = None;
+    let mut chars = None;
+    for style in parse_entities(&kfx, KfxSymbol::Style as u32) {
+        let IonValue::Struct(fields) = &style else {
+            continue;
+        };
+        if let Some(v) = get_field(fields, KfxSymbol::DropcapLines).and_then(|v| v.as_int()) {
+            lines = Some(v);
+        }
+        if let Some(v) = get_field(fields, KfxSymbol::DropcapChars).and_then(|v| v.as_int()) {
+            chars = Some(v);
+        }
+    }
+    assert_eq!(
+        chars,
+        Some(1),
+        "dropcap_chars must count the leading letter"
+    );
+    assert_eq!(
+        lines,
+        Some(3),
+        "dropcap_lines must span the floated letter's height (3.4em ≈ 3 lines)"
+    );
+
+    // No float property survives on any style — the dropcap replaces it.
+    for style in parse_entities(&kfx, KfxSymbol::Style as u32) {
+        let IonValue::Struct(fields) = &style else {
+            continue;
+        };
+        assert!(
+            get_field(fields, KfxSymbol::Float).is_none(),
+            "the dropcap span's float must be dropped"
+        );
+    }
+}
+
 /// `box_align` centers a block within its container. Reference KFX carries
 /// it on block element styles (verified against calibre/KP gold masters) but
 /// never on style_events — readers only consume it on blocks, and it

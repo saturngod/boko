@@ -62,6 +62,9 @@ pub enum ValueTransform {
     /// Example: "10px" → { value: 10, unit: px }, "1.5em" → { value: 1.5, unit: em }
     PreserveUnit,
 
+    /// A plain integer value (e.g. dropcap line/char counts).
+    WrapInt,
+
     /// Hairline dimensions (border widths/radii, letter/word spacing):
     /// absolute px folds to pt at the CSS ratio (0.75pt/px); relative units
     /// pass through. Reference KFX emits pt for these.
@@ -252,6 +255,8 @@ pub enum IrField {
     // Phase 12: Table properties
     BorderCollapse,
     BorderSpacing,
+    DropcapLines,
+    DropcapChars,
 }
 
 /// Declarative definition for how a style property maps from IR to KFX.
@@ -1162,6 +1167,22 @@ impl StyleSchema {
             transform: ValueTransform::AbsolutePt,
         });
 
+        // Dropcap: the leading letters of a paragraph rendered large,
+        // spanning N text lines (detected from a floated large-font span at
+        // paragraph start; see the dropcap-detection pass).
+        schema.register(StylePropertyRule {
+            ir_key: "dropcap-lines",
+            ir_field: Some(IrField::DropcapLines),
+            kfx_symbol: KfxSymbol::DropcapLines,
+            transform: ValueTransform::WrapInt,
+        });
+        schema.register(StylePropertyRule {
+            ir_key: "dropcap-chars",
+            ir_field: Some(IrField::DropcapChars),
+            kfx_symbol: KfxSymbol::DropcapChars,
+            transform: ValueTransform::WrapInt,
+        });
+
         schema
     }
 }
@@ -1240,6 +1261,8 @@ impl ValueTransform {
                     unit: kfx_unit,
                 })
             }
+
+            ValueTransform::WrapInt => raw.trim().parse::<i64>().ok().map(KfxValue::Integer),
 
             ValueTransform::AbsolutePt => {
                 let (num, css_unit) = parse_css_length(raw)?;
@@ -1810,6 +1833,8 @@ pub fn extract_ir_field(
         IrField::WordBreak => shared("word-break"),
         IrField::BorderCollapse => shared("border-collapse"),
         IrField::BorderSpacing => shared("border-spacing"),
+        IrField::DropcapLines => shared("dropcap-lines"),
+        IrField::DropcapChars => shared("dropcap-chars"),
     }
 }
 
@@ -1845,6 +1870,8 @@ impl ValueTransform {
                 // Identity: extract string or symbol text
                 value.as_string().map(|s| s.to_string())
             }
+
+            ValueTransform::WrapInt => value.as_int().map(|i| i.to_string()),
 
             ValueTransform::Map(mappings) => {
                 // Reverse map lookup: find CSS value for KFX value
@@ -2251,6 +2278,16 @@ pub fn apply_ir_field(ir_style: &mut ir_style::ComputedStyle, field: IrField, cs
         IrField::BorderRadiusBottomRight => {
             if let Some(len) = parse_css_length_to_ir(css_value) {
                 ir_style.border_radius_bottom_right = len;
+            }
+        }
+        IrField::DropcapLines => {
+            if let Ok(n) = css_value.parse::<u8>() {
+                ir_style.dropcap_lines = n;
+            }
+        }
+        IrField::DropcapChars => {
+            if let Ok(n) = css_value.parse::<u8>() {
+                ir_style.dropcap_chars = n;
             }
         }
         // Phase 6: List properties

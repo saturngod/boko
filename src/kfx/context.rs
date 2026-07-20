@@ -761,6 +761,12 @@ pub struct ExportContext {
     /// fragment is not emitted (an unreferenced style is a conformance error).
     pub default_style_used: bool,
 
+    /// Set while emitting a dropcap paragraph's inline content: the first
+    /// styled run (the floated dropcap span) has its float and large font
+    /// projected away, because the native KFX dropcap on the paragraph
+    /// replaces them. Consumed by the first inline run.
+    pub dropcap_suppress: bool,
+
     /// Text bytes per absolute font size (keyed by the exact f32 bits),
     /// accumulated during the survey pass to find the dominant body size.
     font_size_weights: FxHashMap<u32, u64>,
@@ -870,6 +876,7 @@ impl ExportContext {
             jpg_rst_marker_present: false,
             has_tables: false,
             default_style_used: false,
+            dropcap_suppress: false,
             font_size_weights: FxHashMap::default(),
             font_scale: 1.0,
             line_height_weights: FxHashMap::default(),
@@ -1009,7 +1016,6 @@ impl ExportContext {
     /// authored line-heights scale toward the 1.2em base (unset leading is
     /// already the base).
     fn scaled_style(&self, style: &crate::style::ComputedStyle) -> crate::style::ComputedStyle {
-        use crate::style::Length;
         let mut scaled = style.clone();
         scaled.font_size_abs = crate::style::AbsFontSize(style.font_size_abs.0 * self.font_scale);
         scaled.line_scale = crate::style::AbsFontSize(self.line_scale);
@@ -1205,11 +1211,27 @@ impl ExportContext {
         parent_id: StyleId,
         style_pool: &crate::style::StylePool,
     ) -> u64 {
+        self.register_inline_style_id_inner(style_id, parent_id, style_pool, false)
+    }
+
+    /// As [`Self::register_inline_style_id`], but when `suppress_dropcap` is
+    /// set the run's float and large font are projected away (a dropcap
+    /// paragraph's leading span — the native dropcap replaces them). Not
+    /// memoized, so the same span emits normally elsewhere.
+    pub fn register_inline_style_id_inner(
+        &mut self,
+        style_id: StyleId,
+        parent_id: StyleId,
+        style_pool: &crate::style::StylePool,
+        suppress_dropcap: bool,
+    ) -> u64 {
         if style_id == StyleId::DEFAULT && parent_id == StyleId::DEFAULT {
             return self.default_style_symbol;
         }
 
-        if let Some(&symbol) = self.ir_inline_style_memo.get(&(style_id, parent_id)) {
+        if !suppress_dropcap
+            && let Some(&symbol) = self.ir_inline_style_memo.get(&(style_id, parent_id))
+        {
             return symbol;
         }
 
@@ -1220,6 +1242,12 @@ impl ExportContext {
             let mut kfx_style =
                 self.build_kfx_style(&ir_style, parent, parent_id == StyleId::DEFAULT);
             kfx_style.remove(crate::kfx::symbols::KfxSymbol::BoxAlign);
+            if suppress_dropcap {
+                use crate::kfx::symbols::KfxSymbol;
+                kfx_style.remove(KfxSymbol::Float);
+                kfx_style.remove(KfxSymbol::FontSize);
+                kfx_style.remove(KfxSymbol::LineHeight);
+            }
             if kfx_style.is_empty() {
                 self.default_style_used = true;
                 self.default_style_symbol
@@ -1229,8 +1257,10 @@ impl ExportContext {
         } else {
             self.default_style_symbol
         };
-        self.ir_inline_style_memo
-            .insert((style_id, parent_id), symbol);
+        if !suppress_dropcap {
+            self.ir_inline_style_memo
+                .insert((style_id, parent_id), symbol);
+        }
         symbol
     }
 

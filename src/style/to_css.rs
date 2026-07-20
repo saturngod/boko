@@ -229,6 +229,8 @@ const PROPERTIES: &[CssProperty] = &[
     prop!("word-break", word_break, in_blob: false),
     prop!("border-collapse", border_collapse, in_blob: false),
     prop!("border-spacing", border_spacing, in_blob: false),
+    count_prop!("dropcap-lines", dropcap_lines),
+    count_prop!("dropcap-chars", dropcap_chars),
 ];
 
 /// The default style every `emit` fn compares against. Built once: this is
