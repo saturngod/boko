@@ -121,6 +121,9 @@ pub fn tokens_to_ion(tokens: &TokenStream, ctx: &mut ExportContext) -> IonValue 
 
                 span_stack.push((current_offset, span.clone()));
             }
+            KfxToken::MathImport(_) => {
+                // Import-only token; export emits math from the IR directly.
+            }
             KfxToken::EndSpan => {
                 // Pop the span and calculate its length
                 if let Some((start_offset, mut span_info)) = span_stack.pop() {

@@ -35,6 +35,24 @@ pub enum KfxToken {
     StartSpan(SpanStart),
     /// End of an inline style span
     EndSpan,
+    /// A math container imported from KFX: content references to its
+    /// `mathml` and `alt_text` annotation strings. The IR builder resolves
+    /// and parses them into a `Role::Math` node + `Math` AST (import-only;
+    /// export builds math from the IR side-table directly).
+    MathImport(Box<MathImportToken>),
+}
+
+/// Content references carried by an imported KFX math container.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MathImportToken {
+    /// Ref to the serialized `<math>` source ($690 annotation).
+    pub mathml_ref: Option<ContentRef>,
+    /// Ref to the spoken alt text ($584 annotation).
+    pub alttext_ref: Option<ContentRef>,
+    /// KFX element id.
+    pub id: Option<i64>,
+    /// Style name for IR style lookup.
+    pub style_name: Option<String>,
 }
 
 /// Information about an element start.
