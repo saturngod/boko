@@ -13,6 +13,14 @@ use super::{Math, MathExpr, TokenKind};
 /// The MathML namespace URI.
 pub const MATHML_NS: &str = "http://www.w3.org/1998/Math/MathML";
 
+/// Parse a standalone MathML string into a [`Math`]. Convenience for tools
+/// and tests; the conversion pipeline goes through the DOM transform instead.
+pub fn parse_math_str(s: &str) -> Option<Math> {
+    let dom = crate::dom::parse_dom(s);
+    let root = dom.find_by_tag("math")?;
+    Some(from_mathml(&dom, root))
+}
+
 /// Whether an element (by namespace or local name) is a MathML `<math>` root.
 pub fn is_math_root(dom: &ArenaDom, id: ArenaNodeId) -> bool {
     dom.element_namespace(id).map(|ns| ns.as_ref()) == Some(MATHML_NS)

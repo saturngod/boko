@@ -14,6 +14,7 @@
 //! contain and what KFX retains. Anything the tree doesn't model is kept
 //! verbatim in a [`MathExpr::Raw`] node so no format silently loses content.
 
+pub mod kvg;
 pub mod latex;
 pub mod mathml;
 
