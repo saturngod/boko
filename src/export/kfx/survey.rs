@@ -91,6 +91,18 @@ pub(super) fn survey_node(
         // We don't need to intern plain text content
     }
 
+    // Math emits a linearized text run in Pass 2 (the interim fallback); its
+    // byte length must be accounted here so the position map stays aligned.
+    if node.role == Role::Math
+        && let Some(math) = chapter.math.get(&node_id)
+    {
+        let len = math.to_text().len();
+        if len > 0 {
+            ctx.advance_text_offset(len);
+            ctx.record_text_metrics(metrics.0, metrics.1, len);
+        }
+    }
+
     // Recurse into children
     for child in chapter.children(node_id) {
         survey_node(chapter, child, metrics, ctx);

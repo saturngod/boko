@@ -172,6 +172,20 @@ pub(super) fn walk_node_for_export(
         return;
     }
 
+    // Math: KFX has no math element yet (native math is Kindle Vector
+    // Graphics — a future spoke). Until then, emit the equation linearized
+    // as a text run so it is present and readable on the device instead of
+    // dropped. `to_text` prefers the source alttext.
+    if node.role == Role::Math {
+        if let Some(math) = chapter.math.get(&node_id) {
+            let text = math.to_text();
+            if !text.is_empty() {
+                stream.push(KfxToken::Text(text));
+            }
+        }
+        return;
+    }
+
     // Build element start with semantics
     let mut elem = ElementStart::new(node.role);
     elem.node_id = Some(node_id);
@@ -323,8 +337,15 @@ pub(super) fn walk_node_for_export(
     // ref — Kindle Previewer's encoding. The hybrid shape (one ref plus
     // children) mis-accounts reading positions and never occurs in
     // Amazon-produced books.
-    let is_inline_flow =
-        |role: Role| matches!(role, Role::Text | Role::Break | Role::Link | Role::Inline);
+    // Math counts as inline flow: its interim text fallback is emitted as a
+    // bare text run, which must stay inside a text-element wrapper (the
+    // mixed-content run-wrapping) rather than float as a direct block child.
+    let is_inline_flow = |role: Role| {
+        matches!(
+            role,
+            Role::Text | Role::Break | Role::Link | Role::Inline | Role::Math
+        )
+    };
     let children: Vec<NodeId> = chapter.children(node_id).collect();
     let has_own_text = !node.text.is_empty() && !chapter.text(node.text).is_empty();
     let has_flow = has_own_text

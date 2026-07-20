@@ -225,6 +225,41 @@ fn font_size_is_never_percent() {
     );
 }
 
+/// MathML is imported as a first-class math node and, until native KVG
+/// rendering exists, emitted into KFX as its readable-text fallback (the
+/// source `alttext`) — present on the device, not dropped. The old behavior
+/// flattened `<math>` into deeply-nested containers, leaking token text and
+/// producing malformed content chunks.
+#[test]
+fn mathml_survives_into_kfx_as_text() {
+    use common::{Doc, EpubBuilder, Nav};
+
+    let epub = EpubBuilder::new("Math Book")
+        .doc(Doc::new(
+            "text/ch1.xhtml",
+            "One",
+            "<p>Einstein wrote <math xmlns=\"http://www.w3.org/1998/Math/MathML\" \
+             alttext=\"E equals m c squared\"><mi>E</mi><mo>=</mo><mi>m</mi>\
+             <msup><mi>c</mi><mn>2</mn></msup></math> in 1905.</p>",
+        ))
+        .nav(vec![Nav::new("One", "text/ch1.xhtml")])
+        .build();
+
+    let mut book = boko::Book::from_bytes(&epub, Format::Epub).expect("import epub");
+    let kfx = common::export_to_bytes(&mut book, Format::Kfx);
+
+    // The equation's text (its alttext) is present in the KFX content — Ion
+    // stores strings as UTF-8, so a raw scan finds it.
+    let text = String::from_utf8_lossy(&kfx);
+    assert!(
+        text.contains("E equals m c squared"),
+        "math must reach KFX as its text fallback, not be dropped"
+    );
+    // The surrounding prose stays intact around it.
+    assert!(text.contains("Einstein wrote"));
+    assert!(text.contains("in 1905."));
+}
+
 /// A floated large-font span at a paragraph's start (the CSS dropcap idiom)
 /// is rendered as a native KFX dropcap: `dropcap_lines`/`dropcap_chars` on
 /// the paragraph style, matching Kindle Previewer, instead of a floated box
