@@ -91,8 +91,10 @@ pub(super) fn survey_node(
         // We don't need to intern plain text content
     }
 
-    // Math emits a linearized text run in Pass 2 (the interim fallback); its
-    // byte length must be accounted here so the position map stays aligned.
+    // Math contributes its readable linearization in Pass 2 (as the math
+    // container's text child, or as an inline segment when nested in a span);
+    // account its length here so text-offset bookkeeping and the body-size
+    // normalization weighting see the same stream Pass 2 emits.
     if node.role == Role::Math
         && let Some(math) = chapter.math.get(&node_id)
     {

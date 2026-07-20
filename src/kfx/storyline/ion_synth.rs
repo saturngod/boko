@@ -189,12 +189,15 @@ fn build_math_container(math: &MathToken, ctx: &mut ExportContext) -> IonValue {
             (sym!(Index), IonValue::Int(index as i64)),
         ])
     };
-    let (alt_name, alt_idx) = ctx.append_text(&math.alttext);
-    let mut annotation_list = vec![IonValue::Struct(vec![
-        (sym!(Content), content_ref(alt_name, alt_idx)),
-        (sym!(AnnotationType), IonValue::Symbol(sym!(AltText))),
-    ])];
-    // Emit the source MathML as a second annotation. kfxlib's KFX→EPUB
+    let mut annotation_list = Vec::new();
+    if !math.alttext.is_empty() {
+        let (alt_name, alt_idx) = ctx.append_text(&math.alttext);
+        annotation_list.push(IonValue::Struct(vec![
+            (sym!(Content), content_ref(alt_name, alt_idx)),
+            (sym!(AnnotationType), IonValue::Symbol(sym!(AltText))),
+        ]));
+    }
+    // The source MathML as a second annotation. kfxlib's KFX→EPUB
     // back-conversion treats a `mathml` annotation as an overlay on a KVG
     // `<svg>` and errors when the SVG is absent (KVG glyph rendering is a
     // deferred spoke) — but that is the calibre plugin's export path, not the
@@ -202,15 +205,13 @@ fn build_math_container(math: &MathToken, ctx: &mut ExportContext) -> IonValue {
     // Enhanced-Typesetting-math firmware. The readable text content remains as
     // a hedge for readers that render neither. See kfxcheck's epub-trial
     // "Missing svg for mathml annotation" notes.
-    let emit_mathml = true;
-    if emit_mathml && !math.mathml.is_empty() {
+    if !math.mathml.is_empty() {
         let (mml_name, mml_idx) = ctx.append_text(&math.mathml);
         annotation_list.push(IonValue::Struct(vec![
             (sym!(Content), content_ref(mml_name, mml_idx)),
             (sym!(AnnotationType), IonValue::Symbol(sym!(Mathml))),
         ]));
     }
-    let annotations = IonValue::List(annotation_list);
 
     let mut fields = vec![
         (sym!(Id), IonValue::Int(container_id as i64)),
@@ -220,12 +221,11 @@ fn build_math_container(math: &MathToken, ctx: &mut ExportContext) -> IonValue {
     if !math.display {
         fields.push((sym!(Render), IonValue::Symbol(sym!(Inline))));
     }
-    fields.push((sym!(Annotations), annotations));
-    fields.push((sym!(Layout), IonValue::Symbol(KfxSymbol::Vertical as u64)));
-    // pan-zoom only makes sense with a KVG image to magnify.
-    if emit_mathml {
-        fields.push((sym!(PanZoomViewer), IonValue::Symbol(sym!(Enabled))));
+    if !annotation_list.is_empty() {
+        fields.push((sym!(Annotations), IonValue::List(annotation_list)));
     }
+    fields.push((sym!(Layout), IonValue::Symbol(KfxSymbol::Vertical as u64)));
+    fields.push((sym!(PanZoomViewer), IonValue::Symbol(sym!(Enabled))));
     fields.push((sym!(Style), IonValue::Symbol(style_sym)));
     fields.push((sym!(Type), IonValue::Symbol(KfxSymbol::Container as u64)));
 

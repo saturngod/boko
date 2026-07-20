@@ -333,10 +333,10 @@ fn function_command(name: &str) -> Option<&'static str> {
 fn write_token(kind: TokenKind, text: &str, out: &mut String) {
     let t = text.trim();
     match kind {
-        TokenKind::Num => out.push_str(t),
+        TokenKind::Num => push_escaped_math_mode(out, t),
         TokenKind::Text => {
             out.push_str("\\text{");
-            out.push_str(text); // preserve internal spaces
+            push_escaped_text_mode(out, text); // preserve internal spaces
             out.push('}');
         }
         TokenKind::Ident => {
@@ -364,13 +364,55 @@ fn write_token(kind: TokenKind, text: &str, out: &mut String) {
 
 /// Emit a token, mapping known operator/relation Unicode to LaTeX commands;
 /// pass everything else through (MathJax renders Unicode Greek and most
-/// symbols directly).
+/// symbols directly), escaping LaTeX-special ASCII on the way.
 fn push_symbol(out: &mut String, t: &str) {
     if let Some(cmd) = symbol_command(t) {
         out.push_str(cmd);
         out.push(' ');
     } else {
-        out.push_str(t);
+        push_escaped_math_mode(out, t);
+    }
+}
+
+/// Escape LaTeX-special characters for text mode (inside `\text{…}`). A raw
+/// `%` starts a comment (KaTeX silently eats the rest of the equation) and a
+/// raw `$` terminates math mode, so unescaped specials corrupt the output.
+fn push_escaped_text_mode(out: &mut String, text: &str) {
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\textbackslash{}"),
+            '{' => out.push_str("\\{"),
+            '}' => out.push_str("\\}"),
+            '$' => out.push_str("\\$"),
+            '%' => out.push_str("\\%"),
+            '&' => out.push_str("\\&"),
+            '#' => out.push_str("\\#"),
+            '_' => out.push_str("\\_"),
+            '~' => out.push_str("\\textasciitilde{}"),
+            '^' => out.push_str("\\textasciicircum{}"),
+            _ => out.push(c),
+        }
+    }
+}
+
+/// Escape LaTeX-special ASCII in math mode (bare number/operator tokens,
+/// e.g. `<mn>50%</mn>` or `<mo>&</mo>`). Non-special characters — including
+/// all Unicode math symbols — pass through untouched.
+fn push_escaped_math_mode(out: &mut String, text: &str) {
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\backslash "),
+            '{' => out.push_str("\\{"),
+            '}' => out.push_str("\\}"),
+            '$' => out.push_str("\\$"),
+            '%' => out.push_str("\\%"),
+            '&' => out.push_str("\\&"),
+            '#' => out.push_str("\\#"),
+            '_' => out.push_str("\\_"),
+            '~' => out.push_str("\\text{\\textasciitilde}"),
+            '^' => out.push_str("\\text{\\textasciicircum}"),
+            _ => out.push(c),
+        }
     }
 }
 
@@ -462,6 +504,22 @@ mod tests {
     }
     fn latex(e: MathExpr) -> String {
         to_latex_body(&e)
+    }
+
+    #[test]
+    fn latex_specials_are_escaped() {
+        // `%` starts a KaTeX comment (silently eats the rest of the
+        // equation), `$` terminates math mode, `&` is a tabular separator —
+        // raw occurrences in source tokens must be escaped.
+        assert_eq!(latex(num("50%")), "50\\%");
+        assert_eq!(latex(op("&")), "\\&");
+        assert_eq!(
+            latex(MathExpr::Token {
+                kind: TokenKind::Text,
+                text: "costs $5 & 10%_off".into(),
+            }),
+            "\\text{costs \\$5 \\& 10\\%\\_off}"
+        );
     }
 
     #[test]
