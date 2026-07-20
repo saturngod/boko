@@ -22,6 +22,7 @@ mod pass;
 mod predicates;
 mod prune;
 mod table;
+mod trim;
 mod vacuum;
 mod wrap;
 
@@ -44,6 +45,7 @@ pub fn optimize(chapter: &mut Chapter) {
     fuse::fuse_lists(chapter);
     wrap::wrap_mixed_content(chapter);
     table::normalize_table_structure(chapter);
+    trim::trim_block_edges(chapter);
     dropcap::detect_dropcaps(chapter);
     prune::prune_empty(chapter);
 }
