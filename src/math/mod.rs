@@ -117,21 +117,22 @@ pub enum MathExpr {
 }
 
 impl Math {
-    /// A lossy, plain-text linearization of the expression — the KFX interim
-    /// fallback (until KVG rendering) and the last-resort fallback anywhere a
-    /// richer converter cannot render a construct. Prefers the source
-    /// `alttext` when present; otherwise walks the tree, using Unicode
-    /// sub/superscript glyphs where they exist.
+    /// A lossy, plain-text linearization of the expression — the visible KFX
+    /// rendering (until KVG typesetting) and the last-resort fallback anywhere
+    /// a richer converter cannot render a construct. Walks the tree using
+    /// Unicode sub/superscript glyphs where they exist (`x₁`, `c²`, `√`);
+    /// the source `alttext` — usually verbose spoken-math prose — is only
+    /// used when the tree yields nothing (e.g. an unmodeled `Raw` equation).
     pub fn to_text(&self) -> String {
-        if let Some(alt) = &self.alttext {
-            let alt = alt.trim();
-            if !alt.is_empty() {
-                return alt.to_string();
-            }
-        }
         let mut out = String::new();
         self.expr.write_text(&mut out);
-        out
+        if !out.trim().is_empty() {
+            return out;
+        }
+        match &self.alttext {
+            Some(alt) if !alt.trim().is_empty() => alt.trim().to_string(),
+            _ => out,
+        }
     }
 }
 

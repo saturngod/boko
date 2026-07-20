@@ -436,12 +436,18 @@ mod tests {
     }
 
     #[test]
-    fn to_text_prefers_alttext_then_linearizes() {
+    fn to_text_linearizes_structurally_with_alttext_fallback() {
+        // The Unicode linearization wins even when alttext is present —
+        // spoken-math prose ("x squared") is for screen readers, not the
+        // visible text run.
         let m = parse(r#"<math alttext="x squared"><msup><mi>x</mi><mn>2</mn></msup></math>"#);
-        assert_eq!(m.to_text(), "x squared");
+        assert_eq!(m.to_text(), "x²");
 
-        // Without alttext, linearize with Unicode scripts.
         let m = parse(r#"<math><msup><mi>x</mi><mn>2</mn></msup></math>"#);
         assert_eq!(m.to_text(), "x²");
+
+        // An unmodeled equation with no renderable tree falls back to alttext.
+        let m = parse(r#"<math alttext="the quadratic formula"><menclose notation="box"/></math>"#);
+        assert_eq!(m.to_text(), "the quadratic formula");
     }
 }
