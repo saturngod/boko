@@ -9,10 +9,12 @@
 //! [`layout::typeset`] (positioned glyphs/rules in font units, y-up) →
 //! [`svg::to_svg`] for verification, KFX fragment emission for export.
 
+pub mod emit;
 pub mod font;
 pub mod layout;
 pub mod svg;
 
+pub use emit::{KvgEquation, PathBundle, emit};
 pub use font::MathFont;
 pub use layout::{LayoutBox, typeset};
 

@@ -3,7 +3,7 @@
 //!
 //! Usage: cargo run --release --example kvg_typeset -- <outdir>
 
-use boko::math::kvg::{MathFont, svg, typeset};
+use boko::math::kvg::{MathFont, PathBundle, emit, svg, typeset};
 
 const SAMPLES: &[(&str, &str)] = &[
     ("sub", r#"<math><msub><mi>x</mi><mn>1</mn></msub></math>"#),
@@ -47,6 +47,15 @@ fn main() {
                 let svg_text = svg::to_svg(&font, &layout);
                 let path = format!("{outdir}/{name}.svg");
                 std::fs::write(&path, svg_text).expect("write");
+                // Full KVG round trip: emit the literal KVG structures, then
+                // render them back through the decode rules.
+                let mut bundle = PathBundle::new();
+                let eq = emit(&font, &layout, &mut bundle);
+                std::fs::write(
+                    format!("{outdir}/{name}-kvg.svg"),
+                    boko::math::kvg::emit::decode_to_svg(&eq, &bundle),
+                )
+                .expect("write kvg round trip");
                 println!(
                     "{name}: {} glyphs, {} rules, {:.0}x{:.0} units -> {path}",
                     layout.glyphs.len(),
