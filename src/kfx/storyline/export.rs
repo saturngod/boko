@@ -183,8 +183,7 @@ pub(super) fn walk_node_for_export(
             let mathml = crate::math::mathml::to_mathml(math);
             if !mathml.is_empty() || !text.is_empty() {
                 let alttext = math.alttext.clone().unwrap_or_else(|| text.clone());
-                let style_symbol =
-                    ctx.register_style_id(node.style, parent_style, &chapter.styles);
+                let style_symbol = ctx.register_style_id(node.style, parent_style, &chapter.styles);
                 stream.push(KfxToken::Math(Box::new(crate::kfx::tokens::MathToken {
                     mathml,
                     alttext,
@@ -354,9 +353,8 @@ pub(super) fn walk_node_for_export(
     // in the parent's content_list — closing any open inline run before it,
     // exactly like an inline image. KP nests math directly in a `type: text`
     // content_list; boko's split-run model places it between text-run wrappers.
-    let is_inline_flow = |role: Role| {
-        matches!(role, Role::Text | Role::Break | Role::Link | Role::Inline)
-    };
+    let is_inline_flow =
+        |role: Role| matches!(role, Role::Text | Role::Break | Role::Link | Role::Inline);
     let children: Vec<NodeId> = chapter.children(node_id).collect();
     let has_own_text = !node.text.is_empty() && !chapter.text(node.text).is_empty();
     let has_flow = has_own_text
