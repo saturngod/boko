@@ -45,6 +45,17 @@ pub enum TokenKind {
     Text,
 }
 
+/// Horizontal alignment of a table column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColAlign {
+    /// Left-aligned cells.
+    Left,
+    /// Centered cells (the MathML default).
+    Center,
+    /// Right-aligned cells.
+    Right,
+}
+
 /// A node in the presentation-math tree.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MathExpr {
@@ -104,7 +115,13 @@ pub enum MathExpr {
         body: Box<MathExpr>,
     },
     /// `<mtable>` — a matrix/array of rows of cells.
-    Table(Vec<Vec<MathExpr>>),
+    Table {
+        /// Rows of cells.
+        rows: Vec<Vec<MathExpr>>,
+        /// Per-column alignment (may be shorter than the column count;
+        /// missing columns default to center).
+        aligns: Vec<ColAlign>,
+    },
     /// `<mspace>` — explicit spacing.
     Space,
     /// An element the tree doesn't model, kept verbatim so no format loses
@@ -199,7 +216,7 @@ impl MathExpr {
                 body.write_text(out);
                 out.push_str(close);
             }
-            MathExpr::Table(rows) => {
+            MathExpr::Table { rows, .. } => {
                 out.push('[');
                 for (r, row) in rows.iter().enumerate() {
                     if r > 0 {

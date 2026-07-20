@@ -7,7 +7,7 @@
 //! own output occupies for the common textbook constructs.
 
 use super::font::MathFont;
-use crate::math::{MathExpr, TokenKind};
+use crate::math::{ColAlign, MathExpr, TokenKind};
 
 /// One positioned glyph: `x` advances right, `y` is the baseline offset
 /// (y-up), `scale` shrinks script levels.
@@ -152,7 +152,31 @@ fn math_italic(c: char) -> char {
 
 /// Operators that render with limits above/below in display style.
 fn is_big_operator(t: &str) -> bool {
-    matches!(t, "∑" | "∏" | "∐" | "⋃" | "⋂" | "⋀" | "⋁" | "∫" | "∬" | "∮")
+    matches!(t, "∑" | "∏" | "∐" | "⋃" | "⋂" | "⋀" | "⋁")
+}
+
+/// Integral-family operators: display style enlarges the glyph but keeps
+/// side scripts (TeX convention), unlike the ∑ family.
+fn is_integral(t: &str) -> bool {
+    matches!(t, "∫" | "∬" | "∭" | "∮" | "∯" | "∰")
+}
+
+/// The accent glyph of an over-script, when it is a lone accent character.
+fn accent_char(e: &MathExpr) -> Option<char> {
+    if let MathExpr::Token { text, .. } = e {
+        let t = text.trim();
+        let mut chars = t.chars();
+        let ch = chars.next()?;
+        if chars.next().is_none()
+            && matches!(
+                ch,
+                '→' | '←' | '^' | 'ˆ' | '¯' | '‾' | '˜' | '~' | '˙' | '¨' | '⌢' | '⃗' | 'ˇ'
+            )
+        {
+            return Some(ch);
+        }
+    }
+    None
 }
 
 impl Ctx<'_> {
@@ -204,13 +228,32 @@ impl Ctx<'_> {
         Some(match expr {
             MathExpr::Row(items) => {
                 let mut out = LayoutBox::default();
+                // Tracks whether the previous item can end an operand — a
+                // sign after an operator, relation, or opening fence (or at
+                // the start) is unary and gets no binary spacing.
+                let mut prev_is_operand = false;
                 for it in items {
                     let (before, after) = match it {
                         MathExpr::Token {
                             kind: TokenKind::Op,
                             text,
-                        } if level == Level::Text => op_spacing(text.trim()),
+                        } if level == Level::Text => {
+                            let t = text.trim();
+                            if matches!(t, "+" | "\u{2212}" | "-" | "±" | "∓") && !prev_is_operand
+                            {
+                                (0.0, 0.0)
+                            } else {
+                                op_spacing(t)
+                            }
+                        }
                         _ => (0.0, 0.0),
+                    };
+                    prev_is_operand = match it {
+                        MathExpr::Token {
+                            kind: TokenKind::Op,
+                            text,
+                        } => matches!(text.trim(), ")" | "]" | "}" | "|" | "⟩" | "!"),
+                        _ => true,
                     };
                     let b = self.layout(it, level)?;
                     if b.width == 0.0 && b.glyphs.is_empty() && b.rules.is_empty() {
@@ -235,6 +278,9 @@ impl Ctx<'_> {
                         // Invisible operators occupy no space.
                         if matches!(t, "\u{2061}" | "\u{2062}" | "\u{2063}" | "\u{2064}") {
                             LayoutBox::default()
+                        } else if t == "-" {
+                            // A hyphen-minus in math is a minus sign.
+                            self.text_box("\u{2212}", false)?
                         } else {
                             self.text_box(t, false)?
                         }
@@ -243,21 +289,21 @@ impl Ctx<'_> {
             }
 
             MathExpr::Sub(base, sub) => {
-                let b = self.layout(base, level)?;
+                let b = self.script_base(base, level)?;
                 let s = self
                     .layout(sub, level.down())?
                     .scaled(self.rel_script_scale(level));
                 self.attach_scripts(b, Some(s), None)
             }
             MathExpr::Sup(base, sup) => {
-                let b = self.layout(base, level)?;
+                let b = self.script_base(base, level)?;
                 let s = self
                     .layout(sup, level.down())?
                     .scaled(self.rel_script_scale(level));
                 self.attach_scripts(b, None, Some(s))
             }
             MathExpr::SubSup(base, sub, sup) => {
-                let b = self.layout(base, level)?;
+                let b = self.script_base(base, level)?;
                 let lo = self
                     .layout(sub, level.down())?
                     .scaled(self.rel_script_scale(level));
@@ -343,7 +389,7 @@ impl Ctx<'_> {
                 out
             }
 
-            MathExpr::Table(rows) => {
+            MathExpr::Table { rows, aligns } => {
                 let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
                 if ncols == 0 {
                     return Some(LayoutBox::default());
@@ -380,7 +426,12 @@ impl Ctx<'_> {
                     }
                     let mut x = 0.0;
                     for (ci, cell) in row.iter().enumerate() {
-                        let cx = x + (col_w[ci] - cell.width) / 2.0;
+                        let slack = col_w[ci] - cell.width;
+                        let cx = x + match aligns.get(ci) {
+                            Some(ColAlign::Left) => 0.0,
+                            Some(ColAlign::Right) => slack,
+                            _ => slack / 2.0,
+                        };
                         merge_at(&mut out, cell.clone(), cx, y);
                         x += col_w[ci] + col_gap;
                     }
@@ -407,6 +458,42 @@ impl Ctx<'_> {
             // Unmodeled content: the whole equation falls back to text.
             MathExpr::Raw { .. } => return None,
         })
+    }
+
+    /// The base of a script construct. Display-style integrals swap in the
+    /// display-size glyph variant (side scripts stay, per TeX convention).
+    fn script_base(&mut self, base: &MathExpr, level: Level) -> Option<LayoutBox> {
+        if self.display
+            && level == Level::Text
+            && let MathExpr::Token {
+                kind: TokenKind::Op,
+                text,
+            } = base
+            && is_integral(text.trim())
+            && let Some(ch) = text.trim().chars().next()
+            && let Some(gid) = self.font.glyph(ch)
+        {
+            let c = self.font.constants();
+            let big = self
+                .font
+                .vertical_variant(gid, c.display_operator_min_height);
+            let m = self.font.metrics(big);
+            let mid = (m.max_y + m.min_y) / 2.0;
+            let dy = c.axis_height - mid;
+            return Some(LayoutBox {
+                width: m.advance,
+                ascent: m.max_y + dy,
+                descent: -(m.min_y + dy),
+                glyphs: vec![PlacedGlyph {
+                    gid: big,
+                    x: 0.0,
+                    y: dy,
+                    scale: 1.0,
+                }],
+                rules: vec![],
+            });
+        }
+        self.layout(base, level)
     }
 
     /// Script scale relative to the current level (a script inside a script
@@ -449,6 +536,45 @@ impl Ctx<'_> {
         level: Level,
     ) -> Option<LayoutBox> {
         let c = *self.font.constants();
+        // Accents (arrows, hats, bars, dots, tildes) hug the base instead of
+        // floating at limit distance, at natural size.
+        if under.is_none()
+            && let Some(over_expr) = over
+            && let Some(ch) = accent_char(over_expr)
+        {
+            let b = self.layout(base, level)?;
+            let gid = self.font.glyph(ch)?;
+            // Stretch the accent to span a wide base (arrows over words).
+            let m0 = self.font.metrics(gid);
+            let gid = if b.width > (m0.max_x - m0.min_x) * 1.25 {
+                self.font.horizontal_variant(gid, b.width)
+            } else {
+                gid
+            };
+            let m = self.font.metrics(gid);
+            let gap = 0.04 * self.em;
+            // Ink bottom of the accent sits just above the base's ink top.
+            let y = b.ascent + gap - m.min_y;
+            let ink_w = m.max_x - m.min_x;
+            let dx = (b.width - ink_w) / 2.0 - m.min_x;
+            let mut out = LayoutBox {
+                width: b.width,
+                ascent: (y + m.max_y).max(b.ascent),
+                descent: b.descent,
+                glyphs: vec![],
+                rules: vec![],
+            };
+            let bw = b.width;
+            merge_at(&mut out, b, 0.0, 0.0);
+            out.glyphs.push(PlacedGlyph {
+                gid,
+                x: dx.max(0.0),
+                y,
+                scale: 1.0,
+            });
+            out.width = bw;
+            return Some(out);
+        }
         // Inline non-big-operator limits read fine as scripts.
         let base_is_big = matches!(
             base,

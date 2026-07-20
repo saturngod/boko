@@ -74,7 +74,7 @@ fn write_latex(expr: &MathExpr, out: &mut String) {
             braces(out, x);
         }
         MathExpr::Fenced { open, close, body } => write_fenced(out, open, close, body),
-        MathExpr::Table(rows) => write_matrix(out, "matrix", rows),
+        MathExpr::Table { rows, .. } => write_matrix(out, "matrix", rows),
         MathExpr::Space => out.push_str("\\; "),
         MathExpr::Raw { latex, .. } => {
             if let Some(l) = latex {
@@ -178,7 +178,7 @@ fn under_over(
 
 fn write_fenced(out: &mut String, open: &str, close: &str, body: &MathExpr) {
     // A fenced matrix becomes a delimited matrix environment.
-    if let MathExpr::Table(rows) = body {
+    if let MathExpr::Table { rows, .. } = body {
         let env = match open.trim() {
             "(" => "pmatrix",
             "[" => "bmatrix",
@@ -582,7 +582,10 @@ mod tests {
 
     #[test]
     fn fenced_matrix_becomes_pmatrix() {
-        let table = MathExpr::Table(vec![vec![num("1"), num("2")], vec![num("3"), num("4")]]);
+        let table = MathExpr::Table {
+            rows: vec![vec![num("1"), num("2")], vec![num("3"), num("4")]],
+            aligns: vec![],
+        };
         let fenced = MathExpr::Fenced {
             open: "(".into(),
             close: ")".into(),

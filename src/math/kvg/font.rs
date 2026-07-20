@@ -246,4 +246,25 @@ impl MathFont {
         }
         best
     }
+
+    /// Choose a horizontal variant of `gid` at least `min_width` font units
+    /// wide (stretchy accents: arrows, bars, braces over a base). Returns the
+    /// base glyph when no wider variant exists.
+    pub fn horizontal_variant(&self, gid: u16, min_width: f32) -> u16 {
+        let face = self.face();
+        let Some(variants) = face.tables().math.and_then(|m| m.variants) else {
+            return gid;
+        };
+        let Some(construction) = variants.horizontal_constructions.get(GlyphId(gid)) else {
+            return gid;
+        };
+        let mut best = gid;
+        for var in construction.variants {
+            best = var.variant_glyph.0;
+            if var.advance_measurement as f32 >= min_width {
+                break;
+            }
+        }
+        best
+    }
 }
