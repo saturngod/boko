@@ -206,12 +206,16 @@ fn build_math_kvg_container(math: &MathKvgToken, ctx: &mut ExportContext) -> Ion
             ]));
         }
 
-        // Innermost: the kvg element with its shape list.
-        let bundle_name = ctx.symbols.get_or_intern("p0");
+        // Innermost: the kvg element with its shape list. All fractional
+        // numerics are Ion DECIMALS — the KFX convention throughout (and
+        // device-tested: binary floats in these fields crash pre-5.18.2
+        // firmware, whose KVG parser only accepts decimal/int scalars).
+        let dec = |v: f32| IonValue::Decimal(format!("{v}"));
         let shapes: Vec<IonValue> = kvg
             .shapes
             .iter()
             .map(|sh| {
+                let bundle_name = ctx.symbols.get_or_intern(&format!("p{}", sh.bundle));
                 IonValue::Struct(vec![
                     (
                         sym!(Path),
@@ -222,21 +226,16 @@ fn build_math_kvg_container(math: &MathKvgToken, ctx: &mut ExportContext) -> Ion
                     ),
                     (
                         sym!(Transform),
-                        IonValue::List(
-                            sh.transform
-                                .iter()
-                                .map(|&v| IonValue::Float(v as f64))
-                                .collect(),
-                        ),
+                        IonValue::List(sh.transform.iter().map(|&v| dec(v)).collect()),
                     ),
-                    (sym!(StrokeWidth), IonValue::Float(0.0)),
+                    (sym!(StrokeWidth), dec(0.0)),
                     (sym!(Type), IonValue::Symbol(KfxSymbol::Shape as u64)),
                 ])
             })
             .collect();
         let em_dim = |v: f32| {
             IonValue::Struct(vec![
-                (sym!(Value), IonValue::Float(v as f64)),
+                (sym!(Value), dec(v)),
                 (sym!(Unit), IonValue::Symbol(sym!(Em))),
             ])
         };
@@ -247,7 +246,7 @@ fn build_math_kvg_container(math: &MathKvgToken, ctx: &mut ExportContext) -> Ion
             (
                 sym!(MaxWidth),
                 IonValue::Struct(vec![
-                    (sym!(Value), IonValue::Float(100.0)),
+                    (sym!(Value), IonValue::Decimal("100".to_string())),
                     (sym!(Unit), IonValue::Symbol(sym!(Percent))),
                 ]),
             ),

@@ -16,10 +16,17 @@ use rustc_hash::FxHashMap;
 /// `path_bundle` ($692) fragment.
 #[derive(Debug, Default)]
 pub struct PathBundle {
-    outlines: Vec<Vec<f32>>,
-    by_glyph: FxHashMap<u16, usize>,
-    unit_square: Option<usize>,
+    /// Outline storage, split into size-bounded segments — Kindle Previewer
+    /// caps bundles around ~45 KB of Ion (old firmware evidently sizes
+    /// buffers to that); we bound by coordinate count to the same effect.
+    segments: Vec<Vec<Vec<f32>>>,
+    by_glyph: FxHashMap<u16, (usize, usize)>,
+    unit_square: Option<(usize, usize)>,
+    values_in_last: usize,
 }
+
+/// Coordinate-count budget per bundle segment (~40 KB of Ion decimals).
+const SEGMENT_VALUE_BUDGET: usize = 6000;
 
 impl PathBundle {
     /// Create an empty bundle.
@@ -27,46 +34,57 @@ impl PathBundle {
         Self::default()
     }
 
-    /// The outlines in index order (the `path_list` payload).
-    pub fn outlines(&self) -> &[Vec<f32>] {
-        &self.outlines
+    /// The bundle segments in order; segment `b` holds the `path_list` of
+    /// fragment `p{b}`.
+    pub fn segments(&self) -> &[Vec<Vec<f32>>] {
+        &self.segments
     }
 
-    /// Number of outlines in the bundle.
+    /// Total outlines across all segments.
     pub fn len(&self) -> usize {
-        self.outlines.len()
+        self.segments.iter().map(|s| s.len()).sum()
     }
 
     /// Whether the bundle holds no outlines.
     pub fn is_empty(&self) -> bool {
-        self.outlines.is_empty()
+        self.segments.is_empty()
     }
 
-    fn glyph_index(&mut self, font: &MathFont, gid: u16) -> usize {
-        if let Some(&i) = self.by_glyph.get(&gid) {
-            return i;
+    fn push_outline(&mut self, outline: Vec<f32>) -> (usize, usize) {
+        if self.segments.is_empty() || self.values_in_last + outline.len() > SEGMENT_VALUE_BUDGET {
+            self.segments.push(Vec::new());
+            self.values_in_last = 0;
         }
-        let i = self.outlines.len();
-        self.outlines.push(font.outline(gid).0);
-        self.by_glyph.insert(gid, i);
-        i
+        self.values_in_last += outline.len();
+        let b = self.segments.len() - 1;
+        let seg = self.segments.last_mut().expect("just ensured");
+        seg.push(outline);
+        (b, seg.len() - 1)
     }
 
-    fn unit_square_index(&mut self) -> usize {
-        if let Some(i) = self.unit_square {
-            return i;
+    fn glyph_index(&mut self, font: &MathFont, gid: u16) -> (usize, usize) {
+        if let Some(&loc) = self.by_glyph.get(&gid) {
+            return loc;
         }
-        let i = self.outlines.len();
+        let loc = self.push_outline(font.outline(gid).0);
+        self.by_glyph.insert(gid, loc);
+        loc
+    }
+
+    fn unit_square_index(&mut self) -> (usize, usize) {
+        if let Some(loc) = self.unit_square {
+            return loc;
+        }
         // (0,0)–(1,1) square, y-up; scaled per rule by its transform.
-        self.outlines.push(vec![
+        let loc = self.push_outline(vec![
             0.0, 0.0, 0.0, // M 0 0
             1.0, 1.0, 0.0, // L 1 0
             1.0, 1.0, 1.0, // L 1 1
             1.0, 0.0, 1.0, // L 0 1
             4.0, // Z
         ]);
-        self.unit_square = Some(i);
-        i
+        self.unit_square = Some(loc);
+        loc
     }
 }
 
@@ -74,7 +92,9 @@ impl PathBundle {
 /// (KFX component order: `[a, c, b, d, e, f]` — b/c swapped vs SVG).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct KvgShape {
-    /// Index into the [`PathBundle`].
+    /// Bundle segment (fragment `p{bundle}`) holding the outline.
+    pub bundle: usize,
+    /// Index into that segment's `path_list`.
     pub path_index: usize,
     /// Placement transform in KFX component order.
     pub transform: [f32; 6],
@@ -113,22 +133,24 @@ pub fn emit(font: &MathFont, layout: &LayoutBox, bundle: &mut PathBundle) -> Kvg
         if outline_len == 0 {
             continue; // blank glyph (space-like)
         }
-        let idx = bundle.glyph_index(font, g.gid);
+        let (bidx, idx) = bundle.glyph_index(font, g.gid);
         // SVG order [a b c d e f] = [s, 0, 0, -s, x, baseline - y];
         // stored with b/c swapped (identical here: both zero — kept explicit
         // so non-axis-aligned shapes stay correct).
         let (a, b, c, d) = (g.scale, 0.0, 0.0, -g.scale);
         shapes.push(KvgShape {
+            bundle: bidx,
             path_index: idx,
             transform: [a, c, b, d, g.x + pad, baseline_y - g.y],
         });
     }
     for r in &layout.rules {
-        let idx = bundle.unit_square_index();
+        let (bidx, idx) = bundle.unit_square_index();
         // Unit square scaled to (w, h), y-up: bottom edge lands at the
         // rule's bottom.
         let (a, b, c, d) = (r.w, 0.0, 0.0, -r.h);
         shapes.push(KvgShape {
+            bundle: bidx,
             path_index: idx,
             transform: [a, c, b, d, r.x + pad, baseline_y - r.y],
         });
@@ -156,7 +178,7 @@ pub fn decode_to_svg(eq: &KvgEquation, bundle: &PathBundle) -> String {
         eq.fixed_width, eq.fixed_height, eq.fixed_width, eq.fixed_height
     );
     for s in &eq.shapes {
-        let d = super::svg::opcodes_to_d(&bundle.outlines()[s.path_index]);
+        let d = super::svg::opcodes_to_d(&bundle.segments()[s.bundle][s.path_index]);
         // Decode: swap b/c back to SVG order.
         let t = s.transform;
         let _ = write!(

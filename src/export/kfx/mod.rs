@@ -203,20 +203,30 @@ fn build_kfx_container(book: &Book) -> crate::Result<Vec<u8>> {
     // equations were typeset. Must precede the container entity map so the
     // bundle is enumerated there.
     if !ctx.math_bundle.is_empty() {
-        let name_sym = ctx.symbols.get_or_intern("p0");
-        let path_list: Vec<IonValue> = ctx
-            .math_bundle
-            .outlines()
-            .iter()
-            .map(|outline| {
-                IonValue::List(outline.iter().map(|&v| IonValue::Float(v as f64)).collect())
-            })
-            .collect();
-        let value = IonValue::Struct(vec![
-            (KfxSymbol::Name as u64, IonValue::Symbol(name_sym)),
-            (KfxSymbol::PathList as u64, IonValue::List(path_list)),
-        ]);
-        fragments.push(KfxFragment::new(KfxSymbol::PathBundle as u64, "p0", value));
+        // One fragment per size-bounded segment (Kindle Previewer caps
+        // bundles ~45 KB; oversized bundles are suspect on old firmware).
+        // Coordinates are Ion DECIMALS, the KFX numeric convention.
+        let segments = std::mem::take(&mut ctx.math_bundle);
+        for (b, outlines) in segments.segments().iter().enumerate() {
+            let fid = format!("p{b}");
+            let name_sym = ctx.symbols.get_or_intern(&fid);
+            let path_list: Vec<IonValue> = outlines
+                .iter()
+                .map(|outline| {
+                    IonValue::List(
+                        outline
+                            .iter()
+                            .map(|&v| IonValue::Decimal(format!("{v}")))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let value = IonValue::Struct(vec![
+                (KfxSymbol::Name as u64, IonValue::Symbol(name_sym)),
+                (KfxSymbol::PathList as u64, IonValue::List(path_list)),
+            ]);
+            fragments.push(KfxFragment::new(KfxSymbol::PathBundle as u64, fid, value));
+        }
     }
 
     // 2k. Navigation maps for reader functionality
