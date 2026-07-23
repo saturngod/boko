@@ -23,8 +23,9 @@ pub struct KfxDumpArgs {
     #[arg(short, long)]
     stat: bool,
 
-    /// Print detailed report for specified field/fragment (can be specified multiple times)
-    /// Supported: anchors, toc
+    /// Print detailed report for specified field/fragment (can be specified multiple times).
+    /// Supported: anchors, container, content, dependencies, document, features, locations,
+    /// metadata, navigation, positions, reading_orders, resources, sections, storylines
     #[arg(short = 'f', long = "field")]
     field: Vec<String>,
 }
@@ -165,9 +166,7 @@ fn dump_kfx_container(data: &[u8], resolve: bool) -> IonResult<()> {
 
     eprintln!("Container version: {version}");
     eprintln!("Header length: {header_len}");
-    eprintln!(
-        "Container info: offset={container_info_offset}, length={container_info_length}"
-    );
+    eprintln!("Container info: offset={container_info_offset}, length={container_info_length}");
     eprintln!();
 
     // Extended symbols from doc symbol table
@@ -187,9 +186,7 @@ fn dump_kfx_container(data: &[u8], resolve: bool) -> IonResult<()> {
         if let Some((doc_sym_offset, doc_sym_length)) =
             parse_container_info_for_doc_symbols(container_info_data)
         {
-            eprintln!(
-                "Document symbols: offset={doc_sym_offset}, length={doc_sym_length}"
-            );
+            eprintln!("Document symbols: offset={doc_sym_offset}, length={doc_sym_length}");
             if doc_sym_offset + doc_sym_length <= data.len() {
                 let doc_sym_data = &data[doc_sym_offset..doc_sym_offset + doc_sym_length];
                 extended_symbols = extract_doc_symbols(doc_sym_data);
@@ -205,9 +202,7 @@ fn dump_kfx_container(data: &[u8], resolve: bool) -> IonResult<()> {
         let index_info = parse_container_info_for_index(container_info_data);
 
         if let Some((index_offset, index_length)) = index_info {
-            eprintln!(
-                "Index table: offset={index_offset}, length={index_length}"
-            );
+            eprintln!("Index table: offset={index_offset}, length={index_length}");
 
             // Parse index table - each entry is 24 bytes
             let entry_size = 24;
@@ -286,14 +281,14 @@ fn dump_kfx_container(data: &[u8], resolve: bool) -> IonResult<()> {
                 eprintln!(
                     "  Offset: {} (absolute: {})",
                     entity_offset,
-                    header_len + entity_offset
+                    header_len.saturating_add(entity_offset)
                 );
                 eprintln!("  Length: {entity_len}");
 
                 // Parse the entity
-                let abs_offset = header_len + entity_offset;
-                if abs_offset + entity_len <= data.len() {
-                    let entity_data = &data[abs_offset..abs_offset + entity_len];
+                let abs_offset = header_len.saturating_add(entity_offset);
+                if abs_offset.saturating_add(entity_len) <= data.len() {
+                    let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
                     dump_entity(entity_data, &extended_symbols, &maps, resolve)?;
                 }
                 eprintln!();
@@ -376,7 +371,10 @@ fn dump_kfx_stats(data: &[u8]) -> IonResult<()> {
 
         // Track singleton entity locations for detailed parsing
         if *count == 1 {
-            singleton_data.insert(type_name, (header_len + entity_offset, entity_len));
+            singleton_data.insert(
+                type_name,
+                (header_len.saturating_add(entity_offset), entity_len),
+            );
         } else {
             // No longer a singleton
             singleton_data.remove(&type_name.clone());
@@ -386,8 +384,8 @@ fn dump_kfx_stats(data: &[u8]) -> IonResult<()> {
     // Parse singleton entities to extract list counts
     let mut singleton_details: HashMap<String, String> = HashMap::new();
     for (type_name, (abs_offset, entity_len)) in &singleton_data {
-        if abs_offset + entity_len <= data.len() {
-            let entity_data = &data[*abs_offset..*abs_offset + *entity_len];
+        if abs_offset.saturating_add(*entity_len) <= data.len() {
+            let entity_data = &data[*abs_offset..abs_offset.saturating_add(*entity_len)];
             if let Some(detail) = extract_singleton_details(entity_data, type_name) {
                 singleton_details.insert(type_name.clone(), detail);
             }
@@ -704,8 +702,6 @@ fn report_anchors(data: &[u8]) -> IonResult<()> {
 
     // First pass: collect content entities (content_name → list of strings)
     let mut content_map: HashMap<String, Vec<String>> = HashMap::new();
-    // For destination text lookup by fragment ID
-    let mut content_by_id: HashMap<i64, String> = HashMap::new();
     // Map fragment ID → (content_name, content_index) for resolving anchor destinations
     let mut fragment_content_map: HashMap<i64, (String, i64)> = HashMap::new();
     // Second pass: collect link_to references from storylines
@@ -718,7 +714,7 @@ fn report_anchors(data: &[u8]) -> IonResult<()> {
             break;
         }
 
-        let Some(id_idnum) = read_u32_le(data, entry_offset) else {
+        let Some(_id_idnum) = read_u32_le(data, entry_offset) else {
             continue;
         };
         let Some(type_idnum) = read_u32_le(data, entry_offset + 4) else {
@@ -731,12 +727,12 @@ fn report_anchors(data: &[u8]) -> IonResult<()> {
             continue;
         };
 
-        let abs_offset = header_len + entity_offset;
-        if abs_offset + entity_len > data.len() {
+        let abs_offset = header_len.saturating_add(entity_offset);
+        if abs_offset.saturating_add(entity_len) > data.len() {
             continue;
         }
 
-        let entity_data = &data[abs_offset..abs_offset + entity_len];
+        let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
 
         // Parse ENTY format
         if entity_data.len() < 10 || &entity_data[0..4] != b"ENTY" {
@@ -762,9 +758,6 @@ fn report_anchors(data: &[u8]) -> IonResult<()> {
             && let Some((name, texts)) =
                 extract_content_texts(&value, &extended_symbols, base_symbol_count)
         {
-            // Also build concatenated text for destination lookup
-            let full_text = texts.join("");
-            content_by_id.insert(i64::from(id_idnum), full_text);
             content_map.insert(name, texts);
         }
 
@@ -828,12 +821,12 @@ fn report_anchors(data: &[u8]) -> IonResult<()> {
             continue;
         }
 
-        let abs_offset = header_len + entity_offset;
-        if abs_offset + entity_len > data.len() {
+        let abs_offset = header_len.saturating_add(entity_offset);
+        if abs_offset.saturating_add(entity_len) > data.len() {
             continue;
         }
 
-        let entity_data = &data[abs_offset..abs_offset + entity_len];
+        let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
 
         // Parse ENTY format
         if entity_data.len() < 10 || &entity_data[0..4] != b"ENTY" {
@@ -1012,12 +1005,12 @@ fn report_navigation(data: &[u8]) -> IonResult<()> {
             continue;
         };
 
-        let abs_offset = header_len + entity_offset;
-        if abs_offset + entity_len > data.len() {
+        let abs_offset = header_len.saturating_add(entity_offset);
+        if abs_offset.saturating_add(entity_len) > data.len() {
             continue;
         }
 
-        let entity_data = &data[abs_offset..abs_offset + entity_len];
+        let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
 
         // Parse ENTY format
         if entity_data.len() < 10 || &entity_data[0..4] != b"ENTY" {
@@ -1081,12 +1074,12 @@ fn report_navigation(data: &[u8]) -> IonResult<()> {
             continue;
         };
 
-        let abs_offset = header_len + entity_offset;
-        if abs_offset + entity_len > data.len() {
+        let abs_offset = header_len.saturating_add(entity_offset);
+        if abs_offset.saturating_add(entity_len) > data.len() {
             continue;
         }
 
-        let entity_data = &data[abs_offset..abs_offset + entity_len];
+        let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
 
         // Parse ENTY format
         if entity_data.len() < 10 || &entity_data[0..4] != b"ENTY" {
@@ -1187,8 +1180,7 @@ fn extract_and_print_navigation(
                     }
                     id if id == KfxSymbol::NavContainerName as u32 => {
                         if let IonValue::Symbol(sym_id) = cfield_value {
-                            container_name =
-                                resolve_symbol(*sym_id, extended_symbols);
+                            container_name = resolve_symbol(*sym_id, extended_symbols);
                         }
                     }
                     id if id == KfxSymbol::Entries as u32 => {
@@ -1318,8 +1310,7 @@ fn extract_nav_entries(
                 id if id == KfxSymbol::LandmarkType as u32 => {
                     // landmark_type is a symbol (h2, h3, cover_page, srl, etc.)
                     if let IonValue::Symbol(sym_id) = field_value {
-                        landmark_type =
-                            Some(resolve_symbol(*sym_id, extended_symbols));
+                        landmark_type = Some(resolve_symbol(*sym_id, extended_symbols));
                     }
                 }
                 id if id == KfxSymbol::Representation as u32 => {
@@ -1531,8 +1522,7 @@ fn extract_fragment_content_from_list(
                     if *field_id == KfxSymbol::Type as u64
                         && let IonValue::Symbol(sym_id) = field_value
                     {
-                        container_type =
-                            Some(resolve_symbol(*sym_id, extended_symbols));
+                        container_type = Some(resolve_symbol(*sym_id, extended_symbols));
                     }
 
                     // Get content reference
@@ -1906,11 +1896,11 @@ fn build_maps(
         };
 
         // Parse entity to extract name field and fragment IDs
-        let abs_offset = header_len + entity_offset;
+        let abs_offset = header_len.saturating_add(entity_offset);
         let mut name: Option<String> = None;
 
-        if abs_offset + entity_len <= data.len() {
-            let entity_data = &data[abs_offset..abs_offset + entity_len];
+        if abs_offset.saturating_add(entity_len) <= data.len() {
+            let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
 
             // Check for ENTY format
             if entity_data.len() >= 10
@@ -2643,12 +2633,12 @@ fn report_features(data: &[u8]) -> IonResult<()> {
         }
 
         // Found content_features entity
-        let abs_offset = header_len + entity_offset;
-        if abs_offset + entity_len > data.len() {
+        let abs_offset = header_len.saturating_add(entity_offset);
+        if abs_offset.saturating_add(entity_len) > data.len() {
             continue;
         }
 
-        let entity_data = &data[abs_offset..abs_offset + entity_len];
+        let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
         if entity_data.len() < 10 || &entity_data[0..4] != b"ENTY" {
             continue;
         }
@@ -2843,12 +2833,12 @@ fn report_metadata(data: &[u8]) -> IonResult<()> {
         }
 
         // Found book_metadata entity
-        let abs_offset = header_len + entity_offset;
-        if abs_offset + entity_len > data.len() {
+        let abs_offset = header_len.saturating_add(entity_offset);
+        if abs_offset.saturating_add(entity_len) > data.len() {
             continue;
         }
 
-        let entity_data = &data[abs_offset..abs_offset + entity_len];
+        let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
         if entity_data.len() < 10 || &entity_data[0..4] != b"ENTY" {
             continue;
         }
@@ -2943,8 +2933,9 @@ fn report_metadata(data: &[u8]) -> IonResult<()> {
                                     println!("=== {cat_name} ===\n");
                                     for (key, val) in &metadata_list {
                                         // Truncate long values
-                                        let display_val = if val.len() > 60 {
-                                            format!("{}...", &val[..60])
+                                        let display_val = if val.chars().count() > 60 {
+                                            let truncated: String = val.chars().take(60).collect();
+                                            format!("{truncated}...")
                                         } else {
                                             val.clone()
                                         };
@@ -3046,12 +3037,12 @@ fn report_reading_orders(data: &[u8]) -> IonResult<()> {
         }
 
         // Found metadata entity
-        let abs_offset = header_len + entity_offset;
-        if abs_offset + entity_len > data.len() {
+        let abs_offset = header_len.saturating_add(entity_offset);
+        if abs_offset.saturating_add(entity_len) > data.len() {
             continue;
         }
 
-        let entity_data = &data[abs_offset..abs_offset + entity_len];
+        let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
         if entity_data.len() < 10 || &entity_data[0..4] != b"ENTY" {
             continue;
         }
@@ -3223,12 +3214,12 @@ fn report_document(data: &[u8]) -> IonResult<()> {
         }
 
         // Found document_data entity
-        let abs_offset = header_len + entity_offset;
-        if abs_offset + entity_len > data.len() {
+        let abs_offset = header_len.saturating_add(entity_offset);
+        if abs_offset.saturating_add(entity_len) > data.len() {
             continue;
         }
 
-        let entity_data = &data[abs_offset..abs_offset + entity_len];
+        let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
         if entity_data.len() < 10 || &entity_data[0..4] != b"ENTY" {
             continue;
         }
@@ -3418,12 +3409,12 @@ fn report_sections(data: &[u8]) -> IonResult<()> {
         }
 
         // Found section entity
-        let abs_offset = header_len + entity_offset;
-        if abs_offset + entity_len > data.len() {
+        let abs_offset = header_len.saturating_add(entity_offset);
+        if abs_offset.saturating_add(entity_len) > data.len() {
             continue;
         }
 
-        let entity_data = &data[abs_offset..abs_offset + entity_len];
+        let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
         if entity_data.len() < 10 || &entity_data[0..4] != b"ENTY" {
             continue;
         }
@@ -3621,12 +3612,12 @@ fn report_resources(data: &[u8]) -> IonResult<()> {
         }
 
         // Found external_resource entity
-        let abs_offset = header_len + entity_offset;
-        if abs_offset + entity_len > data.len() {
+        let abs_offset = header_len.saturating_add(entity_offset);
+        if abs_offset.saturating_add(entity_len) > data.len() {
             continue;
         }
 
-        let entity_data = &data[abs_offset..abs_offset + entity_len];
+        let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
         if entity_data.len() < 10 || &entity_data[0..4] != b"ENTY" {
             continue;
         }
@@ -3791,12 +3782,12 @@ fn report_storylines(data: &[u8]) -> IonResult<()> {
             continue;
         }
 
-        let abs_offset = header_len + entity_offset;
-        if abs_offset + entity_len > data.len() {
+        let abs_offset = header_len.saturating_add(entity_offset);
+        if abs_offset.saturating_add(entity_len) > data.len() {
             continue;
         }
 
-        let entity_data = &data[abs_offset..abs_offset + entity_len];
+        let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
         if entity_data.len() < 10 || &entity_data[0..4] != b"ENTY" {
             continue;
         }
@@ -4202,12 +4193,12 @@ fn report_locations(data: &[u8]) -> IonResult<()> {
             continue;
         };
 
-        let abs_offset = header_len + entity_offset;
-        if abs_offset + entity_len > data.len() {
+        let abs_offset = header_len.saturating_add(entity_offset);
+        if abs_offset.saturating_add(entity_len) > data.len() {
             continue;
         }
 
-        let entity_data = &data[abs_offset..abs_offset + entity_len];
+        let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
         if entity_data.len() < 10 || &entity_data[0..4] != b"ENTY" {
             continue;
         }
@@ -4349,12 +4340,12 @@ fn report_locations(data: &[u8]) -> IonResult<()> {
             continue;
         }
 
-        let abs_offset = header_len + entity_offset;
-        if abs_offset + entity_len > data.len() {
+        let abs_offset = header_len.saturating_add(entity_offset);
+        if abs_offset.saturating_add(entity_len) > data.len() {
             continue;
         }
 
-        let entity_data = &data[abs_offset..abs_offset + entity_len];
+        let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
         if entity_data.len() < 10 || &entity_data[0..4] != b"ENTY" {
             continue;
         }
@@ -4634,12 +4625,12 @@ fn report_positions(data: &[u8]) -> IonResult<()> {
             continue;
         }
 
-        let abs_offset = header_len + entity_offset;
-        if abs_offset + entity_len > data.len() {
+        let abs_offset = header_len.saturating_add(entity_offset);
+        if abs_offset.saturating_add(entity_len) > data.len() {
             continue;
         }
 
-        let entity_data = &data[abs_offset..abs_offset + entity_len];
+        let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
         if entity_data.len() < 10 || &entity_data[0..4] != b"ENTY" {
             continue;
         }
@@ -4724,7 +4715,7 @@ fn report_positions(data: &[u8]) -> IonResult<()> {
                                 if contains.len() <= 10 {
                                     println!("  EIDs: {contains:?}");
                                 } else {
-                                    println!("  first 5: {:?}", &contains[..5]);
+                                    println!("  first 5: {:?}", &contains[..contains.len().min(5)]);
                                     println!("  last 5:  {:?}", &contains[contains.len() - 5..]);
                                 }
                                 println!();
@@ -4884,12 +4875,12 @@ fn report_content(data: &[u8]) -> IonResult<()> {
             continue;
         }
 
-        let abs_offset = header_len + entity_offset;
-        if abs_offset + entity_len > data.len() {
+        let abs_offset = header_len.saturating_add(entity_offset);
+        if abs_offset.saturating_add(entity_len) > data.len() {
             continue;
         }
 
-        let entity_data = &data[abs_offset..abs_offset + entity_len];
+        let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
         if entity_data.len() < 10 || &entity_data[0..4] != b"ENTY" {
             continue;
         }
@@ -4973,9 +4964,7 @@ fn report_content(data: &[u8]) -> IonResult<()> {
                     content_len = payload_len;
                 }
 
-                println!(
-                    "{entity_name:<20} {content_type_str:<12} {content_len} bytes"
-                );
+                println!("{entity_name:<20} {content_type_str:<12} {content_len} bytes");
             } else {
                 println!("{:<20} {:<12} {} bytes (raw)", entity_name, "", payload_len);
             }
@@ -5064,12 +5053,12 @@ fn report_dependencies(data: &[u8]) -> IonResult<()> {
             continue;
         }
 
-        let abs_offset = header_len + entity_offset;
-        if abs_offset + entity_len > data.len() {
+        let abs_offset = header_len.saturating_add(entity_offset);
+        if abs_offset.saturating_add(entity_len) > data.len() {
             continue;
         }
 
-        let entity_data = &data[abs_offset..abs_offset + entity_len];
+        let entity_data = &data[abs_offset..abs_offset.saturating_add(entity_len)];
         if entity_data.len() < 10 || &entity_data[0..4] != b"ENTY" {
             continue;
         }

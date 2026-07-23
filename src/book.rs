@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::io::{self, Seek, Write};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::export::{Azw3Exporter, EpubExporter, Exporter, KfxExporter, MarkdownExporter};
 use crate::import::{
@@ -43,6 +43,14 @@ pub struct Book {
     /// Cache of parsed IR chapters to avoid re-parsing during normalized export.
     /// Uses RwLock for thread-safe access and Arc for cheap cloning.
     ir_cache: Arc<RwLock<HashMap<ChapterId, Arc<Chapter>>>>,
+    /// TOC after format-specific href fixup (AZW3/MOBI `#fileposN` suffixes).
+    /// Empty for formats whose hrefs are correct from source.
+    fixed_toc: OnceLock<Vec<TocEntry>>,
+    /// TOC after href fixup AND target resolution (set by `resolve_links`).
+    /// Takes precedence over `fixed_toc` in [`toc`](Self::toc).
+    targeted_toc: OnceLock<Vec<TocEntry>>,
+    /// Memoized link resolution, shared with callers as an `Arc`.
+    resolved_links: OnceLock<Arc<ResolvedLinks>>,
 }
 
 impl Book {
@@ -68,10 +76,30 @@ impl Book {
                 });
             }
         };
-        Ok(Self {
+        Ok(Self::from_backend(backend))
+    }
+
+    /// Swap the importer backend, returning the old one.
+    ///
+    /// Cached chapters are dropped: they were produced by the old backend
+    /// and may not reflect the new one's view (e.g. rewritten asset paths
+    /// after [`optimize`](Self::optimize)).
+    pub(crate) fn replace_backend(&mut self, backend: Box<dyn Importer>) -> Box<dyn Importer> {
+        self.ir_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        std::mem::replace(&mut self.backend, backend)
+    }
+
+    fn from_backend(backend: Box<dyn Importer>) -> Self {
+        Self {
             backend,
             ir_cache: Arc::new(RwLock::new(HashMap::new())),
-        })
+            fixed_toc: OnceLock::new(),
+            targeted_toc: OnceLock::new(),
+            resolved_links: OnceLock::new(),
+        }
     }
 
     /// Create a Book from in-memory bytes with an explicit format.
@@ -90,10 +118,7 @@ impl Book {
                 });
             }
         };
-        Ok(Self {
-            backend,
-            ir_cache: Arc::new(RwLock::new(HashMap::new())),
-        })
+        Ok(Self::from_backend(backend))
     }
 
     /// Book metadata.
@@ -102,7 +127,18 @@ impl Book {
     }
 
     /// Table of contents.
+    ///
+    /// Serves the most-resolved view available: after `resolve_links` the
+    /// entries carry resolved targets; after `resolve_toc` (AZW3/MOBI) the
+    /// hrefs carry fragment suffixes; otherwise the importer's entries as
+    /// parsed from source.
     pub fn toc(&self) -> &[TocEntry] {
+        if let Some(toc) = self.targeted_toc.get() {
+            return toc;
+        }
+        if let Some(toc) = self.fixed_toc.get() {
+            return toc;
+        }
         self.backend.toc()
     }
 
@@ -122,7 +158,7 @@ impl Book {
     }
 
     /// Load raw chapter bytes.
-    pub fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
+    pub fn load_raw(&self, id: ChapterId) -> crate::Result<Vec<u8>> {
         self.backend.load_raw(id)
     }
 
@@ -150,7 +186,7 @@ impl Book {
     /// }
     /// # Ok::<(), boko::Error>(())
     /// ```
-    pub fn load_chapter(&mut self, id: ChapterId) -> crate::Result<Chapter> {
+    pub fn load_chapter(&self, id: ChapterId) -> crate::Result<Chapter> {
         self.backend.load_chapter(id)
     }
 
@@ -175,7 +211,7 @@ impl Book {
     /// let chapter2 = book.load_chapter_cached(spine[0].id)?;
     /// # Ok::<(), boko::Error>(())
     /// ```
-    pub fn load_chapter_cached(&mut self, id: ChapterId) -> crate::Result<Arc<Chapter>> {
+    pub fn load_chapter_cached(&self, id: ChapterId) -> crate::Result<Arc<Chapter>> {
         // Fast path: check read lock first
         {
             let cache = self
@@ -208,10 +244,7 @@ impl Book {
     /// Like calling [`load_chapter_cached`](Self::load_chapter_cached) per
     /// id, but uncached chapters are handed to the backend as one batch so
     /// importers that support it (EPUB) compile them in parallel.
-    pub fn load_chapters_cached(
-        &mut self,
-        ids: &[ChapterId],
-    ) -> crate::Result<Vec<Arc<Chapter>>> {
+    pub fn load_chapters_cached(&self, ids: &[ChapterId]) -> crate::Result<Vec<Arc<Chapter>>> {
         // Collect the ids that still need compiling.
         let missing: Vec<ChapterId> = {
             let cache = self
@@ -254,7 +287,7 @@ impl Book {
     /// Clear the IR cache.
     ///
     /// Call this to free memory after normalized export is complete.
-    pub fn clear_cache(&mut self) {
+    pub fn clear_cache(&self) {
         if let Ok(mut cache) = self.ir_cache.write() {
             cache.clear();
         }
@@ -283,65 +316,61 @@ impl Book {
     /// }
     /// # Ok::<(), boko::Error>(())
     /// ```
-    pub fn resolve_links(&mut self) -> crate::Result<ResolvedLinks> {
-        resolve_book_links(self)
+    pub fn resolve_links(&self) -> crate::Result<Arc<ResolvedLinks>> {
+        if let Some(resolved) = self.resolved_links.get() {
+            return Ok(Arc::clone(resolved));
+        }
+        let resolved = Arc::new(resolve_book_links(self)?);
+        // A concurrent resolution may have won the race; both computed the
+        // same thing, so whichever landed first is shared.
+        Ok(Arc::clone(self.resolved_links.get_or_init(|| resolved)))
     }
 
     /// Index anchors for link resolution.
     ///
     /// Called internally by `resolve_links()`. Delegates to the format-specific
     /// importer to build anchor maps.
-    pub(crate) fn index_anchors(&mut self, chapters: &[(ChapterId, Arc<Chapter>)]) {
+    pub(crate) fn index_anchors(&self, chapters: &[(ChapterId, Arc<Chapter>)]) {
         self.backend.index_anchors(chapters);
     }
 
     /// Resolve TOC hrefs (fills in fragments for AZW3/MOBI).
     ///
-    /// Called internally by `resolve_links()`. Delegates to the format-specific
-    /// importer.
-    pub(crate) fn resolve_toc(&mut self) {
-        self.backend.resolve_toc();
+    /// Computes the importer's fixed-up TOC once and caches it; formats whose
+    /// hrefs are already correct (EPUB/KFX) cache nothing and
+    /// [`toc`](Self::toc) keeps serving the importer's entries.
+    pub(crate) fn resolve_toc(&self) {
+        if self.fixed_toc.get().is_none()
+            && let Some(fixed) = self.backend.resolve_toc()
+        {
+            let _ = self.fixed_toc.set(fixed);
+        }
     }
 
     /// Resolve TOC entry targets using `resolve_href()`.
     ///
-    /// Called internally by `resolve_links()`. Walks TOC entries and sets their
-    /// `target` field.
-    pub(crate) fn resolve_toc_targets(&mut self) {
-        // First, collect all hrefs with their targets
-        fn collect_targets(
-            entries: &[TocEntry],
-            backend: &dyn Importer,
-            default_chapter: ChapterId,
-            results: &mut Vec<Option<AnchorTarget>>,
-        ) {
+    /// Called internally by `resolve_links()` after `index_anchors`, so
+    /// fragment anchors resolve. Produces the final targeted TOC from the
+    /// fixed (or original) entries and caches it once.
+    pub(crate) fn resolve_toc_targets(&self) {
+        if self.targeted_toc.get().is_some() {
+            return;
+        }
+
+        fn apply_targets(entries: &mut [TocEntry], backend: &dyn Importer) {
             for entry in entries {
-                results.push(backend.resolve_href(default_chapter, &entry.href));
-                collect_targets(&entry.children, backend, default_chapter, results);
+                entry.target = backend.resolve_href(ChapterId(0), &entry.href);
+                apply_targets(&mut entry.children, backend);
             }
         }
 
-        let mut targets = Vec::new();
-        collect_targets(
-            self.backend.toc(),
-            &*self.backend,
-            ChapterId(0),
-            &mut targets,
-        );
-
-        // Then apply the targets to the TOC entries
-        fn apply_targets(
-            entries: &mut [TocEntry],
-            targets: &mut impl Iterator<Item = Option<AnchorTarget>>,
-        ) {
-            for entry in entries {
-                entry.target = targets.next().flatten();
-                apply_targets(&mut entry.children, targets);
-            }
-        }
-
-        let toc = self.backend.toc_mut();
-        apply_targets(toc, &mut targets.into_iter());
+        let mut toc = self
+            .fixed_toc
+            .get()
+            .cloned()
+            .unwrap_or_else(|| self.backend.toc().to_vec());
+        apply_targets(&mut toc, &*self.backend);
+        let _ = self.targeted_toc.set(toc);
     }
 
     /// Resolve a single href using format-specific logic.
@@ -353,7 +382,7 @@ impl Book {
     }
 
     /// Load an asset by archive entry name (e.g. `"OEBPS/images/cover.jpg"`).
-    pub fn load_asset(&mut self, path: &str) -> crate::Result<Vec<u8>> {
+    pub fn load_asset(&self, path: &str) -> crate::Result<Vec<u8>> {
         self.backend.load_asset(path)
     }
 
@@ -367,7 +396,7 @@ impl Book {
     /// Returns font-face rules that map font family names to font files.
     /// Used by KFX export to create font entities linking font-family
     /// names to resource locations.
-    pub fn font_faces(&mut self) -> Vec<crate::model::FontFace> {
+    pub fn font_faces(&self) -> Vec<crate::model::FontFace> {
         self.backend.font_faces()
     }
 
@@ -397,12 +426,12 @@ impl Book {
     /// use boko::{Book, Format};
     /// use std::fs::File;
     ///
-    /// let mut book = Book::open("input.azw3")?;
+    /// let book = Book::open("input.azw3")?;
     /// let mut file = File::create("output.epub")?;
     /// book.export(Format::Epub, &mut file)?;
     /// # Ok::<(), boko::Error>(())
     /// ```
-    pub fn export<W: Write + Seek>(&mut self, format: Format, writer: &mut W) -> crate::Result<()> {
+    pub fn export<W: Write + Seek>(&self, format: Format, writer: &mut W) -> crate::Result<()> {
         match format {
             Format::Epub => EpubExporter::new().export(self, writer),
             Format::Azw3 => Azw3Exporter::new().export(self, writer),

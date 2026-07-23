@@ -133,6 +133,7 @@ pub fn build_cover_section(
     ctx.record_section_image_ref(section_name, &resource_name);
 
     // Use default style for the cover image
+    ctx.default_style_used = true;
     let style_symbol = ctx.default_style_symbol;
 
     // Assign a fragment ID for the cover image content
@@ -239,7 +240,7 @@ mod tests {
     fn test_is_image_only_chapter_with_css_hidden_text() {
         // epictetus.epub titlepage has text hidden via CSS (display:none)
         // so the IR only contains the image
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
         let spine = book.spine();
 
         if let Some(first) = spine.first() {
@@ -253,7 +254,7 @@ mod tests {
 
     #[test]
     fn test_needs_standalone_cover() {
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
         let cover_path = book
             .metadata()
             .cover_image
@@ -273,7 +274,7 @@ mod tests {
 
     #[test]
     fn test_get_chapter_image_path() {
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
         let spine = book.spine();
 
         if let Some(first) = spine.first() {

@@ -247,6 +247,7 @@ pub struct EpubBuilder {
     css: Option<String>,
     images: Vec<(String, Vec<u8>)>,
     cover: Option<String>,
+    direction: Option<String>,
 }
 
 impl EpubBuilder {
@@ -261,11 +262,23 @@ impl EpubBuilder {
             css: None,
             images: Vec::new(),
             cover: None,
+            direction: None,
         }
     }
 
     pub fn language(mut self, lang: &str) -> Self {
         self.language = lang.into();
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn identifier(mut self, identifier: &str) -> Self {
+        self.identifier = identifier.into();
+        self
+    }
+
+    pub fn direction(mut self, dir: &str) -> Self {
+        self.direction = Some(dir.into());
         self
     }
 
@@ -391,10 +404,15 @@ impl EpubBuilder {
   </metadata>
   <manifest>
 {manifest}  </manifest>
-  <spine toc="ncx">
+  <spine toc="ncx"{spine_dir}>
 {spine}  </spine>
 </package>
 "#,
+            spine_dir = self
+                .direction
+                .as_deref()
+                .map(|d| format!(" page-progression-direction=\"{d}\""))
+                .unwrap_or_default(),
             identifier = xml_escape(&self.identifier),
             title = xml_escape(&self.title),
             language = xml_escape(&self.language),

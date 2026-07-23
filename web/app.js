@@ -34,18 +34,10 @@ async function initWasm() {
 
     wasmPromise = import('./pkg/boko.js').then(async (boko) => {
         await boko.default();
-        converters = {
-            'epub_azw3': boko.epub_to_azw3,
-            'epub_kfx': boko.epub_to_kfx,
-            'epub_markdown': boko.epub_to_markdown,
-            'azw3_epub': boko.azw3_to_epub,
-            'azw3_markdown': boko.azw3_to_markdown,
-            'kfx_epub': boko.kfx_to_epub,
-            'kfx_markdown': boko.kfx_to_markdown,
-            'mobi_epub': boko.mobi_to_epub,
-            'mobi_azw3': boko.mobi_to_azw3,
-            'mobi_markdown': boko.mobi_to_markdown,
-        };
+        // The wasm module exposes a single generic `convert(data, from, to)`
+        // function rather than per-format helpers, so we keep a reference to
+        // the module and dispatch through it at conversion time.
+        converters = boko;
         wasmReady = true;
     }).catch((e) => {
         wasmPromise = null;
@@ -208,11 +200,12 @@ async function convert() {
 
     const inputFormat = getInputFormat(currentFile.name);
     const targetFormat = outputFormat.value;
-    const converterKey = `${inputFormat}_${targetFormat}`;
-    const converter = converters[converterKey];
 
-    if (!converter) {
-        showError('Unsupported conversion: ' + inputFormat + ' to ' + targetFormat);
+    // The wasm `convert` function validates supported routes itself and
+    // throws on an unsupported combination, so we just forward the formats.
+    const convertFn = converters && converters.convert;
+    if (!convertFn) {
+        showError('Converter is not ready yet. Please try again.');
         return;
     }
 
@@ -224,7 +217,7 @@ async function convert() {
 
         showProgress('Converting...');
 
-        const outputData = converter(inputData);
+        const outputData = convertFn(inputData, inputFormat, targetFormat);
         const baseName = currentFile.name.replace(/\.[^/.]+$/, '');
         const outputFilename = baseName + extensions[targetFormat];
         const mimeType = mimeTypes[targetFormat];

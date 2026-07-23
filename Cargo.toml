@@ -1,14 +1,15 @@
 [package]
 name = "boko"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
-description = "Fast ebook conversion library for EPUB and Kindle formats"
+rust-version = "1.91"
+description = "Fast native ebook converter for EPUB, KFX, AZW3, and MOBI — the only KFX writer that needs no Kindle Previewer"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/zacharydenton/boko"
 homepage = "https://github.com/zacharydenton/boko"
 documentation = "https://docs.rs/boko"
 readme = "README.md"
-keywords = ["ebook", "epub", "mobi", "azw3", "kindle"]
+keywords = ["ebook", "epub", "kfx", "azw3", "kindle"]
 categories = ["parsing", "encoding"]
 # Test fixtures (binary ebooks) and the fuzz harness are only needed to develop
 # boko, not to build it — keep them out of the published crate.
@@ -19,7 +20,10 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["cli", "parallel"]
-cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:ion-rs"]
+cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:ion-rs", "optimize-images"]
+# Image shrinking for `Book::optimize` (recompress/transcode raster images).
+# Optional so the wasm build stays small; included in the CLI by default.
+optimize-images = ["dep:image"]
 wasm = ["wasm-bindgen", "console_error_panic_hook"]
 # Parallel chapter compilation via rayon. Native-only: the dependency is
 # declared under the non-wasm target table below, so enabling this feature on
@@ -41,8 +45,22 @@ bstr = { version = "1.11", default-features = false, features = ["alloc"] }
 # arena ids, symbol tables) whose keys are not attacker-chosen for collision.
 rustc-hash = "2.1"
 
+# Inline storage for small hot collections (KFX token attrs/spans, Ion
+# annotations) so the common case avoids a heap allocation.
+smallvec = "1.15"
+
 # Derive Display/Error/From for the typed error enum (compile-time only).
 thiserror = "2"
+
+# Font parsing for the KVG math typesetting spoke: glyph outlines (TrueType
+# and CFF) plus the OpenType MATH table (typesetting constants, stretchy
+# glyph variants/assemblies).
+ttf-parser = "0.25"
+
+# Raster decode + JPEG encode for the image-shrinking optimize pass and KFX
+# cover normalization (transcode to RGB JPEG/JFIF). Optional: pulled in by the
+# `optimize-images` feature, excluded from wasm.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"], optional = true }
 
 html5ever = "0.39"
 cssparser = "0.36"
@@ -54,10 +72,6 @@ encoding_rs = "0.8"
 
 # Base64 encoding for KFX raw media
 base64 = "0.22"
-
-# Normalize KFX covers to RGB JPEG/JFIF for Kindle library and lock-screen use.
-# Keep the decoder set limited to raster formats commonly found in EPUB files.
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 
 # Ion binary format parsing for KFX dump tool (CLI only; the library uses
 # its own hand-rolled reader/writer in src/kfx/ion.rs)
@@ -87,6 +101,10 @@ js-sys = "0.3"
 tempfile = "3.14"
 proptest = "1.6"
 criterion = "0.8"
+# Synthesizes image fixtures for the optimize-images tests.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Obfuscates font fixtures for the deobfuscation tests (IDPF key = SHA-1).
+sha1_smol = { version = "1.0", features = ["std"] }
 
 [[bin]]
 name = "boko"
@@ -107,3 +125,8 @@ codegen-units = 1
 # fields, but keep overflow checks on in release so any missed site aborts
 # loudly instead of silently wrapping to a bogus offset.
 overflow-checks = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

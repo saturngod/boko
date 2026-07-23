@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use crate::kfx::ion::IonValue;
-use crate::kfx::style_schema::{KfxValue, StyleContext, StyleSchema, extract_ir_field};
+use crate::kfx::style_schema::{KfxValue, StyleSchema, extract_ir_field};
 use crate::kfx::symbols::KfxSymbol;
 use crate::style as ir_style;
 
@@ -64,10 +64,18 @@ impl ComputedStyle {
     }
 
     /// Add a property to this style.
+    ///
+    /// Setting the same symbol twice replaces the value, except when both
+    /// values are struct-shaped: those merge into one multi-field struct so
+    /// that orphans (`{first: N}`) and widows (`{last: M}`) can coexist in a
+    /// single `keep_lines_together` instead of one silently clobbering the
+    /// other.
     pub fn set(&mut self, symbol: KfxSymbol, value: KfxValue) {
-        // Remove any existing value for this symbol
-        self.properties.retain(|(s, _)| *s != symbol);
-        self.properties.push((symbol, value));
+        if let Some(existing) = self.properties.iter_mut().find(|(s, _)| *s == symbol) {
+            existing.1 = existing.1.merge_struct_fields(&value).unwrap_or(value);
+        } else {
+            self.properties.push((symbol, value));
+        }
     }
 
     /// Get a property value.
@@ -78,9 +86,10 @@ impl ComputedStyle {
             .map(|(_, v)| v)
     }
 
-    /// Remove a property, if present.
-    pub fn remove(&mut self, symbol: KfxSymbol) {
-        self.properties.retain(|(s, _)| *s != symbol);
+    /// Remove a property, returning its value if it was present.
+    pub fn remove(&mut self, symbol: KfxSymbol) -> Option<KfxValue> {
+        let idx = self.properties.iter().position(|(s, _)| *s == symbol)?;
+        Some(self.properties.remove(idx).1)
     }
 
     /// Check if the style is empty.
@@ -110,61 +119,6 @@ impl ComputedStyle {
         a.sort_by_key(|(s, _)| *s as u64);
         b.sort_by_key(|(s, _)| *s as u64);
         a == b
-    }
-
-    /// Check if this style contains any block-only properties.
-    pub fn has_block_properties(&self, schema: &StyleSchema) -> bool {
-        for (symbol, _) in &self.properties {
-            // Find the rule for this symbol
-            for rule in schema.rules() {
-                if rule.kfx_symbol == *symbol && rule.context == StyleContext::BlockOnly {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Check if this style contains any inline-safe properties.
-    pub fn has_inline_properties(&self, schema: &StyleSchema) -> bool {
-        for (symbol, _) in &self.properties {
-            for rule in schema.rules() {
-                if rule.kfx_symbol == *symbol && rule.context == StyleContext::InlineSafe {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Split into block and inline styles.
-    ///
-    /// Returns (block_style, inline_style) where each contains only
-    /// properties appropriate for that context.
-    pub fn split_by_context(&self, schema: &StyleSchema) -> (ComputedStyle, ComputedStyle) {
-        let mut block = ComputedStyle::new();
-        let mut inline = ComputedStyle::new();
-
-        for (symbol, value) in &self.properties {
-            let mut found_context = None;
-            for rule in schema.rules() {
-                if rule.kfx_symbol == *symbol {
-                    found_context = Some(rule.context);
-                    break;
-                }
-            }
-
-            match found_context {
-                Some(StyleContext::BlockOnly) => block.set(*symbol, value.clone()),
-                Some(StyleContext::InlineSafe) => inline.set(*symbol, value.clone()),
-                Some(StyleContext::Any) | None => {
-                    // Properties with Any context go to both (or default to block)
-                    block.set(*symbol, value.clone());
-                }
-            }
-        }
-
-        (block, inline)
     }
 
     /// Compute a hash for this style (for deduplication).
@@ -221,6 +175,16 @@ fn hash_kfx_value<H: Hasher>(value: &KfxValue, hasher: &mut H) {
         KfxValue::StructField { field, value } => {
             (*field as u64).hash(hasher);
             value.hash(hasher);
+        }
+        KfxValue::SymbolList(syms) => {
+            10u8.hash(hasher);
+            syms.hash(hasher);
+        }
+        KfxValue::StructFields(fields) => {
+            for (field, value) in fields {
+                (*field as u64).hash(hasher);
+                value.hash(hasher);
+            }
         }
     }
 }
@@ -288,8 +252,9 @@ impl StyleRegistry {
 
         let bucket = self.styles.entry(hash).or_default();
         // Confirm a hash hit is a real match, not a collision.
-        if let Some((_, name_symbol, _)) =
-            bucket.iter().find(|(_, _, existing)| existing.same_properties(&style))
+        if let Some((_, name_symbol, _)) = bucket
+            .iter()
+            .find(|(_, _, existing)| existing.same_properties(&style))
         {
             return *name_symbol;
         }
@@ -379,26 +344,11 @@ impl<'a> StyleBuilder<'a> {
         }
     }
 
-    /// Apply a CSS property.
-    pub fn apply(&mut self, property: &str, value: &str) -> &mut Self {
-        // Handle shorthand properties first
-        if let Some(expanded) = expand_shorthand(property, value) {
-            for (prop, val) in expanded {
-                self.apply_single(&prop, &val);
-            }
-        } else {
-            self.apply_single(property, value);
-        }
-        self
-    }
-
     /// Apply a single (non-shorthand) property.
     fn apply_single(&mut self, property: &str, value: &str) {
-        if let Some(rules) = self.schema.get(property) {
-            for rule in rules {
-                if let Some(kfx_value) = rule.transform.apply(value) {
-                    self.style.set(rule.kfx_symbol, kfx_value);
-                }
+        for rule in self.schema.get(property) {
+            if let Some(kfx_value) = rule.transform.apply(value) {
+                self.style.set(rule.kfx_symbol, kfx_value);
             }
         }
     }
@@ -416,11 +366,24 @@ impl<'a> StyleBuilder<'a> {
     /// 2. Add extraction case to `extract_ir_field()`
     /// 3. Add schema rule with `ir_field: Some(IrField::NewField)`
     pub fn ingest_ir_style(&mut self, ir_style: &ir_style::ComputedStyle) -> &mut Self {
+        static DEFAULT: std::sync::OnceLock<ir_style::ComputedStyle> = std::sync::OnceLock::new();
+        self.ingest_ir_style_with_parent(ir_style, DEFAULT.get_or_init(Default::default))
+    }
+
+    /// Like [`Self::ingest_ir_style`], with the parent element's computed
+    /// style as the inheritance baseline: CSS-inherited properties are
+    /// emitted only where they differ from the parent (KFX renderers inherit
+    /// heritable properties through nested containers).
+    pub fn ingest_ir_style_with_parent(
+        &mut self,
+        ir_style: &ir_style::ComputedStyle,
+        parent: &ir_style::ComputedStyle,
+    ) -> &mut Self {
         // Iterate over all schema rules that have IR field mappings
         for rule in self.schema.ir_mapped_rules() {
             if let Some(ir_field) = rule.ir_field {
                 // Extract CSS string from IR struct (returns None for default values)
-                if let Some(css_value) = extract_ir_field(ir_style, ir_field) {
+                if let Some(css_value) = extract_ir_field(ir_style, parent, ir_field) {
                     // Apply schema transform to convert CSS → KFX
                     self.apply_single(rule.ir_key, &css_value);
                 }
@@ -432,82 +395,53 @@ impl<'a> StyleBuilder<'a> {
 
     /// Build the final computed style.
     pub fn build(self) -> ComputedStyle {
-        self.style
-    }
-}
-
-/// Expand CSS shorthand properties into individual properties.
-fn expand_shorthand(property: &str, value: &str) -> Option<Vec<(String, String)>> {
-    let parts: Vec<&str> = value.split_whitespace().collect();
-
-    match property {
-        "margin" => Some(expand_box_shorthand("margin", &parts)),
-        "padding" => Some(expand_box_shorthand("padding", &parts)),
-        "border-width" => Some(
-            expand_box_shorthand("border", &parts)
-                .into_iter()
-                .map(|(p, v)| (format!("{}-width", p), v))
-                .collect(),
-        ),
-        "font" => expand_font_shorthand(value),
-        _ => None,
-    }
-}
-
-/// Expand a box model shorthand (margin, padding) into four individual properties.
-fn expand_box_shorthand(prefix: &str, parts: &[&str]) -> Vec<(String, String)> {
-    let (top, right, bottom, left) = match parts.len() {
-        1 => (parts[0], parts[0], parts[0], parts[0]),
-        2 => (parts[0], parts[1], parts[0], parts[1]),
-        3 => (parts[0], parts[1], parts[2], parts[1]),
-        4 => (parts[0], parts[1], parts[2], parts[3]),
-        _ => return vec![],
-    };
-
-    vec![
-        (format!("{}-top", prefix), top.to_string()),
-        (format!("{}-right", prefix), right.to_string()),
-        (format!("{}-bottom", prefix), bottom.to_string()),
-        (format!("{}-left", prefix), left.to_string()),
-    ]
-}
-
-/// Expand font shorthand (complex, partial support).
-fn expand_font_shorthand(value: &str) -> Option<Vec<(String, String)>> {
-    // font: [style] [weight] size[/line-height] family
-    // This is complex; for now just extract what we can
-    let mut result = Vec::new();
-    let parts: Vec<&str> = value.split_whitespace().collect();
-
-    for part in &parts {
-        let lower = part.to_lowercase();
-        if lower == "italic" || lower == "oblique" {
-            result.push(("font-style".to_string(), lower));
-        } else if lower == "bold" || lower == "normal" || lower == "lighter" || lower == "bolder" {
-            result.push(("font-weight".to_string(), lower));
-        } else if part.contains("px")
-            || part.contains("em")
-            || part.contains("pt")
-            || part.contains('%')
-        {
-            // This might be size or size/line-height
-            if part.contains('/') {
-                let size_parts: Vec<&str> = part.split('/').collect();
-                if size_parts.len() == 2 {
-                    result.push(("font-size".to_string(), size_parts[0].to_string()));
-                    result.push(("line-height".to_string(), size_parts[1].to_string()));
+        let mut style = self.style;
+        // Reference KFX folds four equal border sides into the uniform
+        // shorthand symbol (border_style/border_weight/border_color)
+        // instead of four longhands.
+        for (sides, uniform) in [
+            (
+                [
+                    KfxSymbol::BorderStyleTop,
+                    KfxSymbol::BorderStyleLeft,
+                    KfxSymbol::BorderStyleBottom,
+                    KfxSymbol::BorderStyleRight,
+                ],
+                KfxSymbol::BorderStyle,
+            ),
+            (
+                [
+                    KfxSymbol::BorderWeightTop,
+                    KfxSymbol::BorderWeightLeft,
+                    KfxSymbol::BorderWeightBottom,
+                    KfxSymbol::BorderWeightRight,
+                ],
+                KfxSymbol::BorderWeight,
+            ),
+            (
+                [
+                    KfxSymbol::BorderColorTop,
+                    KfxSymbol::BorderColorLeft,
+                    KfxSymbol::BorderColorBottom,
+                    KfxSymbol::BorderColorRight,
+                ],
+                KfxSymbol::BorderColor,
+            ),
+        ] {
+            let values: Vec<Option<&KfxValue>> = sides.iter().map(|&s| style.get(s)).collect();
+            if let [Some(a), Some(b), Some(c), Some(d)] = values[..]
+                && a == b
+                && b == c
+                && c == d
+            {
+                let value = a.clone();
+                for &side in &sides {
+                    style.remove(side);
                 }
-            } else {
-                result.push(("font-size".to_string(), part.to_string()));
+                style.set(uniform, value);
             }
         }
-        // Font family is harder to parse reliably, skip for now
-    }
-
-    if result.is_empty() {
-        None
-    } else {
-        Some(result)
+        style
     }
 }
 
@@ -516,6 +450,7 @@ fn expand_font_shorthand(value: &str) -> Option<Vec<(String, String)>> {
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -617,30 +552,141 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_margin_shorthand() {
-        let parts = vec!["10px"];
-        let expanded = expand_box_shorthand("margin", &parts);
-        assert_eq!(expanded.len(), 4);
-        assert_eq!(expanded[0], ("margin-top".to_string(), "10px".to_string()));
+    fn test_orphans_widows_merge_into_one_struct() {
+        use crate::kfx::style_schema::StyleSchema;
 
-        let parts = vec!["10px", "20px"];
-        let expanded = expand_box_shorthand("margin", &parts);
-        assert_eq!(expanded[0].1, "10px"); // top
-        assert_eq!(expanded[1].1, "20px"); // right
-        assert_eq!(expanded[2].1, "10px"); // bottom
-        assert_eq!(expanded[3].1, "20px"); // left
+        let mut ir = crate::style::ComputedStyle::default();
+        ir.orphans = 3;
+        ir.widows = 4;
+
+        let mut builder = StyleBuilder::new(StyleSchema::standard());
+        builder.ingest_ir_style(&ir);
+        let style = builder.build();
+
+        // Both must survive in a single keep_lines_together value; before the
+        // merge fix, whichever rule ran last silently clobbered the other.
+        match style.get(KfxSymbol::KeepLinesTogether) {
+            Some(KfxValue::StructFields(fields)) => {
+                assert_eq!(
+                    fields.as_slice(),
+                    &[(KfxSymbol::First, 3), (KfxSymbol::Last, 4),]
+                );
+            }
+            other => panic!("expected merged StructFields, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_underline_style_overrides_plain_underline() {
+        use crate::kfx::style_schema::StyleSchema;
+
+        // Flag only -> solid underline.
+        let mut ir = crate::style::ComputedStyle::default();
+        ir.text_decoration_underline = true;
+        let mut builder = StyleBuilder::new(StyleSchema::standard());
+        builder.ingest_ir_style(&ir);
+        assert_eq!(
+            builder.build().get(KfxSymbol::Underline),
+            Some(&KfxValue::Symbol(KfxSymbol::Solid))
+        );
+
+        // Flag + style -> the specific style wins, deterministically.
+        let mut ir = crate::style::ComputedStyle::default();
+        ir.text_decoration_underline = true;
+        ir.underline_style = crate::style::DecorationStyle::Dotted;
+        let mut builder = StyleBuilder::new(StyleSchema::standard());
+        builder.ingest_ir_style(&ir);
+        assert_eq!(
+            builder.build().get(KfxSymbol::Underline),
+            Some(&KfxValue::Symbol(KfxSymbol::Dotted))
+        );
+
+        // Style without the flag draws nothing in CSS -> no KFX underline.
+        let mut ir = crate::style::ComputedStyle::default();
+        ir.underline_style = crate::style::DecorationStyle::Dotted;
+        let mut builder = StyleBuilder::new(StyleSchema::standard());
+        builder.ingest_ir_style(&ir);
+        assert_eq!(builder.build().get(KfxSymbol::Underline), None);
+    }
+
+    #[test]
+    fn test_font_size_is_always_relative() {
+        use crate::kfx::style_schema::StyleSchema;
+
+        // Absolute font sizes freeze under the device font-size setting;
+        // reference KFX never emits them. The exporter reads the resolved
+        // absolute size (cascade-computed) and emits rem — converted, not
+        // relabeled (the old Dimensioned{Rem} transform turned 24px into
+        // 24rem, ~38x too large on device).
+        let mut ir = crate::style::ComputedStyle::default();
+        ir.font_size = crate::style::Length::Px(24.0);
+        ir.font_size_abs = crate::style::AbsFontSize(1.5);
+        let mut builder = StyleBuilder::new(StyleSchema::standard());
+        builder.ingest_ir_style(&ir);
+        match builder.build().get(KfxSymbol::FontSize) {
+            Some(KfxValue::Dimensioned { value, unit }) => {
+                assert_eq!(*value, 1.5);
+                assert_eq!(*unit, KfxSymbol::Rem);
+            }
+            other => panic!("expected dimensioned font-size, got {other:?}"),
+        }
+
+        let mut ir = crate::style::ComputedStyle::default();
+        ir.font_size = crate::style::Length::Em(0.833);
+        ir.font_size_abs = crate::style::AbsFontSize(0.833);
+        let mut builder = StyleBuilder::new(StyleSchema::standard());
+        builder.ingest_ir_style(&ir);
+        match builder.build().get(KfxSymbol::FontSize) {
+            Some(KfxValue::Dimensioned { unit, .. }) => assert_eq!(*unit, KfxSymbol::Rem),
+            other => panic!("expected dimensioned font-size, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_transparent_background_is_omitted() {
+        let mut ir = crate::style::ComputedStyle::default();
+        ir.background_color = Some(crate::style::Color::TRANSPARENT);
+        let mut builder = StyleBuilder::new(StyleSchema::standard());
+        builder.ingest_ir_style(&ir);
+        let style = builder.build();
+        // `transparent` used to export as opaque black fill/text background.
+        assert!(style.get(KfxSymbol::FillColor).is_none());
+        assert!(style.get(KfxSymbol::TextBackgroundColor).is_none());
+    }
+
+    #[test]
+    fn test_ingest_is_deterministic_registration_order() {
+        use crate::kfx::style_schema::StyleSchema;
+
+        let mut ir = crate::style::ComputedStyle::default();
+        ir.text_decoration_underline = true;
+        ir.orphans = 2;
+        ir.widows = 3;
+        ir.font_size = crate::style::Length::Px(12.0);
+        ir.background_color = Some(crate::style::Color::rgb(1, 2, 3));
+
+        let build = || {
+            let mut b = StyleBuilder::new(StyleSchema::standard());
+            b.ingest_ir_style(&ir);
+            b.build()
+        };
+        let a = build();
+        let b = build();
+        // Property *order* must match, not just the set: emitted Ion structs
+        // follow this order and KFX output must be byte-reproducible.
+        assert_eq!(a.iter().collect::<Vec<_>>(), b.iter().collect::<Vec<_>>());
     }
 
     #[test]
     fn test_style_builder() {
-        let schema = StyleSchema::standard();
-        let mut builder = StyleBuilder::new(schema);
+        let mut ir = crate::style::ComputedStyle::default();
+        ir.font_weight = crate::style::FontWeight::BOLD;
+        ir.font_style = crate::style::FontStyle::Italic;
 
-        builder.apply("font-weight", "bold");
-        builder.apply("font-style", "italic");
+        let mut builder = StyleBuilder::new(StyleSchema::standard());
+        builder.ingest_ir_style(&ir);
 
         let style = builder.build();
-        assert_eq!(style.len(), 2);
         assert!(style.get(KfxSymbol::FontWeight).is_some());
         assert!(style.get(KfxSymbol::FontStyle).is_some());
     }

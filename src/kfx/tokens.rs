@@ -14,7 +14,13 @@
 
 use crate::kfx::schema::SemanticTarget;
 use crate::model::{NodeId, Role};
+use smallvec::SmallVec;
 use std::collections::HashMap;
+
+/// Pre-transformed KFX element/span attributes: `(field_id, value_string)`.
+/// Most elements carry 0–2 of these (href, src, alt, a table span, …), so an
+/// inline-2 SmallVec keeps the common case off the heap.
+pub type KfxAttrs = SmallVec<[(u64, String); 2]>;
 
 /// A token in the KFX content stream.
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +35,48 @@ pub enum KfxToken {
     StartSpan(SpanStart),
     /// End of an inline style span
     EndSpan,
+    /// A math equation exported as a KVG-bearing container (typeset shapes
+    /// plus mathml/alt_text annotations), or a text-child container when
+    /// the equation declined typesetting (`Raw` content).
+    MathKvg(Box<MathKvgToken>),
+    /// A math container imported from KFX: content references to its
+    /// `mathml` and `alt_text` annotation strings. The IR builder resolves
+    /// and parses them into a `Role::Math` node + `Math` AST (import-only;
+    /// export builds math from the IR side-table directly).
+    MathImport(Box<MathImportToken>),
+}
+
+/// Payload for an exported math container.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MathKvgToken {
+    /// Typeset KVG equation; `None` when the equation declined (falls back
+    /// to a text child, no mathml annotation).
+    pub kvg: Option<crate::math::kvg::KvgEquation>,
+    /// Serialized MathML (annotation; only emitted alongside KVG).
+    pub mathml: String,
+    /// Spoken alt text (annotation).
+    pub alttext: String,
+    /// Unicode linearization (text child when kvg is None).
+    pub text: String,
+    /// Display (block) vs inline math.
+    pub display: bool,
+    /// KFX style symbol for the container.
+    pub style_symbol: Option<u64>,
+    /// Original IR node id.
+    pub node_id: Option<NodeId>,
+}
+
+/// Content references carried by an imported KFX math container.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MathImportToken {
+    /// Ref to the serialized `<math>` source ($690 annotation).
+    pub mathml_ref: Option<ContentRef>,
+    /// Ref to the spoken alt text ($584 annotation).
+    pub alttext_ref: Option<ContentRef>,
+    /// KFX element id.
+    pub id: Option<i64>,
+    /// Style name for IR style lookup.
+    pub style_name: Option<String>,
 }
 
 /// Information about an element start.
@@ -48,7 +96,7 @@ pub struct ElementStart {
     pub style_events: Vec<SpanStart>,
     /// Pre-transformed KFX attributes (field_id, value_string).
     /// Populated during export by schema.export_attributes().
-    pub kfx_attrs: Vec<(u64, String)>,
+    pub kfx_attrs: KfxAttrs,
     /// KFX style symbol ID for this element.
     /// Populated during export after registering the node's style.
     pub style_symbol: Option<u64>,
@@ -59,6 +107,10 @@ pub struct ElementStart {
     /// KFX requires block elements with borders to be `type: container` with
     /// nested `type: text` for content. Set during export by checking IR style.
     pub needs_container_wrapper: bool,
+    /// Whether this table cell is a header cell (`<th>`). Emitted as the
+    /// `table_header_cell` semantic-type marker so the header/data distinction
+    /// survives KFX export.
+    pub is_header_cell: bool,
 }
 
 impl ElementStart {
@@ -71,10 +123,11 @@ impl ElementStart {
             semantics: HashMap::new(),
             content_ref: None,
             style_events: Vec::new(),
-            kfx_attrs: Vec::new(),
+            kfx_attrs: KfxAttrs::new(),
             style_symbol: None,
             style_name: None,
             needs_container_wrapper: false,
+            is_header_cell: false,
         }
     }
 
@@ -120,7 +173,7 @@ pub struct SpanStart {
     pub style_symbol: Option<u64>,
     /// Pre-transformed KFX attributes (field_id, value_string).
     /// Populated during export by schema.export_attributes().
-    pub kfx_attrs: Vec<(u64, String)>,
+    pub kfx_attrs: KfxAttrs,
 }
 
 impl SpanStart {
@@ -133,7 +186,7 @@ impl SpanStart {
             offset,
             length,
             style_symbol: None,
-            kfx_attrs: Vec::new(),
+            kfx_attrs: KfxAttrs::new(),
         }
     }
 
@@ -183,10 +236,11 @@ impl TokenStream {
             semantics,
             content_ref,
             style_events,
-            kfx_attrs: Vec::new(),
+            kfx_attrs: KfxAttrs::new(),
             style_symbol: None,
             style_name: None,
             needs_container_wrapper: false,
+            is_header_cell: false,
         }));
     }
 
@@ -206,7 +260,7 @@ impl TokenStream {
             offset: 0,
             length: 0,
             style_symbol: None,
-            kfx_attrs: Vec::new(),
+            kfx_attrs: KfxAttrs::new(),
         }));
     }
 

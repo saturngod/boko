@@ -33,7 +33,6 @@ use crate::kfx::transforms::{
     AttributeTransform, IdentityTransform, KfxLinkTransform, ResourceTransform,
 };
 use crate::model::{LandmarkType, Role};
-use crate::style::{ComputedStyle, FontStyle, FontWeight};
 use std::collections::HashMap;
 
 // ============================================================================
@@ -65,16 +64,6 @@ pub enum Strategy {
         modifier_attr: KfxSymbol,
         /// How to transform the role based on attribute value.
         modifier_effect: ModifierEffect,
-        /// KFX type symbol for export.
-        kfx_type: KfxSymbol,
-    },
-
-    /// Apply a style modifier without creating a new node.
-    ///
-    /// Usage: Bold, italic wrappers in style_events.
-    Style {
-        /// The style modification to apply.
-        modifier: StyleModifier,
         /// KFX type symbol for export.
         kfx_type: KfxSymbol,
     },
@@ -123,7 +112,6 @@ impl Strategy {
         match self {
             Strategy::Structure { kfx_type, .. } => *kfx_type,
             Strategy::StructureWithModifier { kfx_type, .. } => *kfx_type,
-            Strategy::Style { kfx_type, .. } => *kfx_type,
             Strategy::Dynamic { kfx_type, .. } => *kfx_type,
             Strategy::Transparent { kfx_type } => *kfx_type,
             Strategy::StructureWithSemanticType { kfx_type, .. } => *kfx_type,
@@ -146,31 +134,6 @@ pub enum ModifierEffect {
     HeadingLevel,
     /// Attribute presence switches to ordered list.
     ListOrdered,
-}
-
-/// Style modifications that can be applied without creating nodes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StyleModifier {
-    Bold,
-    Italic,
-    Underline,
-    Strikethrough,
-    Superscript,
-    Subscript,
-}
-
-impl StyleModifier {
-    /// Apply this modifier to a ComputedStyle.
-    pub fn apply(&self, style: &mut ComputedStyle) {
-        match self {
-            StyleModifier::Bold => style.font_weight = FontWeight::BOLD,
-            StyleModifier::Italic => style.font_style = FontStyle::Italic,
-            StyleModifier::Underline => style.text_decoration_underline = true,
-            StyleModifier::Strikethrough => style.text_decoration_line_through = true,
-            StyleModifier::Superscript => style.vertical_align = crate::style::VerticalAlign::Super,
-            StyleModifier::Subscript => style.vertical_align = crate::style::VerticalAlign::Sub,
-        }
-    }
 }
 
 /// Semantic attribute targets for attribute mapping.
@@ -451,23 +414,48 @@ impl KfxSchema {
             },
             vec![],
         );
-        // Table cells → type: text (both th and td)
+        // Table cells → type: text with a yj.semantics.type: table_cell marker
+        // so the cell round-trips as a TableCell (KFX has no dedicated cell
+        // container; without the marker cells import back as plain Paragraphs,
+        // collapsing the table structure).
         self.export_strategy_table.insert(
             Role::TableCell,
-            Strategy::Structure {
+            Strategy::StructureWithSemanticType {
                 role: Role::TableCell,
                 kfx_type: KfxSymbol::Text,
+                semantic_type: "table_cell",
             },
         );
 
-        // Sidebar
+        // Sidebar. Exported as a text element carrying a
+        // `yj.semantics.type: sidebar` marker: Kindle Previewer never emits
+        // the $280 element type (it renders asides as styled containers or
+        // single-cell tables), so unknown-to-modern-firmware element types
+        // are avoided while boko round-trips keep the role. The marker must
+        // ride on a $269 text element, not a $270 container — readers only
+        // consume `yj.semantics.*` keys on $269 (same placement as
+        // TableCell/BlockQuote). Import still recognizes the legacy $280
+        // element type.
         self.register_element(
             KfxSymbol::Sidebar,
-            Strategy::Structure {
+            Strategy::StructureWithSemanticType {
                 role: Role::Sidebar,
-                kfx_type: KfxSymbol::Sidebar,
+                kfx_type: KfxSymbol::Text,
+                semantic_type: "sidebar",
             },
             vec![],
+        );
+        // register_element only wires the import side for this strategy;
+        // the export mapping (and the marker-based import via
+        // role_for_semantic_type) needs the explicit entry, same pattern as
+        // TableCell/BlockQuote.
+        self.export_strategy_table.insert(
+            Role::Sidebar,
+            Strategy::StructureWithSemanticType {
+                role: Role::Sidebar,
+                kfx_type: KfxSymbol::Text,
+                semantic_type: "sidebar",
+            },
         );
 
         // Horizontal rule
@@ -593,6 +581,14 @@ impl KfxSchema {
     }
 
     /// Register landmark type mappings.
+    ///
+    /// The mapping is used in both directions; `EXPORTABLE_LANDMARKS` below
+    /// restricts which of them boko will *write*. Amazon's tooling only ever
+    /// emits cover_page, srl, toc, acknowledgements, and index — the other
+    /// guidance-type symbol IDs exist in the shared symbol table but are
+    /// never used by real books (kfxlib's symbol catalog marks them
+    /// never-observed), so emitting them makes output flag as nonconformant
+    /// and risks confusing firmware. Import still accepts all of them.
     fn register_landmark_rules(&mut self) {
         self.landmark_mapping = vec![
             (LandmarkType::Cover, KfxSymbol::CoverPage),
@@ -792,7 +788,16 @@ impl KfxSchema {
             } => {
                 if let Some(value) = get_attr(*modifier_attr) {
                     match modifier_effect {
-                        ModifierEffect::HeadingLevel => Role::Heading(value as u8),
+                        // The level is untrusted: `as u8` would truncate an
+                        // out-of-range value to an arbitrary heading level, so
+                        // fall back to the default role instead. Values that
+                        // fit u8 but fall outside HTML's 1..=6 (e.g. 0 or
+                        // 200) would render as zero or hundreds of `#`s in
+                        // markdown, so reject those too.
+                        ModifierEffect::HeadingLevel => u8::try_from(value)
+                            .ok()
+                            .filter(|level| (1..=6).contains(level))
+                            .map_or(*default_role, Role::Heading),
                         ModifierEffect::ListOrdered => {
                             // list_style is a symbol; check for numeric (343)
                             if value == KfxSymbol::Numeric as i64 {
@@ -821,7 +826,6 @@ impl KfxSchema {
                 }
             }
 
-            Strategy::Style { .. } => Role::Inline, // Style strategies don't create structure
             Strategy::Transparent { .. } => Role::Container,
             Strategy::StructureWithSemanticType { role, .. } => *role,
         }
@@ -864,11 +868,11 @@ impl KfxSchema {
         role: Role,
         get_semantic: F,
         export_ctx: &crate::kfx::transforms::ExportContext,
-    ) -> Vec<(u64, String)>
+    ) -> crate::kfx::tokens::KfxAttrs
     where
         F: Fn(SemanticTarget) -> Option<String>,
     {
-        let mut attrs = Vec::new();
+        let mut attrs = crate::kfx::tokens::KfxAttrs::new();
 
         // Apply element attribute rules if role has a KFX type mapping
         if let Some(kfx_type_id) = self.kfx_symbol_for_role(role) {
@@ -919,63 +923,6 @@ impl KfxSchema {
         matches!(role, Role::Link | Role::Inline)
     }
 
-    /// Export span attributes for an inline role.
-    ///
-    /// Similar to export_attributes but uses span rules instead of element rules.
-    /// Used when generating style_events for inline spans.
-    pub fn export_span_attributes<F>(
-        &self,
-        role: Role,
-        get_semantic: F,
-        export_ctx: &crate::kfx::transforms::ExportContext,
-    ) -> Vec<(u64, String)>
-    where
-        F: Fn(SemanticTarget) -> Option<String>,
-    {
-        let mut attrs = Vec::new();
-
-        // Find the matching span rule for this role
-        // For export, we match by examining the strategy's trigger_role or role
-        for span_rule in &self.span_rules {
-            let rule_matches = match &span_rule.strategy {
-                Strategy::Dynamic { trigger_role, .. } => *trigger_role == role,
-                Strategy::Structure { role: r, .. } => *r == role,
-                Strategy::StructureWithModifier { default_role, .. } => *default_role == role,
-                Strategy::StructureWithSemanticType { role: r, .. } => *r == role,
-                Strategy::Style { .. } => role == Role::Inline,
-                Strategy::Transparent { .. } => false,
-            };
-
-            if rule_matches {
-                // Apply attribute rules for this span type
-                for attr_rule in &span_rule.attr_rules {
-                    if let Some(value) = get_semantic(attr_rule.target) {
-                        let parsed = crate::kfx::transforms::ParsedAttribute::String(value);
-                        let kfx_value = attr_rule.transform.export(&parsed, export_ctx);
-                        attrs.push((attr_rule.kfx_field as u64, kfx_value));
-                    }
-                }
-
-                // Apply conditional export rules (e.g., noteref → YjDisplay)
-                for cond_rule in &span_rule.conditional_export_rules {
-                    if let Some(value) = get_semantic(cond_rule.source)
-                        && value.contains(cond_rule.trigger_value)
-                    {
-                        // Emit KFX symbol ID as string (will be parsed in tokens_to_ion)
-                        attrs.push((
-                            cond_rule.kfx_field as u64,
-                            (cond_rule.kfx_value as u64).to_string(),
-                        ));
-                    }
-                }
-
-                break;
-            }
-        }
-
-        attrs
-    }
-
     // =========================================================================
     // Landmark API
     // =========================================================================
@@ -988,12 +935,24 @@ impl KfxSchema {
             .map(|(ir, _)| *ir)
     }
 
-    /// Convert an IR LandmarkType to KFX symbol.
+    /// Convert an IR LandmarkType to KFX symbol, for export.
+    ///
+    /// Returns `None` for landmark types whose KFX symbol is never used by
+    /// Amazon-produced books (see `register_landmark_rules`); those landmarks
+    /// are silently dropped from KFX output.
     pub fn landmark_to_kfx(&self, landmark_type: LandmarkType) -> Option<KfxSymbol> {
+        const EXPORTABLE_LANDMARKS: [KfxSymbol; 5] = [
+            KfxSymbol::CoverPage,
+            KfxSymbol::Srl,
+            KfxSymbol::Toc,
+            KfxSymbol::Acknowledgements,
+            KfxSymbol::Index,
+        ];
         self.landmark_mapping
             .iter()
             .find(|(ir, _)| *ir == landmark_type)
             .map(|(_, kfx)| *kfx)
+            .filter(|kfx| EXPORTABLE_LANDMARKS.contains(kfx))
     }
 }
 
@@ -1159,17 +1118,6 @@ mod tests {
     }
 
     #[test]
-    fn test_style_modifier_apply() {
-        let mut style = ComputedStyle::default();
-        StyleModifier::Bold.apply(&mut style);
-        assert!(style.is_bold());
-
-        let mut style = ComputedStyle::default();
-        StyleModifier::Italic.apply(&mut style);
-        assert!(style.is_italic());
-    }
-
-    #[test]
     fn test_landmark_from_kfx() {
         let s = schema();
         assert_eq!(
@@ -1198,9 +1146,12 @@ mod tests {
             s.landmark_to_kfx(LandmarkType::StartReading),
             Some(KfxSymbol::Srl)
         );
+        // BodyMatter maps to a symbol id no Amazon book uses; it is
+        // import-recognized but never exported.
+        assert_eq!(s.landmark_to_kfx(LandmarkType::BodyMatter), None);
         assert_eq!(
-            s.landmark_to_kfx(LandmarkType::BodyMatter),
-            Some(KfxSymbol::Bodymatter)
+            s.landmark_from_kfx(KfxSymbol::Bodymatter as u64),
+            Some(LandmarkType::BodyMatter)
         );
         // Endnotes has no KFX equivalent
         assert_eq!(s.landmark_to_kfx(LandmarkType::Endnotes), None);
@@ -1209,11 +1160,23 @@ mod tests {
     #[test]
     fn test_landmark_roundtrip() {
         let s = schema();
-        // All mapped landmark types should roundtrip correctly
+        // Every mapped type imports; exportable types roundtrip.
         for (ir_type, kfx_sym) in &s.landmark_mapping {
             let kfx_id = *kfx_sym as u64;
             assert_eq!(s.landmark_from_kfx(kfx_id), Some(*ir_type));
-            assert_eq!(s.landmark_to_kfx(*ir_type), Some(*kfx_sym));
+            if let Some(exported) = s.landmark_to_kfx(*ir_type) {
+                assert_eq!(exported, *kfx_sym);
+            }
+        }
+        // The Amazon-observed set must all be exportable.
+        for ir_type in [
+            LandmarkType::Cover,
+            LandmarkType::StartReading,
+            LandmarkType::Toc,
+            LandmarkType::Acknowledgements,
+            LandmarkType::Index,
+        ] {
+            assert!(s.landmark_to_kfx(ir_type).is_some());
         }
     }
 }

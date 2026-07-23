@@ -182,8 +182,12 @@ pub fn metadata_schema() -> Vec<MetadataRule> {
             category: MetadataCategory::KindleTitle,
             source: MetadataSource::Dynamic(MetadataField::BookId),
         },
-        // Personal-document identifiers used by Kindle's USB library thumbnail
-        // association. KFX Output uses the same value for ASIN and content_id.
+        // Identifiers Kindle keys sideloaded-book library thumbnails on.
+        // The device does not render cover tiles from the book itself; transfer
+        // software (e.g. Calibre's Kindle driver) writes a sidecar
+        // `system/thumbnails/thumbnail_{content_id}_{cde_content_type}_portrait.jpg`,
+        // looked up via these fields — without them no cover can ever display.
+        // Like the KFX Output plugin, ASIN and content_id share one value.
         MetadataRule {
             key: "ASIN",
             category: MetadataCategory::KindleTitle,

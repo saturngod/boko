@@ -7,6 +7,7 @@ use super::*;
 /// JFIF image byte-for-byte; otherwise transcode supported raster images. If an
 /// unusual or corrupt image cannot be decoded, retain the source bytes so cover
 /// normalization never makes an otherwise-convertible book fail.
+#[cfg(feature = "optimize-images")]
 pub(super) fn normalize_kfx_cover(data: Vec<u8>) -> Vec<u8> {
     if is_jfif_jpeg(&data) {
         return data;
@@ -39,6 +40,14 @@ pub(super) fn normalize_kfx_cover(data: Vec<u8>) -> Vec<u8> {
     jpeg
 }
 
+/// Without the `optimize-images` feature the `image` crate is unavailable, so
+/// covers ship in their source format unchanged.
+#[cfg(not(feature = "optimize-images"))]
+pub(super) fn normalize_kfx_cover(data: Vec<u8>) -> Vec<u8> {
+    data
+}
+
+#[cfg(feature = "optimize-images")]
 fn is_jfif_jpeg(data: &[u8]) -> bool {
     data.starts_with(&[0xff, 0xd8]) && data.windows(5).any(|window| window == b"JFIF\0")
 }
@@ -110,11 +119,26 @@ pub(super) fn build_resource_fragment(
     KfxFragment::raw(KfxSymbol::Bcrawmedia as u64, &raw_name, data)
 }
 
+/// Build a bcRawFont fragment ($418) - raw font bytes.
+///
+/// Shares the `resource/{name}` fid the $262 font entity's location field
+/// points at, mirroring `build_resource_fragment` for images.
+pub(super) fn build_font_data_fragment(
+    href: &str,
+    data: Vec<u8>,
+    ctx: &mut ExportContext,
+) -> KfxFragment {
+    let resource_name = generate_resource_name(href, ctx);
+    let raw_name = format!("resource/{}", resource_name);
+    ctx.symbols.get_or_intern(&raw_name);
+    KfxFragment::raw(KfxSymbol::Bcrawfont as u64, &raw_name, data)
+}
+
 /// Build font entity fragments ($262) from @font-face rules.
 ///
 /// Font entities link font_family names (e.g., "cover-Ubuntu") to resource locations.
 /// This enables Kindle to properly render custom fonts.
-pub(super) fn build_font_fragments(book: &mut Book, ctx: &mut ExportContext) -> Vec<KfxFragment> {
+pub(super) fn build_font_fragments(book: &Book, ctx: &mut ExportContext) -> Vec<KfxFragment> {
     use crate::style::{FontStyle, FontWeight};
 
     let mut fragments = Vec::new();
@@ -186,50 +210,38 @@ pub(super) fn build_font_fragments(book: &mut Book, ctx: &mut ExportContext) -> 
             ),
         ]);
 
-        // Generate unique fragment name for this font face
-        let frag_name = format!(
-            "font-{}-{}-{}",
-            font_face.font_family,
-            if font_face.font_weight.0 >= 700 {
-                "bold"
-            } else {
-                "normal"
-            },
-            match font_face.font_style {
-                FontStyle::Italic | FontStyle::Oblique => "italic",
-                FontStyle::Normal => "normal",
-            }
-        );
-
-        fragments.push(KfxFragment::new(KfxSymbol::Font, &frag_name, ion));
+        // Font entities are ROOT fragments (unnamed, id = the $262 type
+        // itself, several allowed) in Amazon output; a named $262 decodes as
+        // an unexpected root id in reference tooling.
+        fragments.push(KfxFragment::singleton(KfxSymbol::Font, ion));
     }
 
     fragments
 }
 
 /// Build anchor fragments ($266) for all recorded anchors.
-///
-/// Returns (fragments, anchor_ids_by_fragment) where anchor_ids_by_fragment
-/// maps fragment_id → list of anchor symbol IDs for use in position_map.
 pub(super) fn build_anchor_fragments(
     ctx: &mut ExportContext,
-) -> (Vec<KfxFragment>, HashMap<u64, Vec<u64>>) {
+    used_anchors: &BTreeSet<u64>,
+) -> Vec<KfxFragment> {
     let mut fragments = Vec::new();
-    let mut anchor_ids_by_fragment: HashMap<u64, Vec<u64>> = HashMap::new();
+    let is_used = |ctx: &ExportContext, symbol: &str| {
+        ctx.symbols
+            .get(symbol)
+            .is_some_and(|sym| used_anchors.contains(&sym))
+    };
 
     // Get resolved internal anchors from the AnchorRegistry
     let resolved_anchors = ctx.anchor_registry.drain_anchors();
 
     for anchor in resolved_anchors {
+        // Anchors resolved for id'd elements that no link references would be
+        // unreachable fragments; skip them.
+        if !is_used(ctx, &anchor.symbol) {
+            continue;
+        }
         // Intern the anchor symbol to get its ID
         let anchor_symbol_id = ctx.symbols.get_or_intern(&anchor.symbol);
-
-        // Track which anchors belong to which SECTION for position_map
-        // Key by section_id (page_template ID), not fragment_id (content ID)
-        anchor_ids_by_fragment
-            .entry(anchor.section_id)
-            .or_default()
-            .push(anchor_symbol_id);
 
         // Build position struct - uses content fragment_id for navigation target
         let mut pos_fields = Vec::new();
@@ -256,10 +268,51 @@ pub(super) fn build_anchor_fragments(
         fragments.push(KfxFragment::new(KfxSymbol::Anchor, &anchor.symbol, ion));
     }
 
+    // Fallback anchors: symbols handed out to link_to references whose
+    // targets never resolved (broken internal links). A referenced-but-
+    // missing $266 is a conformance error; point them at the first section
+    // instead, mirroring go-to-start behavior for broken links.
+    let unresolved = ctx.anchor_registry.unresolved_symbols();
+    if !unresolved.is_empty() {
+        let fallback_id = ctx
+            .cover_fragment_id
+            .or_else(|| {
+                ctx.section_ids.first().and_then(|_| {
+                    ctx.spine_section_chapters
+                        .first()
+                        .and_then(|&(_, ch)| ctx.chapter_fragments.get(&ch).copied())
+                })
+            })
+            .unwrap_or(crate::kfx::context::IdGenerator::FRAGMENT_MIN_ID);
+        for symbol in unresolved {
+            if !is_used(ctx, &symbol) {
+                continue;
+            }
+            let anchor_symbol_id = ctx.symbols.get_or_intern(&symbol);
+            let ion = IonValue::Struct(vec![
+                (
+                    KfxSymbol::AnchorName as u64,
+                    IonValue::Symbol(anchor_symbol_id),
+                ),
+                (
+                    KfxSymbol::Position as u64,
+                    IonValue::Struct(vec![(
+                        KfxSymbol::Id as u64,
+                        IonValue::Int(fallback_id as i64),
+                    )]),
+                ),
+            ]);
+            fragments.push(KfxFragment::new(KfxSymbol::Anchor, &symbol, ion));
+        }
+    }
+
     // Get external anchors (http/https links) from the AnchorRegistry
     let external_anchors = ctx.anchor_registry.drain_external_anchors();
 
     for anchor in external_anchors {
+        if !is_used(ctx, &anchor.symbol) {
+            continue;
+        }
         // Intern the anchor symbol to get its ID
         let anchor_symbol_id = ctx.symbols.get_or_intern(&anchor.symbol);
 
@@ -275,7 +328,7 @@ pub(super) fn build_anchor_fragments(
         fragments.push(KfxFragment::new(KfxSymbol::Anchor, &anchor.symbol, ion));
     }
 
-    (fragments, anchor_ids_by_fragment)
+    fragments
 }
 
 /// Generate a short resource name for a given href.
@@ -314,16 +367,28 @@ fn detect_resource_media_format(href: &str, data: &[u8]) -> crate::util::MediaFo
     }
 }
 
-/// Check if a path is a media asset (image, font, etc.)
-pub(super) fn is_media_asset(path: &str) -> bool {
+/// Check if a path is a media asset (image or font).
+///
+/// Known media extensions short-circuit without touching the bytes; known
+/// document/style extensions are rejected outright. Anything else (unusual
+/// names like `.jfif`/`.bmp`, or extensionless entries) is sniffed by magic
+/// bytes so a real image referenced from content isn't silently dropped —
+/// a storyline pointing at an unregistered resource renders a broken image
+/// with no warning.
+pub(super) fn is_media_asset(book: &crate::model::Book, path: &str) -> bool {
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
-    matches!(
-        ext.to_lowercase().as_str(),
+    match ext.to_lowercase().as_str() {
         "jpg" | "jpeg" | "png" | "gif" | "svg" | "webp" | "ttf" | "otf" | "woff" | "woff2"
-    )
+        | "jfif" | "jpe" | "bmp" => true,
+        "css" | "xhtml" | "html" | "htm" | "xml" | "opf" | "ncx" | "txt" | "js" | "json" => false,
+        _ => book.load_asset(path).is_ok_and(|data| {
+            let format = detect_media_format(path, &data);
+            format.is_image() || format.is_font()
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -368,8 +433,8 @@ mod resource_export_tests {
 
     #[test]
     fn test_kfx_export_includes_images() {
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
-        let data = build_kfx_container(&mut book).unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let data = build_kfx_container(&book).unwrap();
 
         // KFX should be > 400KB (images alone are ~401KB)
         assert!(
@@ -382,14 +447,14 @@ mod resource_export_tests {
     #[test]
     fn test_kfx_asset_roundtrip() {
         // Export EPUB to KFX
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
-        let kfx_data = build_kfx_container(&mut book).unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let kfx_data = build_kfx_container(&book).unwrap();
 
         // Write to temp file and re-open
         let temp_path = std::env::temp_dir().join("test_roundtrip.kfx");
         std::fs::write(&temp_path, &kfx_data).unwrap();
 
-        let mut reimported = Book::open(&temp_path).unwrap();
+        let reimported = Book::open(&temp_path).unwrap();
         let assets: Vec<_> = reimported.list_assets().to_vec();
 
         // Load all assets and verify total size
@@ -419,7 +484,7 @@ mod anchor_resolution_tests {
     fn test_cross_file_anchor_resolution_flow() {
         // Test the full anchor resolution flow with epictetus.epub
         // This EPUB has endnotes in endnotes.xhtml with links from the main text
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
 
         // Step 1: Resolve all links using centralized resolver
         let resolved = book.resolve_links().unwrap();
@@ -437,7 +502,7 @@ mod anchor_resolution_tests {
     fn test_anchor_symbol_reuse() {
         // Test that anchor symbols are consistent between link_to and anchor creation
         // This tests the core invariant of the anchor registry
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
 
         let mut ctx = ExportContext::new();
 
@@ -456,7 +521,7 @@ mod anchor_resolution_tests {
         let resolved = book.resolve_links().unwrap();
 
         // Step 2: Register link targets from ResolvedLinks
-        register_link_targets(&mut book, &spine_info, &resolved, &mut ctx).unwrap();
+        register_link_targets(&book, &spine_info, &resolved, &mut ctx).unwrap();
 
         // Step 3: Verify that href lookups return the same symbol as GlobalNodeId lookups
         // Find an internal link that has both
@@ -489,8 +554,8 @@ mod anchor_resolution_tests {
     #[test]
     fn test_anchor_entities_created_in_full_export() {
         // Test that anchor entities are actually created during full export
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
-        let kfx_data = build_kfx_container(&mut book).unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let kfx_data = build_kfx_container(&book).unwrap();
 
         // Parse the KFX container to find anchor entities
         use crate::kfx::container::{

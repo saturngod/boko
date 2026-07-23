@@ -2,7 +2,6 @@
 //!
 //! Creates EPUB 2/3 files from Book structures using passthrough for content.
 
-use std::collections::HashMap;
 use std::io::{self, Seek, Write};
 
 use zip::CompressionMethod;
@@ -68,7 +67,7 @@ impl Default for EpubExporter {
 }
 
 impl Exporter for EpubExporter {
-    fn export<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> crate::Result<()> {
+    fn export<W: Write + Seek>(&self, book: &Book, writer: &mut W) -> crate::Result<()> {
         // Use normalized mode if explicitly requested OR if the source format requires it
         // (e.g., KFX raw content is binary Ion, not HTML)
         if self.config.normalize || book.requires_normalized_export() {
@@ -81,7 +80,7 @@ impl Exporter for EpubExporter {
 
 impl EpubExporter {
     /// Export with passthrough mode (preserves original HTML/CSS).
-    fn export_raw<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> crate::Result<()> {
+    fn export_raw<W: Write + Seek>(&self, book: &Book, writer: &mut W) -> crate::Result<()> {
         // Resolve TOC fragments before we generate the NCX. AZW3 and MOBI
         // importers leave TOC entries with bare chapter hrefs until
         // `resolve_toc()` populates the `#fileposN` / `#id` suffix from the
@@ -108,7 +107,7 @@ impl EpubExporter {
         zip.write_all(CONTAINER_XML)?;
 
         // 3. Collect content info for manifest
-        let spine: Vec<_> = book.spine().to_vec();
+        let spine = book.spine();
         let mut manifest_items: Vec<ManifestItem> = Vec::new();
         let mut spine_refs: Vec<String> = Vec::new();
 
@@ -124,46 +123,72 @@ impl EpubExporter {
             })
             .collect();
 
-        // Add chapters to manifest
+        // Add chapters to manifest (written at their original source paths)
         for (i, entry) in spine.iter().enumerate() {
             let source_path = book.source_id(entry.id).unwrap_or("unknown.xhtml");
-            let filename = format!("chapter_{}.xhtml", i);
             let id = format!("chapter_{}", i);
 
             manifest_items.push(ManifestItem {
                 id: id.clone(),
-                href: filename,
+                href: format!("OEBPS/{}", sanitize_path(source_path)),
                 media_type: "application/xhtml+xml",
                 properties: None,
             });
             spine_refs.push(id);
-
-            // Store original path for content writing
-            manifest_items.last_mut().unwrap().href =
-                format!("OEBPS/{}", sanitize_path(source_path));
         }
 
-        // Add assets to manifest
-        let assets: Vec<_> = book.list_assets().to_vec();
-        let mut asset_map: HashMap<String, String> = HashMap::new();
+        // Add assets to manifest. The source's own packaging files (mimetype,
+        // META-INF/, OPF, NCX) must not be re-bundled: we generate fresh ones,
+        // and shipping the stale originals bloats the book and confuses
+        // validators.
+        let assets = book.list_assets();
 
         for (i, asset_path) in assets.iter().enumerate() {
+            if is_source_packaging(asset_path) {
+                continue;
+            }
             let href = format!("OEBPS/{}", sanitize_path(asset_path));
             // Skip spine documents already emitted as chapters (see above).
             if chapter_paths.contains(&href) {
                 continue;
             }
-            let media_type = guess_media_type(asset_path);
+            let media_type = asset_media_type(book, asset_path);
             let id = format!("asset_{}", i);
 
             manifest_items.push(ManifestItem {
-                id: id.clone(),
-                href: href.clone(),
+                id,
+                href,
                 media_type,
                 properties: None,
             });
-            asset_map.insert(asset_path.clone(), href);
         }
+
+        mark_cover_image(&mut manifest_items, book.metadata().cover_image.as_deref());
+
+        // EPUB 3 requires exactly one manifest item with the `nav` property;
+        // synthesize a nav document (at a path no source file occupies).
+        let nav_zip_path = if manifest_items.iter().any(|m| m.href == "OEBPS/nav.xhtml") {
+            "OEBPS/boko-nav.xhtml"
+        } else {
+            "OEBPS/nav.xhtml"
+        };
+        manifest_items.push(ManifestItem {
+            id: "nav".to_string(),
+            href: nav_zip_path.to_string(),
+            media_type: "application/xhtml+xml",
+            properties: Some("nav"),
+        });
+
+        // NCX and nav both require at least one entry; synthesize one for
+        // TOC-less books.
+        let first_chapter_href = spine
+            .first()
+            .map(|entry| sanitize_path(book.source_id(entry.id).unwrap_or("unknown.xhtml")));
+        let toc = toc_or_fallback(
+            book.toc(),
+            &book.metadata().title,
+            first_chapter_href.as_deref(),
+        );
 
         // 4. Write content.opf
         let opf = generate_opf(book.metadata(), &manifest_items, &spine_refs);
@@ -172,13 +197,18 @@ impl EpubExporter {
         zip.write_all(opf.as_bytes())?;
 
         // 5. Write toc.ncx
-        let ncx = generate_ncx(book.metadata(), book.toc());
+        let ncx = generate_ncx(book.metadata(), &toc);
         zip.start_file("OEBPS/toc.ncx", deflated)
             .map_err(io_error)?;
         zip.write_all(ncx.as_bytes())?;
 
+        // 5b. Write the EPUB 3 nav document
+        let nav = generate_nav(&book.metadata().title, &toc);
+        zip.start_file(nav_zip_path, deflated).map_err(io_error)?;
+        zip.write_all(nav.as_bytes())?;
+
         // 6. Write chapters
-        for entry in &spine {
+        for entry in spine {
             let source_path = book
                 .source_id(entry.id)
                 .unwrap_or("unknown.xhtml")
@@ -190,8 +220,12 @@ impl EpubExporter {
             zip.write_all(&content)?;
         }
 
-        // 7. Write assets
-        for asset_path in &assets {
+        // 7. Write assets (skipping spine documents already written as
+        // chapters and the source's packaging files).
+        for asset_path in assets {
+            if is_source_packaging(asset_path) {
+                continue;
+            }
             let zip_path = format!("OEBPS/{}", sanitize_path(asset_path));
             if chapter_paths.contains(&zip_path) {
                 continue;
@@ -208,11 +242,7 @@ impl EpubExporter {
     }
 
     /// Export with normalized content (IR pipeline produces clean, consistent output).
-    fn export_normalized<W: Write + Seek>(
-        &self,
-        book: &mut Book,
-        writer: &mut W,
-    ) -> io::Result<()> {
+    fn export_normalized<W: Write + Seek>(&self, book: &Book, writer: &mut W) -> io::Result<()> {
         use super::normalize::normalize_book;
 
         // Resolve TOC fragments before generating the NCX. Same rationale as
@@ -225,7 +255,7 @@ impl EpubExporter {
         // resources like embedded fonts that are referenced from CSS rather
         // than from the IR DOM. We add those back into the manifest and ZIP
         // below.
-        let all_assets: Vec<_> = book.list_assets().to_vec();
+        let all_assets = book.list_assets();
 
         // Normalize the book content
         let content = normalize_book(book)?;
@@ -251,15 +281,16 @@ impl EpubExporter {
         let mut manifest_items: Vec<ManifestItem> = Vec::new();
         let mut spine_refs: Vec<String> = Vec::new();
 
-        // Add stylesheet to manifest
-        if !content.css.is_empty() {
-            manifest_items.push(ManifestItem {
-                id: "stylesheet".to_string(),
-                href: "OEBPS/style.css".to_string(),
-                media_type: "text/css",
-                properties: None,
-            });
-        }
+        // Add stylesheet to manifest. Always present: synthesized chapters
+        // unconditionally link style.css, so skipping an empty stylesheet
+        // would leave every chapter with a dangling reference (epubcheck
+        // RSC-007).
+        manifest_items.push(ManifestItem {
+            id: "stylesheet".to_string(),
+            href: "OEBPS/style.css".to_string(),
+            media_type: "text/css",
+            properties: None,
+        });
 
         // Add chapters to manifest
         for (i, _) in content.chapters.iter().enumerate() {
@@ -285,7 +316,7 @@ impl EpubExporter {
 
         // Add assets to manifest (from normalized content)
         for (asset_idx, asset_path) in content.assets.iter().enumerate() {
-            let media_type = guess_media_type(asset_path);
+            let media_type = asset_media_type(book, asset_path);
             let id = format!("asset_{}", asset_idx);
             let href = format!("OEBPS/{}", sanitize_path(asset_path));
 
@@ -303,7 +334,7 @@ impl EpubExporter {
         // `content.assets`. Without this we'd emit `@font-face` rules whose
         // `src:` URLs point at files we never wrote into the ZIP.
         let mut extra_font_idx = 0;
-        for asset_path in &all_assets {
+        for asset_path in all_assets {
             if !asset_path.starts_with("fonts/") {
                 continue;
             }
@@ -319,6 +350,8 @@ impl EpubExporter {
             extra_font_idx += 1;
         }
 
+        mark_cover_image(&mut manifest_items, book.metadata().cover_image.as_deref());
+
         // 4. Write content.opf
         let opf = generate_opf(book.metadata(), &manifest_items, &spine_refs);
         zip.start_file("OEBPS/content.opf", deflated)
@@ -327,7 +360,13 @@ impl EpubExporter {
 
         // 5. Write toc.ncx. Rewrite the TOC hrefs (original source paths / bare
         // `#anchor`s) to the emitted chapter files so navigation resolves.
-        let rewritten_toc = content.rewrite_toc(book.toc());
+        // NCX and nav both require at least one entry; synthesize one for
+        // TOC-less books.
+        let rewritten_toc = toc_or_fallback(
+            &content.rewrite_toc(book.toc()),
+            &book.metadata().title,
+            (!content.chapters.is_empty()).then_some("chapter_0.xhtml"),
+        );
         let ncx = generate_ncx(book.metadata(), &rewritten_toc);
         zip.start_file("OEBPS/toc.ncx", deflated)
             .map_err(io_error)?;
@@ -339,12 +378,11 @@ impl EpubExporter {
             .map_err(io_error)?;
         zip.write_all(nav.as_bytes())?;
 
-        // 6. Write unified stylesheet
-        if !content.css.is_empty() {
-            zip.start_file("OEBPS/style.css", deflated)
-                .map_err(io_error)?;
-            zip.write_all(content.css.as_bytes())?;
-        }
+        // 6. Write unified stylesheet (always, matching the manifest entry
+        // and the chapters' unconditional link to it).
+        zip.start_file("OEBPS/style.css", deflated)
+            .map_err(io_error)?;
+        zip.write_all(content.css.as_bytes())?;
 
         // 7. Write synthesized chapters
         for (i, chapter) in content.chapters.iter().enumerate() {
@@ -367,7 +405,7 @@ impl EpubExporter {
 
         // 9. Write font assets not already covered by normalized content.
         // Matches the manifest entries added above.
-        for asset_path in &all_assets {
+        for asset_path in all_assets {
             if !asset_path.starts_with("fonts/") {
                 continue;
             }
@@ -407,6 +445,60 @@ struct ManifestItem {
     media_type: &'static str,
     /// Optional OPF `properties` (e.g. `nav`, `cover-image`).
     properties: Option<&'static str>,
+}
+
+/// Media type for a manifest asset: extension first, magic-byte sniffing as
+/// fallback for unknown/extensionless names (e.g. KFX short resource names
+/// like "e6") so real images aren't declared as foreign octet-streams.
+fn asset_media_type(book: &Book, path: &str) -> &'static str {
+    let by_ext = guess_media_type(path);
+    if by_ext != "application/octet-stream" {
+        return by_ext;
+    }
+    book.load_asset(path)
+        .map(|data| crate::util::detect_media_format(path, &data).mime_type())
+        .unwrap_or(by_ext)
+}
+
+/// Whether an asset path is part of the *source* EPUB's packaging (its
+/// mimetype, container.xml, OPF, or NCX). These are regenerated on export and
+/// must not be re-bundled as ordinary assets.
+fn is_source_packaging(path: &str) -> bool {
+    path == "mimetype"
+        || path.starts_with("META-INF/")
+        || path.ends_with(".opf")
+        || path.ends_with(".ncx")
+}
+
+/// Mark the manifest item holding the book's cover image with
+/// `properties="cover-image"` (EPUB 3). `generate_opf` also emits the EPUB 2
+/// `<meta name="cover">` from this marking.
+fn mark_cover_image(manifest_items: &mut [ManifestItem], cover_image: Option<&str>) {
+    let Some(cover) = cover_image else { return };
+    let sanitized = sanitize_path(cover);
+    // cover_image is importer-relative; hrefs are OEBPS/-prefixed zip paths
+    // that may carry an extra source directory, so match on the path tail.
+    if let Some(item) = manifest_items.iter_mut().find(|item| {
+        let href = item.href.strip_prefix("OEBPS/").unwrap_or(&item.href);
+        (href == sanitized || href.ends_with(&format!("/{sanitized}")))
+            && item.media_type.starts_with("image/")
+    }) {
+        item.properties = Some("cover-image");
+    }
+}
+
+/// Clone the TOC, or synthesize a single entry pointing at the first chapter
+/// when it is empty: both the NCX DTD (`navMap` needs a `navPoint`) and the
+/// EPUB 3 nav spec (`nav` needs an `ol`) reject empty navigation.
+fn toc_or_fallback(toc: &[TocEntry], title: &str, first_href: Option<&str>) -> Vec<TocEntry> {
+    if !toc.is_empty() {
+        return toc.to_vec();
+    }
+    let Some(href) = first_href else {
+        return Vec::new();
+    };
+    let label = if title.is_empty() { "Start" } else { title };
+    vec![TocEntry::new(label, href)]
 }
 
 /// Pick a ZIP compression method for an asset. Images and fonts are already
@@ -599,6 +691,18 @@ fn generate_opf(
         ));
     }
 
+    // EPUB 2 cover marker, pointing at the manifest item flagged with the
+    // EPUB 3 `cover-image` property (see `mark_cover_image`).
+    if let Some(cover_item) = manifest.iter().find(|item| {
+        item.properties
+            .is_some_and(|p| p.split_ascii_whitespace().any(|p| p == "cover-image"))
+    }) {
+        opf.push_str(&format!(
+            "    <meta name=\"cover\" content=\"{}\"/>\n",
+            escape_xml(&cover_item.id)
+        ));
+    }
+
     opf.push_str("  </metadata>\n");
 
     // Manifest
@@ -624,8 +728,16 @@ fn generate_opf(
     }
     opf.push_str("  </manifest>\n");
 
-    // Spine
-    opf.push_str("  <spine toc=\"ncx\">\n");
+    // Spine. Preserve the global reading direction (RTL books) when the
+    // source declared one and it isn't the default.
+    match metadata.page_progression_direction.as_deref() {
+        Some(dir @ ("rtl" | "ltr")) => {
+            opf.push_str(&format!(
+                "  <spine toc=\"ncx\" page-progression-direction=\"{dir}\">\n"
+            ));
+        }
+        _ => opf.push_str("  <spine toc=\"ncx\">\n"),
+    }
     for id in spine_refs {
         opf.push_str(&format!("    <itemref idref=\"{}\"/>\n", escape_xml(id)));
     }
@@ -647,15 +759,16 @@ fn generate_ncx(metadata: &crate::model::Metadata, toc: &[TocEntry]) -> String {
     <meta name="dtb:uid" content=""#,
     );
     ncx.push_str(&escape_xml(&metadata.identifier));
-    ncx.push_str(
+    ncx.push_str(&format!(
         r#""/>
-    <meta name="dtb:depth" content="1"/>
+    <meta name="dtb:depth" content="{}"/>
     <meta name="dtb:totalPageCount" content="0"/>
     <meta name="dtb:maxPageNumber" content="0"/>
   </head>
   <docTitle>
     <text>"#,
-    );
+        toc_depth(toc)
+    ));
     ncx.push_str(&escape_xml(&metadata.title));
     ncx.push_str(
         r#"</text>
@@ -669,6 +782,22 @@ fn generate_ncx(metadata: &crate::model::Metadata, toc: &[TocEntry]) -> String {
 
     ncx.push_str("  </navMap>\n</ncx>\n");
     ncx
+}
+
+/// Actual nesting depth of the TOC tree (>= 1), for the NCX `dtb:depth`
+/// declaration. Depth is capped alongside the writer's own recursion cap.
+fn toc_depth(entries: &[TocEntry]) -> usize {
+    fn depth_of(entries: &[TocEntry], depth: usize) -> usize {
+        if entries.is_empty() || depth > crate::util::MAX_TREE_DEPTH {
+            return depth;
+        }
+        entries
+            .iter()
+            .map(|e| depth_of(&e.children, depth + 1))
+            .max()
+            .unwrap_or(depth)
+    }
+    depth_of(entries, 0).max(1)
 }
 
 /// Recursively write navPoint elements.

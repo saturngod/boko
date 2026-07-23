@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::import::{ChapterId, Importer, SpineEntry};
 use crate::io::{ByteSource, FileSource};
@@ -69,29 +69,25 @@ pub struct KfxImporter {
     section_storylines_indexed: bool,
 
     /// Resources: name -> EntityLoc (lazily populated)
-    resources: HashMap<String, EntityLoc>,
-    /// Whether resources have been indexed
-    resources_indexed: bool,
+    resource_index: OnceLock<HashMap<String, EntityLoc>>,
+
+    /// Content-entity name → location, built once. Without it,
+    /// `load_content_entity` was a linear scan that fully Ion-parsed every
+    /// content entity on each miss — O(C^2) parses per book.
+    content_index: OnceLock<HashMap<String, EntityLoc>>,
 
     /// Content cache: name -> list of strings (lazily populated)
-    content_cache: HashMap<String, Vec<String>>,
+    content_cache: RwLock<HashMap<String, Vec<String>>>,
 
     /// Anchor map: anchor_name -> uri (for external link resolution)
-    anchors: Arc<HashMap<String, String>>,
-    /// Whether anchors have been indexed
-    anchors_indexed: bool,
+    anchors: OnceLock<AnchorIndex>,
 
     /// Style map: style_name -> KFX style properties (for style resolution)
-    styles: Arc<HashMap<String, Vec<(u64, IonValue)>>>,
-    /// Whether styles have been indexed
-    styles_indexed: bool,
+    styles: OnceLock<Arc<StyleIndex>>,
 
     // --- Link resolution ---
-    /// Internal anchors: anchor_name -> (position_id, offset)
-    internal_anchors: Arc<HashMap<String, (i64, i64)>>,
-
     /// Maps element string ID -> GlobalNodeId (built during index_anchors)
-    element_id_map: HashMap<String, GlobalNodeId>,
+    element_id_map: RwLock<HashMap<String, GlobalNodeId>>,
 }
 
 impl From<ContainerError> for crate::Error {
@@ -118,10 +114,6 @@ impl Importer for KfxImporter {
         &self.toc
     }
 
-    fn toc_mut(&mut self) -> &mut [TocEntry] {
-        &mut self.toc
-    }
-
     fn landmarks(&self) -> &[Landmark] {
         &self.landmarks
     }
@@ -134,11 +126,7 @@ impl Importer for KfxImporter {
         self.section_names.get(id.0 as usize).map(|s| s.as_str())
     }
 
-    fn load_chapter(&mut self, id: ChapterId) -> crate::Result<Chapter> {
-        // Ensure anchors and styles are indexed
-        self.index_anchor_entities()?;
-        self.index_styles()?;
-
+    fn load_chapter(&self, id: ChapterId) -> crate::Result<Chapter> {
         let section_name = self
             .section_names
             .get(id.0 as usize)
@@ -155,8 +143,8 @@ impl Importer for KfxImporter {
 
         // Clone Arc handles to avoid borrow conflict with content lookup closure
         let doc_symbols = Arc::clone(&self.doc_symbols);
-        let anchors = Arc::clone(&self.anchors);
-        let styles = Arc::clone(&self.styles);
+        let anchors = Arc::clone(&self.anchor_index().external);
+        let styles = Arc::clone(self.style_index());
 
         // Parse storyline and build IR using schema-driven tokenization
         let mut chapter = parse_storyline_to_ir(
@@ -173,7 +161,7 @@ impl Importer for KfxImporter {
         Ok(chapter)
     }
 
-    fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
+    fn load_raw(&self, id: ChapterId) -> crate::Result<Vec<u8>> {
         let section_name = self
             .section_names
             .get(id.0 as usize)
@@ -191,7 +179,7 @@ impl Importer for KfxImporter {
         &self.asset_paths
     }
 
-    fn load_asset(&mut self, path: &str) -> crate::Result<Vec<u8>> {
+    fn load_asset(&self, path: &str) -> crate::Result<Vec<u8>> {
         // Handle font path lookup (e.g., "fonts/font_0000.otf")
         if let Some(loc) = self.font_entities.get(path) {
             return self.read_entity(*loc);
@@ -210,13 +198,8 @@ impl Importer for KfxImporter {
             });
         }
 
-        // Ensure resources are indexed for name-based lookup
-        if !self.resources_indexed {
-            self.index_resources()?;
-        }
-
         let loc = self
-            .resources
+            .resource_index()
             .get(path)
             .ok_or_else(|| crate::Error::NotFound {
                 what: format!("asset {}", path),
@@ -230,17 +213,20 @@ impl Importer for KfxImporter {
         true
     }
 
-    fn index_anchors(&mut self, chapters: &[(ChapterId, Arc<Chapter>)]) {
-        self.element_id_map.clear();
+    fn index_anchors(&self, chapters: &[(ChapterId, Arc<Chapter>)]) {
+        let mut element_id_map = HashMap::new();
 
         // Build element_id → GlobalNodeId map from chapters
         for (chapter_id, chapter) in chapters {
             for node_id in chapter.iter_dfs() {
                 if let Some(id) = chapter.semantics.id(node_id) {
-                    self.element_id_map
-                        .insert(id.to_string(), GlobalNodeId::new(*chapter_id, node_id));
+                    element_id_map.insert(id.to_string(), GlobalNodeId::new(*chapter_id, node_id));
                 }
             }
+        }
+
+        if let Ok(mut map) = self.element_id_map.write() {
+            *map = element_id_map;
         }
     }
 
@@ -267,29 +253,29 @@ impl Importer for KfxImporter {
         };
 
         // Check external anchors map (anchor_name → uri)
-        if let Some(uri) = self.anchors.as_ref().get(anchor_name) {
+        if let Some(uri) = self.anchor_index().external.get(anchor_name) {
             return Some(AnchorTarget::External(uri.clone()));
         }
 
         // Check internal anchors (anchor_name → position.id → element_id)
         // The position.id in anchor entities references element IDs in storylines
-        if let Some(&(pos_id, _offset)) = self.internal_anchors.as_ref().get(anchor_name) {
+        if let Some(&(pos_id, _offset)) = self.anchor_index().internal.get(anchor_name) {
             let id_str = pos_id.to_string();
-            if let Some(target) = self.element_id_map.get(&id_str) {
-                return Some(AnchorTarget::Internal(*target));
+            if let Some(target) = self.element_id(&id_str) {
+                return Some(AnchorTarget::Internal(target));
             }
         }
 
         // Try direct element ID lookup (anchor_name might be the numeric ID directly)
-        if let Some(target) = self.element_id_map.get(anchor_name) {
-            return Some(AnchorTarget::Internal(*target));
+        if let Some(target) = self.element_id(anchor_name) {
+            return Some(AnchorTarget::Internal(target));
         }
 
         // Try parsing as numeric ID
         if let Ok(numeric_id) = anchor_name.parse::<i64>() {
             let id_str = numeric_id.to_string();
-            if let Some(target) = self.element_id_map.get(&id_str) {
-                return Some(AnchorTarget::Internal(*target));
+            if let Some(target) = self.element_id(&id_str) {
+                return Some(AnchorTarget::Internal(target));
             }
         }
 
@@ -299,6 +285,14 @@ impl Importer for KfxImporter {
 }
 
 impl KfxImporter {
+    /// Look up an element id in the anchor index built by `index_anchors`.
+    fn element_id(&self, key: &str) -> Option<GlobalNodeId> {
+        self.element_id_map
+            .read()
+            .ok()
+            .and_then(|m| m.get(key).copied())
+    }
+
     /// Create an importer from a ByteSource.
     pub fn from_source(source: Arc<dyn ByteSource>) -> crate::Result<Self> {
         // Read and parse container header (18 bytes)
@@ -368,15 +362,12 @@ impl KfxImporter {
             section_names: Vec::new(),
             section_storylines: HashMap::new(),
             section_storylines_indexed: false,
-            resources: HashMap::new(),
-            resources_indexed: false,
-            content_cache: HashMap::new(),
-            anchors: Arc::new(HashMap::new()),
-            anchors_indexed: false,
-            styles: Arc::new(HashMap::new()),
-            styles_indexed: false,
-            internal_anchors: Arc::new(HashMap::new()),
-            element_id_map: HashMap::new(),
+            resource_index: OnceLock::new(),
+            content_index: OnceLock::new(),
+            content_cache: RwLock::new(HashMap::new()),
+            anchors: OnceLock::new(),
+            styles: OnceLock::new(),
+            element_id_map: RwLock::new(HashMap::new()),
         };
 
         // Parse metadata (only reads needed entities)
@@ -874,16 +865,20 @@ impl KfxImporter {
     /// Look up text content by name and index.
     ///
     /// Lazily loads and caches content entities as needed.
-    fn lookup_content_text(&mut self, name: &str, index: usize) -> Option<String> {
+    fn lookup_content_text(&self, name: &str, index: usize) -> Option<String> {
         // Check cache first
-        if let Some(content_list) = self.content_cache.get(name) {
+        if let Ok(cache) = self.content_cache.read()
+            && let Some(content_list) = cache.get(name)
+        {
             return content_list.get(index).cloned();
         }
 
         // Load and cache the content entity
         if let Some(content_list) = self.load_content_entity(name) {
             let result = content_list.get(index).cloned();
-            self.content_cache.insert(name.to_string(), content_list);
+            if let Ok(mut cache) = self.content_cache.write() {
+                cache.insert(name.to_string(), content_list);
+            }
             return result;
         }
 
@@ -892,37 +887,45 @@ impl KfxImporter {
 
     /// Load a content entity by name and return its string list.
     fn load_content_entity(&self, name: &str) -> Option<Vec<String>> {
-        // Find content entity with matching name
-        for loc in &self.entities {
-            if loc.type_id == KfxSymbol::Content as u32
-                && let Ok(elem) = self.parse_entity_ion(*loc)
-                && let Some(fields) = elem.as_struct()
-            {
-                // Check if name matches
-                let entity_name =
-                    get_field(fields, sym!(Name)).and_then(|v| self.get_symbol_text(v));
+        let loc = *self.content_index().get(name)?;
+        let elem = self.parse_entity_ion(loc).ok()?;
+        let fields = elem.as_struct()?;
+        let list = get_field(fields, sym!(ContentList)).and_then(|v| v.as_list())?;
+        Some(
+            list.iter()
+                .filter_map(|v| v.as_string().map(|s| s.to_string()))
+                .collect(),
+        )
+    }
 
-                if entity_name == Some(name)
-                    && let Some(list) =
-                        get_field(fields, sym!(ContentList)).and_then(|v| v.as_list())
+    /// The content-entity-name → location index, built on first use.
+    fn content_index(&self) -> &HashMap<String, EntityLoc> {
+        self.content_index.get_or_init(|| {
+            let mut index = HashMap::new();
+            for loc in &self.entities {
+                if loc.type_id == KfxSymbol::Content as u32
+                    && let Ok(elem) = self.parse_entity_ion(*loc)
+                    && let Some(fields) = elem.as_struct()
+                    && let Some(entity_name) =
+                        get_field(fields, sym!(Name)).and_then(|v| self.get_symbol_text(v))
                 {
-                    return Some(
-                        list.iter()
-                            .filter_map(|v| v.as_string().map(|s| s.to_string()))
-                            .collect(),
-                    );
+                    // First occurrence wins, matching the old forward scan.
+                    index.entry(entity_name.to_string()).or_insert(*loc);
                 }
             }
-        }
-        None
+            index
+        })
     }
 
     /// Index external resources.
-    fn index_resources(&mut self) -> crate::Result<()> {
-        if self.resources_indexed {
-            return Ok(());
-        }
+    /// The resource-name → entity-location index, built on first use.
+    fn resource_index(&self) -> &HashMap<String, EntityLoc> {
+        self.resource_index
+            .get_or_init(|| self.build_resource_index())
+    }
 
+    fn build_resource_index(&self) -> HashMap<String, EntityLoc> {
+        let mut resources = HashMap::new();
         // Build a lookup from resolved bcRawMedia entity names to their binary payload locations.
         let mut raw_media_by_name: HashMap<String, EntityLoc> = HashMap::new();
         for raw_loc in self
@@ -977,30 +980,28 @@ impl KfxImporter {
                 if let Some(loc_str) = &location
                     && !loc_str.is_empty()
                 {
-                    self.resources.insert(loc_str.clone(), resolved_loc);
+                    resources.insert(loc_str.clone(), resolved_loc);
                 }
                 if let Some(name_str) = &name
                     && !name_str.is_empty()
                     && Some(name_str) != location.as_ref()
                 {
-                    self.resources.insert(name_str.clone(), resolved_loc);
+                    resources.insert(name_str.clone(), resolved_loc);
                 }
             }
         }
 
-        self.resources_indexed = true;
-        Ok(())
+        resources
     }
 
-    /// Index anchor entities to build anchor_name → uri/position maps.
-    ///
-    /// This enables resolution of both external and internal links where
-    /// `link_to` contains an anchor name.
-    fn index_anchor_entities(&mut self) -> crate::Result<()> {
-        if self.anchors_indexed {
-            return Ok(());
-        }
+    /// The anchor indexes (external uri map + internal position map), built
+    /// on first use. Enables resolution of both external and internal links
+    /// where `link_to` contains an anchor name.
+    fn anchor_index(&self) -> &AnchorIndex {
+        self.anchors.get_or_init(|| self.build_anchor_index())
+    }
 
+    fn build_anchor_index(&self) -> AnchorIndex {
         // Find all anchor entities (type $266)
         let locs: Vec<_> = self
             .entities
@@ -1049,32 +1050,20 @@ impl KfxImporter {
             }
         }
 
-        if !new_external.is_empty() {
-            let anchors = Arc::make_mut(&mut self.anchors);
-            for (name, uri) in new_external {
-                anchors.insert(name, uri);
-            }
+        AnchorIndex {
+            external: Arc::new(new_external.into_iter().collect()),
+            internal: Arc::new(new_internal.into_iter().collect()),
         }
-        if !new_internal.is_empty() {
-            let internal_anchors = Arc::make_mut(&mut self.internal_anchors);
-            for (name, pos) in new_internal {
-                internal_anchors.insert(name, pos);
-            }
-        }
-
-        self.anchors_indexed = true;
-        Ok(())
     }
 
-    /// Index style entities to build style_name → properties map.
-    ///
-    /// This enables resolution of style references in storyline elements.
-    /// Style entities ($157) contain properties like font_weight, text_alignment, margins, etc.
-    fn index_styles(&mut self) -> crate::Result<()> {
-        if self.styles_indexed {
-            return Ok(());
-        }
+    /// The style_name → properties index, built on first use. Style entities
+    /// ($157) contain properties like font_weight, text_alignment, margins.
+    fn style_index(&self) -> &Arc<StyleIndex> {
+        self.styles
+            .get_or_init(|| Arc::new(self.build_style_index()))
+    }
 
+    fn build_style_index(&self) -> StyleIndex {
         // Find all style entities (type $157)
         let locs: Vec<_> = self
             .entities
@@ -1107,14 +1096,17 @@ impl KfxImporter {
             }
         }
 
-        if !new_styles.is_empty() {
-            let styles = Arc::make_mut(&mut self.styles);
-            for (name, props) in new_styles {
-                styles.insert(name, props);
-            }
-        }
-
-        self.styles_indexed = true;
-        Ok(())
+        new_styles.into_iter().collect()
     }
+}
+
+/// style_name → raw Ion property fields, from style entities ($157).
+type StyleIndex = HashMap<String, Vec<(u64, IonValue)>>;
+
+/// Anchor lookup tables built from anchor entities ($266).
+struct AnchorIndex {
+    /// anchor_name → external URI.
+    external: Arc<HashMap<String, String>>,
+    /// anchor_name → (position_id, offset) for internal links.
+    internal: Arc<HashMap<String, (i64, i64)>>,
 }

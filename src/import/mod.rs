@@ -69,7 +69,7 @@ pub trait Importer: Send + Sync {
     /// 4. Compiles the parsed DOM + CSS to IR via `compile_dom()`
     ///
     /// Implementations may override for format-specific optimizations.
-    fn load_chapter(&mut self, id: ChapterId) -> crate::Result<Chapter> {
+    fn load_chapter(&self, id: ChapterId) -> crate::Result<Chapter> {
         let html_bytes = self.load_raw(id)?;
         let base_path = self.source_id(id).map(str::to_string);
         Ok(compile_chapter_html(
@@ -81,13 +81,21 @@ pub trait Importer: Send + Sync {
 
     /// Load several chapters as normalized IR.
     ///
-    /// The default implementation loads serially via [`load_chapter`]
-    /// (Self::load_chapter). Importers whose IO is thread-safe (e.g. EPUB's
-    /// random-access ZIP source) override this to compile chapters in
-    /// parallel — HTML parsing, the CSS cascade, and IR transformation
-    /// dominate cold conversion and are independent per chapter.
-    fn load_chapters(&mut self, ids: &[ChapterId]) -> Vec<crate::Result<Chapter>> {
-        ids.iter().map(|&id| self.load_chapter(id)).collect()
+    /// Importers are `Sync` and chapter loads take `&self`, so the default
+    /// implementation compiles chapters in parallel (with the `parallel`
+    /// feature, native targets) — HTML parsing, the CSS cascade, and IR
+    /// transformation dominate cold conversion and are independent per
+    /// chapter.
+    fn load_chapters(&self, ids: &[ChapterId]) -> Vec<crate::Result<Chapter>> {
+        #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+        {
+            use rayon::prelude::*;
+            ids.par_iter().map(|&id| self.load_chapter(id)).collect()
+        }
+        #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+        {
+            ids.iter().map(|&id| self.load_chapter(id)).collect()
+        }
     }
 
     // --- Track 2: Raw Access (The Converter) ---
@@ -96,7 +104,7 @@ pub trait Importer: Send + Sync {
     fn source_id(&self, id: ChapterId) -> Option<&str>;
 
     /// Returns the raw bytes of a chapter.
-    fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>>;
+    fn load_raw(&self, id: ChapterId) -> crate::Result<Vec<u8>>;
 
     // --- Assets ---
 
@@ -107,14 +115,14 @@ pub trait Importer: Send + Sync {
     fn list_assets(&self) -> &[String];
 
     /// Load an asset by archive entry name.
-    fn load_asset(&mut self, path: &str) -> crate::Result<Vec<u8>>;
+    fn load_asset(&self, path: &str) -> crate::Result<Vec<u8>>;
 
     /// Load and parse a stylesheet, optionally using a cache.
     ///
     /// The default implementation loads the asset bytes and parses CSS.
     /// Returns an `Arc` so cached sheets are shared across chapters instead
     /// of deep-cloning the parsed rules per chapter.
-    fn load_stylesheet(&mut self, path: &str) -> Option<Arc<Stylesheet>> {
+    fn load_stylesheet(&self, path: &str) -> Option<Arc<Stylesheet>> {
         if let Ok(css_bytes) = self.load_asset(path) {
             let css_str = String::from_utf8_lossy(&css_bytes);
             return Some(Arc::new(Stylesheet::parse(&css_str)));
@@ -130,7 +138,7 @@ pub trait Importer: Send + Sync {
     ///
     /// This is used by KFX export to create font entities linking font-family
     /// names to resource locations.
-    fn font_faces(&mut self) -> Vec<FontFace> {
+    fn font_faces(&self) -> Vec<FontFace> {
         let mut font_faces = Vec::new();
 
         // Find all CSS files
@@ -179,22 +187,21 @@ pub trait Importer: Send + Sync {
     ///
     /// Importers should override this to handle format-specific anchor systems
     /// (e.g., KFX anchor entities, AZW3 fragment IDs).
-    fn index_anchors(&mut self, _chapters: &[(ChapterId, Arc<Chapter>)]) {
+    fn index_anchors(&self, _chapters: &[(ChapterId, Arc<Chapter>)]) {
         // Default: no-op. Path-based resolution in resolve_href() handles EPUB.
         // Format-specific importers override to build their anchor maps.
     }
 
     /// Resolve TOC href fragments after chapters are loaded.
     ///
-    /// This method is called after `index_anchors()` to fix up TOC entries
-    /// that were built without fragment identifiers (e.g., AZW3/MOBI).
-    /// The default implementation does nothing (EPUB/KFX have correct hrefs).
-    fn resolve_toc(&mut self) {
-        // Default: no-op. EPUB and KFX have correct TOC hrefs from source.
+    /// Called after `index_anchors()`. Importers whose TOC entries are built
+    /// without fragment identifiers (AZW3/MOBI) return a fixed-up copy of the
+    /// TOC; the default returns `None` (EPUB/KFX have correct hrefs from
+    /// source). The resolved TOC is cached by [`Book`](crate::Book) — the
+    /// importer's own entries are never mutated.
+    fn resolve_toc(&self) -> Option<Vec<TocEntry>> {
+        None
     }
-
-    /// Get mutable access to TOC entries for resolution.
-    fn toc_mut(&mut self) -> &mut [TocEntry];
 
     /// Resolve an href to its target.
     ///
@@ -346,16 +353,28 @@ fn normalize_separators(path: String) -> String {
 ///
 /// Both inputs are archive entry names separated by forward slashes; the
 /// result is normalized to forward slashes as well.
-fn resolve_relative_path(base: &str, relative: &str) -> String {
+pub(crate) fn resolve_relative_path(base: &str, relative: &str) -> String {
     // Handle absolute paths and URLs
     if relative.starts_with('/') || relative.contains("://") {
         return normalize_separators(relative.to_string());
     }
 
+    // `relative` comes from parsed content (hrefs, CSS urls) and is a URL:
+    // percent-escapes like `my%20image.png` must be decoded (path and
+    // fragment separately) to match literal archive entry names. `base` is
+    // already an archive name and stays literal.
+    let relative = crate::util::percent_decode_href(relative);
+
     // Handle fragment-only paths (#anchor) - resolve to base file + fragment
     if relative.starts_with('#') {
         return normalize_separators(format!("{}{}", base, relative));
     }
+
+    // Normalize backslashes BEFORE splitting on '/': `..\styles\main.css`
+    // from Windows-authored content must split into components, or the `..`
+    // survives as a literal segment and the archive lookup silently misses.
+    let base = normalize_separators(base.to_string());
+    let relative = normalize_separators(relative.into_owned());
 
     // Get the directory of the base path
     let base_dir = base.rsplit_once('/').map_or("", |(dir, _)| dir);
@@ -431,6 +450,21 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_percent_encoded_relative() {
+        // Percent-escapes in content hrefs decode to literal archive names.
+        let result = resolve_relative_path("OEBPS/text/ch1.xhtml", "my%20image.png");
+        assert_eq!(result, "OEBPS/text/my image.png");
+
+        // Path and fragment decoded independently; separator preserved.
+        let result = resolve_relative_path("OEBPS/ch1.xhtml", "ch%202.xhtml#sec%201");
+        assert_eq!(result, "OEBPS/ch 2.xhtml#sec 1");
+
+        // The base is a literal archive name: a '%' in it is never re-decoded.
+        let result = resolve_relative_path("OEBPS/100%/ch1.xhtml", "next.xhtml");
+        assert_eq!(result, "OEBPS/100%/next.xhtml");
+    }
+
+    #[test]
     fn test_resolve_url_unchanged() {
         let result = resolve_relative_path("text/chapter.xhtml", "https://example.com/");
         assert_eq!(result, "https://example.com/");
@@ -442,8 +476,8 @@ mod tests {
             chapters: HashMap<u32, String>,
             assets: HashMap<String, Vec<u8>>,
             asset_list: Vec<String>,
-            css_cache: HashMap<String, Arc<Stylesheet>>,
-            css_loads: usize,
+            css_cache: std::sync::Mutex<HashMap<String, Arc<Stylesheet>>>,
+            css_loads: std::sync::atomic::AtomicUsize,
             metadata: Metadata,
             toc: Vec<TocEntry>,
             landmarks: Vec<Landmark>,
@@ -464,10 +498,6 @@ mod tests {
                 &self.toc
             }
 
-            fn toc_mut(&mut self) -> &mut [TocEntry] {
-                &mut self.toc
-            }
-
             fn landmarks(&self) -> &[Landmark] {
                 &self.landmarks
             }
@@ -480,7 +510,7 @@ mod tests {
                 self.source_ids.get(id.0 as usize).map(|s| s.as_str())
             }
 
-            fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
+            fn load_raw(&self, id: ChapterId) -> crate::Result<Vec<u8>> {
                 self.chapters
                     .get(&id.0)
                     .map(|s| s.as_bytes().to_vec())
@@ -493,26 +523,28 @@ mod tests {
                 &self.asset_list
             }
 
-            fn load_asset(&mut self, path: &str) -> crate::Result<Vec<u8>> {
+            fn load_asset(&self, path: &str) -> crate::Result<Vec<u8>> {
                 self.assets.get(path).cloned().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "asset not found").into()
                 })
             }
 
-            fn load_stylesheet(&mut self, path: &str) -> Option<Arc<Stylesheet>> {
-                if let Some(sheet) = self.css_cache.get(path) {
+            fn load_stylesheet(&self, path: &str) -> Option<Arc<Stylesheet>> {
+                let mut cache = self.css_cache.lock().unwrap();
+                if let Some(sheet) = cache.get(path) {
                     return Some(Arc::clone(sheet));
                 }
                 let css_bytes = self.load_asset(path).ok()?;
                 let css_str = String::from_utf8_lossy(&css_bytes);
                 let sheet = Arc::new(Stylesheet::parse(&css_str));
-                self.css_cache.insert(path.to_string(), sheet.clone());
-                self.css_loads += 1;
+                cache.insert(path.to_string(), sheet.clone());
+                self.css_loads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Some(sheet)
             }
         }
 
-        let mut importer = TestImporter {
+        let importer = TestImporter {
             chapters: HashMap::from([
                 (
                     0,
@@ -530,8 +562,8 @@ mod tests {
                 b"p { color: red; }".to_vec(),
             )]),
             asset_list: vec!["text/style.css".to_string()],
-            css_cache: HashMap::new(),
-            css_loads: 0,
+            css_cache: std::sync::Mutex::new(HashMap::new()),
+            css_loads: std::sync::atomic::AtomicUsize::new(0),
             metadata: Metadata::default(),
             toc: Vec::new(),
             landmarks: Vec::new(),
@@ -551,7 +583,12 @@ mod tests {
         let _ = importer.load_chapter(ChapterId(0)).unwrap();
         let _ = importer.load_chapter(ChapterId(1)).unwrap();
 
-        assert_eq!(importer.css_loads, 1);
+        assert_eq!(
+            importer
+                .css_loads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
@@ -577,10 +614,6 @@ mod tests {
                 &self.toc
             }
 
-            fn toc_mut(&mut self) -> &mut [TocEntry] {
-                &mut self.toc
-            }
-
             fn landmarks(&self) -> &[Landmark] {
                 &self.landmarks
             }
@@ -593,7 +626,7 @@ mod tests {
                 None
             }
 
-            fn load_raw(&mut self, _id: ChapterId) -> crate::Result<Vec<u8>> {
+            fn load_raw(&self, _id: ChapterId) -> crate::Result<Vec<u8>> {
                 Err(io::Error::other("unused").into())
             }
 
@@ -601,17 +634,17 @@ mod tests {
                 &self.asset_list
             }
 
-            fn load_asset(&mut self, _path: &str) -> crate::Result<Vec<u8>> {
+            fn load_asset(&self, _path: &str) -> crate::Result<Vec<u8>> {
                 Err(io::Error::other("load_asset should not be called").into())
             }
 
-            fn load_stylesheet(&mut self, _path: &str) -> Option<Arc<Stylesheet>> {
+            fn load_stylesheet(&self, _path: &str) -> Option<Arc<Stylesheet>> {
                 let css = "@font-face { font-family: Test; src: url(../fonts/test.woff); }";
                 Some(Arc::new(Stylesheet::parse(css)))
             }
         }
 
-        let mut importer = TestImporter {
+        let importer = TestImporter {
             asset_list: vec!["styles/main.css".to_string()],
             metadata: Metadata::default(),
             toc: Vec::new(),

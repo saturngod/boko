@@ -9,8 +9,12 @@ use crate::style::properties::{Color, Length};
 /// Text decoration value (can combine underline and line-through).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TextDecorationValue {
+    /// Whether the `underline` line is present.
     pub underline: bool,
+    /// Whether the `line-through` (strikethrough) line is present.
     pub line_through: bool,
+    /// Whether the `overline` line is present.
+    pub overline: bool,
 }
 
 pub(crate) fn parse_color(input: &mut Parser<'_, '_>) -> Option<Color> {
@@ -293,6 +297,18 @@ pub(crate) fn parse_length(input: &mut Parser<'_, '_>) -> Option<Length> {
     }
 }
 
+/// Parse letter-/word-spacing: a length, or the `normal` reset keyword
+/// (mapped to `Length::Auto`, the unset value — both mean no extra spacing).
+pub(crate) fn parse_spacing(input: &mut Parser<'_, '_>) -> Option<Length> {
+    if input
+        .try_parse(|i| i.expect_ident_matching("normal"))
+        .is_ok()
+    {
+        return Some(Length::Auto);
+    }
+    parse_length(input)
+}
+
 pub(crate) fn parse_integer(input: &mut Parser<'_, '_>) -> Option<u32> {
     if let Ok(Token::Number {
         int_value: Some(v), ..
@@ -311,6 +327,7 @@ pub(crate) fn parse_text_decoration(input: &mut Parser<'_, '_>) -> Option<TextDe
         match token.as_ref() {
             "underline" => result.underline = true,
             "line-through" => result.line_through = true,
+            "overline" => result.overline = true,
             "none" => {}
             _ => continue,
         }
@@ -333,7 +350,10 @@ mod tests {
     fn parses_rgba_and_extended_named_colors() {
         assert_eq!(color("orange"), Some(Color::rgb(255, 165, 0)));
         assert_eq!(color("PURPLE"), Some(Color::rgb(128, 0, 128)));
-        assert_eq!(color("rgba(10, 20, 30, 0.5)"), Some(Color::rgba(10, 20, 30, 128)));
+        assert_eq!(
+            color("rgba(10, 20, 30, 0.5)"),
+            Some(Color::rgba(10, 20, 30, 128))
+        );
         // Modern space + slash-alpha syntax.
         assert_eq!(color("rgb(1 2 3 / 50%)"), Some(Color::rgba(1, 2, 3, 128)));
         // Non-color keywords are not treated as colors.

@@ -16,7 +16,7 @@ fn missing_asset_is_not_found_for_every_format() {
         if !Path::new(path).exists() {
             continue;
         }
-        let mut book = Book::open(path).expect("fixture opens");
+        let book = Book::open(path).expect("fixture opens");
         let err = book
             .load_asset("does/not/exist.xyz")
             .expect_err("missing asset must error");
@@ -54,7 +54,7 @@ fn corrupt_kfx_is_malformed_not_io() {
             "corrupt KFX open should be Malformed, got {e:?}"
         ),
         // If it opens, driving a chapter must surface Malformed, never Io.
-        Ok(mut book) => {
+        Ok(book) => {
             let spine: Vec<_> = book.spine().to_vec();
             for entry in spine {
                 if let Err(e) = book.load_chapter(entry.id) {

@@ -174,13 +174,13 @@ impl ResolvedLinksBuilder {
 /// 2. Calls importer's index_anchors() to build format-specific anchor maps
 /// 3. Walks all chapters, finds Link nodes, resolves via importer
 /// 4. Builds reverse maps for efficient lookup
-pub(crate) fn resolve_book_links(book: &mut crate::book::Book) -> crate::Result<ResolvedLinks> {
+pub(crate) fn resolve_book_links(book: &crate::book::Book) -> crate::Result<ResolvedLinks> {
     let mut builder = ResolvedLinksBuilder::new();
 
     // Step 1: Load all chapters as one batch, so importers with thread-safe
     // IO compile them in parallel (this is usually the first place a cold
     // conversion touches every chapter).
-    let spine: Vec<_> = book.spine().to_vec();
+    let spine = book.spine();
     let spine_ids: Vec<ChapterId> = spine.iter().map(|e| e.id).collect();
     let chapters: Vec<(ChapterId, Arc<Chapter>)> = spine_ids
         .iter()

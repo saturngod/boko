@@ -14,7 +14,10 @@ mod style_pool;
 mod to_css;
 mod types;
 
-// Re-export the ToCss trait
+/// Serialize a style value back to its CSS text representation.
+///
+/// Implemented by all property value types and by `ComputedStyle` itself
+/// (which emits only non-default properties).
 pub trait ToCss {
     /// Write this value as CSS to the buffer.
     fn to_css(&self, buf: &mut String);
@@ -36,16 +39,17 @@ pub use properties::{
 
 // Re-export core style types
 pub use style_pool::StylePool;
-pub use to_css::{changed_property_value, for_each_changed_property};
-pub use types::{ComputedStyle, StyleId};
+pub use to_css::{changed_property_value, changed_property_value_from, for_each_changed_property};
+pub use types::{AbsFontSize, ComputedStyle, StyleId};
 
 // Re-export declaration type (kept minimal)
 pub use declaration::Declaration;
 
 // Re-export stylesheet types from parse module
-pub use parse::{CssRule, Origin, Specificity, Stylesheet, TextDecorationValue};
+pub use parse::{CssRule, InlineStyle, Origin, Specificity, Stylesheet, TextDecorationValue};
 
 // Re-export cascade function
+pub(crate) use cascade::inherit_from_parent;
 pub use cascade::{CascadeIndex, CascadeScratch, compute_styles, compute_styles_indexed};
 
 // Re-export macro for internal use

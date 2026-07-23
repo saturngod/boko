@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 use zip::ZipArchive;
 
 use crate::dom::Stylesheet;
-use crate::epub::{parse_container_xml, parse_nav_landmarks, parse_ncx, parse_opf};
+use crate::epub::{parse_container_xml, parse_nav_landmarks, parse_nav_toc, parse_ncx, parse_opf};
 use crate::import::{ChapterId, Importer, SpineEntry, resolve_path_based_href};
 use crate::io::{ByteSource, ByteSourceCursor, FileSource};
 use crate::model::{AnchorTarget, Chapter, GlobalNodeId, Landmark, Metadata, TocEntry};
@@ -57,12 +57,17 @@ pub struct EpubImporter {
     /// compilation ([`Importer::load_chapters`]) can share it through `&self`.
     css_cache: RwLock<HashMap<String, Arc<Stylesheet>>>,
 
+    /// Fonts listed in META-INF/encryption.xml as obfuscated, keyed by
+    /// archive path. Deobfuscated transparently in [`load_asset`].
+    obfuscated_fonts: HashMap<String, FontObfuscation>,
+
     // --- Link resolution ---
     /// Maps path (without fragment) -> ChapterId
     path_to_chapter: HashMap<String, ChapterId>,
 
-    /// Maps "path#id" -> GlobalNodeId for fragment resolution
-    anchor_map: HashMap<String, GlobalNodeId>,
+    /// Maps "path#id" -> GlobalNodeId for fragment resolution. Behind a lock
+    /// so `index_anchors` runs through `&self` like every other access.
+    anchor_map: RwLock<HashMap<String, GlobalNodeId>>,
 }
 
 #[derive(Clone, Copy)]
@@ -88,10 +93,6 @@ impl Importer for EpubImporter {
         &self.toc
     }
 
-    fn toc_mut(&mut self) -> &mut [TocEntry] {
-        &mut self.toc
-    }
-
     fn landmarks(&self) -> &[Landmark] {
         &self.landmarks
     }
@@ -104,7 +105,7 @@ impl Importer for EpubImporter {
         self.spine_paths.get(id.0 as usize).map(|s| s.as_str())
     }
 
-    fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
+    fn load_raw(&self, id: ChapterId) -> crate::Result<Vec<u8>> {
         let path = self
             .spine_paths
             .get(id.0 as usize)
@@ -118,46 +119,33 @@ impl Importer for EpubImporter {
         &self.assets
     }
 
-    fn load_asset(&mut self, path: &str) -> crate::Result<Vec<u8>> {
-        self.read_entry(path)
-    }
-
-    fn load_stylesheet(&mut self, path: &str) -> Option<Arc<Stylesheet>> {
-        self.load_stylesheet_shared(path)
-    }
-
-    fn load_chapters(&mut self, ids: &[ChapterId]) -> Vec<crate::Result<Chapter>> {
-        // Everything a chapter load needs is `&self` here (random-access ZIP
-        // reads, the locked CSS cache), so chapters compile in parallel: the
-        // HTML parse + CSS cascade + IR transform dominate cold conversion.
-        let load_one = |id: &ChapterId| -> crate::Result<Chapter> {
-            let path =
-                self.spine_paths
-                    .get(id.0 as usize)
-                    .ok_or_else(|| crate::Error::NotFound {
-                        what: format!("chapter {}", id.0),
-                    })?;
-            let html_bytes = self.read_entry(path)?;
-            Ok(crate::import::compile_chapter_html(
-                &html_bytes,
-                Some(path),
-                &mut |css_path| self.load_stylesheet_shared(css_path),
-            ))
-        };
-
-        #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-        {
-            use rayon::prelude::*;
-            ids.par_iter().map(load_one).collect()
+    fn load_asset(&self, path: &str) -> crate::Result<Vec<u8>> {
+        let data = self.read_entry(path)?;
+        if let Some(obfuscation) = self.obfuscated_fonts.get(path) {
+            return Ok(deobfuscate_font(data, obfuscation));
         }
-        #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+        Ok(data)
+    }
+
+    fn load_stylesheet(&self, path: &str) -> Option<Arc<Stylesheet>> {
+        if let Ok(cache) = self.css_cache.read()
+            && let Some(sheet) = cache.get(path)
         {
-            ids.iter().map(load_one).collect()
+            return Some(Arc::clone(sheet));
+        }
+        let css_bytes = self.read_entry(path).ok()?;
+        let css_str = String::from_utf8_lossy(&css_bytes);
+        let sheet = Arc::new(Stylesheet::parse(&css_str));
+        // Two threads may race to parse the same sheet; the first insert wins
+        // so every chapter ends up sharing one Arc.
+        match self.css_cache.write() {
+            Ok(mut cache) => Some(Arc::clone(cache.entry(path.to_string()).or_insert(sheet))),
+            Err(_) => Some(sheet),
         }
     }
 
-    fn index_anchors(&mut self, chapters: &[(ChapterId, Arc<Chapter>)]) {
-        self.anchor_map.clear();
+    fn index_anchors(&self, chapters: &[(ChapterId, Arc<Chapter>)]) {
+        let mut anchor_map = HashMap::new();
 
         for (chapter_id, chapter) in chapters {
             // Get the chapter's source path
@@ -170,10 +158,13 @@ impl Importer for EpubImporter {
             for node_id in chapter.iter_dfs() {
                 if let Some(id) = chapter.semantics.id(node_id) {
                     let key = format!("{}#{}", chapter_path, id);
-                    self.anchor_map
-                        .insert(key, GlobalNodeId::new(*chapter_id, node_id));
+                    anchor_map.insert(key, GlobalNodeId::new(*chapter_id, node_id));
                 }
             }
+        }
+
+        if let Ok(mut map) = self.anchor_map.write() {
+            *map = anchor_map;
         }
     }
 
@@ -183,7 +174,7 @@ impl Importer for EpubImporter {
             from_path,
             href,
             |p| self.path_to_chapter.get(p).copied(),
-            |k| self.anchor_map.get(k).copied(),
+            |k| self.anchor_map.read().ok().and_then(|m| m.get(k).copied()),
         )
     }
 }
@@ -211,7 +202,11 @@ impl EpubImporter {
                     compression: compression_to_u16(file.compression()),
                 },
             );
-            assets.push(name);
+            // Directory entries are ZIP bookkeeping, not assets; surfacing
+            // them made re-exports reference "files" like `OEBPS/images/`.
+            if !name.ends_with('/') {
+                assets.push(name);
+            }
         }
 
         // 2. Find OPF path from container.xml
@@ -229,33 +224,55 @@ impl EpubImporter {
         let opf_str = crate::util::decode_text(&opf_bytes, hint_encoding);
         let opf = parse_opf(&opf_str)?;
 
-        // 4. Build spine
+        // 4. Build spine. Manifest hrefs are URLs (may be percent-encoded);
+        // archive entry names are literal, so decode at this join point.
         let mut spine = Vec::new();
         let mut spine_paths = Vec::new();
 
-        for (i, spine_id) in opf.spine_ids.iter().enumerate() {
+        for spine_id in &opf.spine_ids {
             if let Some((href, _media_type)) = opf.manifest.get(spine_id) {
-                let full_path = format!("{}{}", opf_base, href);
+                let full_path = crate::import::resolve_relative_path(&opf_path, href);
                 let size_estimate = zip_index
                     .get(&full_path)
                     .map(|loc| loc.compressed_size as usize)
                     .unwrap_or(0);
 
                 spine.push(SpineEntry {
-                    id: ChapterId(i as u32),
+                    // Id by position in spine_paths, not the itemref index: a
+                    // dangling idref (no manifest entry) is skipped, and using
+                    // the raw index would desync every later ChapterId from
+                    // its path in spine_paths.
+                    id: ChapterId(spine_paths.len() as u32),
                     size_estimate,
                 });
                 spine_paths.push(full_path);
             }
         }
 
-        // 5. Parse TOC (NCX)
-        let toc = if let Some(ncx_href) = &opf.ncx_href {
-            let ncx_path = format!("{}{}", opf_base, ncx_href);
+        // Load the EPUB 3 nav document once, if declared: it serves both the
+        // TOC fallback (step 5) and landmarks (step 6).
+        let nav_str: Option<String> = opf.nav_href.as_ref().and_then(|nav_href| {
+            let nav_path = crate::import::resolve_relative_path(&opf_path, nav_href);
+            read_entry(&source, &zip_index, &nav_path)
+                .ok()
+                .map(|nav_bytes| {
+                    let hint_encoding = crate::util::extract_xml_encoding(&nav_bytes);
+                    crate::util::decode_text(&nav_bytes, hint_encoding).into_owned()
+                })
+        });
+
+        // 5. Parse TOC. The NCX is used when it yields entries (existing
+        // behavior, kept for dual-TOC books to avoid churn); EPUB 3 makes the
+        // nav document canonical and the NCX optional, so books without a
+        // usable NCX fall back to `<nav epub:type="toc">`.
+        let mut toc = if let Some(ncx_href) = &opf.ncx_href {
+            let ncx_path = crate::import::resolve_relative_path(&opf_path, ncx_href);
             if let Ok(ncx_bytes) = read_entry(&source, &zip_index, &ncx_path) {
                 let hint_encoding = crate::util::extract_xml_encoding(&ncx_bytes);
                 let ncx_str = crate::util::decode_text(&ncx_bytes, hint_encoding);
-                let toc_entries = parse_ncx(&ncx_str)?;
+                // Navigation is auxiliary: a malformed NCX degrades to an
+                // empty TOC (like a missing one) instead of failing the open.
+                let toc_entries = parse_ncx(&ncx_str).unwrap_or_default();
                 // Prepend base path to hrefs (NCX uses relative paths)
                 prepend_base_to_toc(&toc_entries, &opf_base)
             } else {
@@ -264,24 +281,25 @@ impl EpubImporter {
         } else {
             Vec::new()
         };
+        if toc.is_empty()
+            && let Some(nav_str) = &nav_str
+        {
+            // Same leniency as the NCX: a malformed nav document must not
+            // fail the whole book.
+            let toc_entries = parse_nav_toc(nav_str).unwrap_or_default();
+            toc = prepend_base_to_toc(&toc_entries, &opf_base);
+        }
 
         // 6. Parse landmarks from EPUB 3 nav document
-        let landmarks = if let Some(nav_href) = &opf.nav_href {
-            let nav_path = format!("{}{}", opf_base, nav_href);
-            if let Ok(nav_bytes) = read_entry(&source, &zip_index, &nav_path) {
-                let hint_encoding = crate::util::extract_xml_encoding(&nav_bytes);
-                let nav_str = crate::util::decode_text(&nav_bytes, hint_encoding);
-                let mut parsed = parse_nav_landmarks(&nav_str)?;
-                // Prepend base path to hrefs (nav uses relative paths)
-                for landmark in &mut parsed {
-                    if !landmark.href.starts_with('#') && !landmark.href.is_empty() {
-                        landmark.href = format!("{}{}", opf_base, landmark.href);
-                    }
+        let landmarks = if let Some(nav_str) = &nav_str {
+            let mut parsed = parse_nav_landmarks(nav_str).unwrap_or_default();
+            // Prepend base path to hrefs (nav uses relative, URL-encoded paths)
+            for landmark in &mut parsed {
+                if !landmark.href.starts_with('#') && !landmark.href.is_empty() {
+                    landmark.href = crate::import::resolve_relative_path(&opf_path, &landmark.href);
                 }
-                parsed
-            } else {
-                Vec::new()
             }
+            parsed
         } else {
             Vec::new()
         };
@@ -296,14 +314,25 @@ impl EpubImporter {
 
         // Resolve cover_image to an absolute (zip-relative) path so it matches
         // asset keys downstream. The OPF parser leaves it as a manifest href
-        // relative to opf_base.
+        // relative to opf_base; like all manifest hrefs it may be
+        // percent-encoded while asset keys are literal.
         let mut metadata = opf.metadata;
         if let Some(ref href) = metadata.cover_image
             && !href.is_empty()
-            && !opf_base.is_empty()
         {
-            metadata.cover_image = Some(format!("{}{}", opf_base, href));
+            metadata.cover_image = Some(crate::import::resolve_relative_path(&opf_path, href));
         }
+
+        // Font obfuscation manifest (META-INF/encryption.xml), if any. Every
+        // dc:identifier is a key candidate: the obfuscation key derives from
+        // the package unique-identifier, which is not always the first (or
+        // only) identifier declared.
+        let obfuscated_fonts = read_entry(&source, &zip_index, "META-INF/encryption.xml")
+            .map(|xml| {
+                let identifiers = collect_identifiers(&opf_str);
+                parse_encryption_xml(&xml, &identifiers, &opf_base)
+            })
+            .unwrap_or_default();
 
         Ok(Self {
             source,
@@ -315,34 +344,15 @@ impl EpubImporter {
             spine_paths,
             assets,
             path_to_chapter,
-            anchor_map: HashMap::new(),
+            anchor_map: RwLock::new(HashMap::new()),
             css_cache: RwLock::new(HashMap::new()),
+            obfuscated_fonts,
         })
     }
 
     /// Read and decompress a ZIP entry by path.
     fn read_entry(&self, path: &str) -> crate::Result<Vec<u8>> {
         read_entry(&self.source, &self.zip_index, path)
-    }
-
-    /// Load and cache a parsed stylesheet through `&self`, so both the
-    /// `&mut self` trait method and parallel chapter compilation share the
-    /// same cache.
-    fn load_stylesheet_shared(&self, path: &str) -> Option<Arc<Stylesheet>> {
-        if let Ok(cache) = self.css_cache.read()
-            && let Some(sheet) = cache.get(path)
-        {
-            return Some(Arc::clone(sheet));
-        }
-        let css_bytes = self.read_entry(path).ok()?;
-        let css_str = String::from_utf8_lossy(&css_bytes);
-        let sheet = Arc::new(Stylesheet::parse(&css_str));
-        // Two threads may race to parse the same sheet; the first insert wins
-        // so every chapter ends up sharing one Arc.
-        match self.css_cache.write() {
-            Ok(mut cache) => Some(Arc::clone(cache.entry(path.to_string()).or_insert(sheet))),
-            Err(_) => Some(sheet),
-        }
     }
 }
 
@@ -383,6 +393,198 @@ fn read_entry(
     }
 }
 
+// ============================================================================
+// Font deobfuscation (OCF §Resource Obfuscation)
+// ============================================================================
+
+/// How an asset is obfuscated: candidate XOR keys (one per identifier the
+/// key could derive from) and how many leading bytes they cover.
+pub(crate) struct FontObfuscation {
+    candidates: Vec<Vec<u8>>,
+    prefix_len: usize,
+}
+
+const IDPF_ALGORITHM: &str = "http://www.idpf.org/2008/embedding";
+const ADOBE_ALGORITHM: &str = "http://ns.adobe.com/pdf/enc#RC";
+
+/// Every dc:identifier value in the OPF. The obfuscation key derives from
+/// the package unique-identifier, which is not reliably the first
+/// identifier, so all of them become key candidates (validated by font
+/// magic on use).
+fn collect_identifiers(opf_str: &str) -> Vec<String> {
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+
+    let mut reader = Reader::from_str(opf_str);
+    let mut identifiers = Vec::new();
+    let mut in_identifier = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) if e.name().local_name().as_ref() == b"identifier" => {
+                in_identifier = true;
+            }
+            Ok(Event::Text(t)) if in_identifier => {
+                let text = t.xml_content().unwrap_or_default().trim().to_string();
+                if !text.is_empty() {
+                    identifiers.push(text);
+                }
+            }
+            Ok(Event::End(e)) if e.name().local_name().as_ref() == b"identifier" => {
+                in_identifier = false;
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    identifiers
+}
+
+/// Parse META-INF/encryption.xml into a path → obfuscation map.
+///
+/// Only the two font-obfuscation schemes are handled (IDPF and Adobe);
+/// entries with other algorithms (true DRM) are ignored — those assets pass
+/// through untouched, as before. Each referenced URI is indexed both as
+/// written (container-root-relative per spec) and resolved against the OPF
+/// directory (a common real-world deviation).
+fn parse_encryption_xml(
+    xml: &[u8],
+    identifiers: &[String],
+    opf_base: &str,
+) -> HashMap<String, FontObfuscation> {
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+
+    let content = String::from_utf8_lossy(xml);
+    let mut reader = Reader::from_str(&content);
+
+    let mut fonts = HashMap::new();
+    let mut current_algorithm: Option<&'static str> = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let name = e.name();
+                let local = name.local_name();
+                if local.as_ref() == b"EncryptionMethod" {
+                    current_algorithm = e.attributes().flatten().find_map(|a| {
+                        if a.key.local_name().as_ref() != b"Algorithm" {
+                            return None;
+                        }
+                        let value: &[u8] = &a.value;
+                        match value {
+                            v if v == IDPF_ALGORITHM.as_bytes() => Some(IDPF_ALGORITHM),
+                            v if v == ADOBE_ALGORITHM.as_bytes() => Some(ADOBE_ALGORITHM),
+                            _ => None,
+                        }
+                    });
+                } else if local.as_ref() == b"CipherReference"
+                    && let Some(algorithm) = current_algorithm
+                    && let Some(uri) = e.attributes().flatten().find_map(|a| {
+                        (a.key.local_name().as_ref() == b"URI")
+                            .then(|| String::from_utf8_lossy(&a.value).to_string())
+                    })
+                {
+                    // URIs may be percent-encoded; archive names are literal.
+                    let path = percent_encoding::percent_decode_str(&uri)
+                        .decode_utf8_lossy()
+                        .to_string();
+                    let (candidates, prefix_len): (Vec<Vec<u8>>, usize) = match algorithm {
+                        IDPF_ALGORITHM => {
+                            (identifiers.iter().map(|id| idpf_key(id)).collect(), 1040)
+                        }
+                        _ => (
+                            identifiers.iter().filter_map(|id| adobe_key(id)).collect(),
+                            1024,
+                        ),
+                    };
+                    let candidates: Vec<Vec<u8>> =
+                        candidates.into_iter().filter(|k| !k.is_empty()).collect();
+                    if !candidates.is_empty() {
+                        for key_path in [path.clone(), format!("{opf_base}{path}")] {
+                            fonts.insert(
+                                key_path,
+                                FontObfuscation {
+                                    candidates: candidates.clone(),
+                                    prefix_len,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(e)) if e.name().local_name().as_ref() == b"EncryptedData" => {
+                current_algorithm = None;
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    fonts
+}
+
+/// IDPF key: SHA-1 of the unique identifier with whitespace removed.
+fn idpf_key(identifier: &str) -> Vec<u8> {
+    let cleaned: String = identifier
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '\t' | '\r' | '\n'))
+        .collect();
+    if cleaned.is_empty() {
+        return Vec::new();
+    }
+    sha1_smol::Sha1::from(cleaned.as_bytes())
+        .digest()
+        .bytes()
+        .to_vec()
+}
+
+/// Adobe key: the 16 bytes of the identifier's UUID (hex digits only).
+fn adobe_key(identifier: &str) -> Option<Vec<u8>> {
+    let hex: String = identifier
+        .rsplit(':')
+        .next()
+        .unwrap_or(identifier)
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    (0..16)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+        .collect()
+}
+
+const FONT_MAGICS: [&[u8]; 6] = [
+    &[0x00, 0x01, 0x00, 0x00], // TrueType
+    b"OTTO",                   // CFF OpenType
+    b"true",                   // legacy TrueType
+    b"ttcf",                   // TrueType collection
+    b"wOFF",
+    b"wOF2",
+];
+
+/// XOR the obfuscated prefix back to plain bytes, trying each candidate key
+/// until the result looks like a font. If none do, the key derives from an
+/// identifier that is no longer in the OPF and the original bytes are
+/// returned unchanged — no worse than before.
+fn deobfuscate_font(data: Vec<u8>, obfuscation: &FontObfuscation) -> Vec<u8> {
+    // Already plain? Some books list unobfuscated fonts in encryption.xml.
+    if FONT_MAGICS.iter().any(|magic| data.starts_with(magic)) {
+        return data;
+    }
+    let end = obfuscation.prefix_len.min(data.len());
+    for key in &obfuscation.candidates {
+        let mut attempt = data.clone();
+        for (i, byte) in attempt[..end].iter_mut().enumerate() {
+            *byte ^= key[i % key.len()];
+        }
+        if FONT_MAGICS.iter().any(|magic| attempt.starts_with(magic)) {
+            return attempt;
+        }
+    }
+    data
+}
+
 fn compression_to_u16(method: zip::CompressionMethod) -> u16 {
     match method {
         zip::CompressionMethod::Stored => 0,
@@ -391,15 +593,20 @@ fn compression_to_u16(method: zip::CompressionMethod) -> u16 {
     }
 }
 
-/// Prepend base path to TOC entry hrefs (NCX uses relative paths).
+/// Prepend base path to TOC entry hrefs (NCX/nav use relative paths).
+///
+/// TOC hrefs are URLs: percent-escapes are decoded here (path and fragment
+/// separately) so the stored hrefs match literal archive entry names.
 fn prepend_base_to_toc(entries: &[TocEntry], base: &str) -> Vec<TocEntry> {
     entries
         .iter()
         .map(|entry| {
-            let href = if entry.href.starts_with('#') || entry.href.is_empty() {
+            let href = if entry.href.is_empty() {
                 entry.href.clone()
+            } else if entry.href.starts_with('#') {
+                crate::util::percent_decode_href(&entry.href).into_owned()
             } else {
-                format!("{}{}", base, entry.href)
+                crate::import::resolve_relative_path(base, &entry.href)
             };
             TocEntry {
                 title: entry.title.clone(),

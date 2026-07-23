@@ -36,20 +36,30 @@
 //! # Ok::<(), boko::Error>(())
 //! ```
 
+#![warn(missing_docs)]
+
 mod book;
-pub mod dom;
+pub(crate) mod dom;
 pub mod error;
 pub mod export;
 pub mod import;
-pub mod io;
-pub mod markdown;
+pub(crate) mod io;
+pub(crate) mod markdown;
+pub mod math;
 pub mod model;
+pub mod optimize;
 mod resolved;
 pub mod style;
 
-pub mod epub;
+pub(crate) mod epub;
+/// KFX format internals (Ion codec, container layout, symbol tables).
+///
+/// Exposed for boko's own tooling (`boko kfx-dump`, fuzz targets, fixture
+/// generators) — **not** part of the stable API; contents may change in any
+/// release without a major-version bump.
+#[doc(hidden)]
 pub mod kfx;
-pub mod mobi;
+pub(crate) mod mobi;
 
 pub(crate) mod util;
 

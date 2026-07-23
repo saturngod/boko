@@ -11,7 +11,7 @@ use crate::model::{AnchorTarget, Chapter, GlobalNodeId, NodeId, ResolvedLinks, R
 use crate::style::Display;
 use crate::util::strip_ebook_chars;
 
-use super::escape::escape_markdown;
+use super::escape::escape_markdown_at;
 use super::escape::{calculate_fence_length, calculate_inline_code_ticks};
 
 /// Result of rendering a chapter to markdown.
@@ -257,7 +257,10 @@ impl<'a> RenderContext<'a> {
 
             Role::Heading(level) => {
                 self.start_block();
-                for _ in 0..level {
+                // Clamp defensively: CommonMark only knows ATX levels 1..=6.
+                // Level 0 would emit a bare paragraph and 7+ a literal
+                // `#######` run, silently demoting the heading.
+                for _ in 0..level.clamp(1, 6) {
                     self.output.push('#');
                 }
                 self.output.push(' ');
@@ -391,7 +394,9 @@ impl<'a> RenderContext<'a> {
                 } else {
                     self.output.push('[');
                     self.walk_children(id);
-                    self.output.push_str(&format!("]({})", anchor));
+                    self.output.push_str("](");
+                    self.output.push_str(&format_link_destination(&anchor));
+                    self.output.push(')');
                 }
             }
 
@@ -399,7 +404,13 @@ impl<'a> RenderContext<'a> {
                 self.start_block();
                 let alt = self.chapter.semantics.alt(id).unwrap_or("image");
                 let src = self.chapter.semantics.src(id).unwrap_or("");
-                self.output.push_str(&format!("![{}]({})", alt, src));
+                // The alt goes inside `[...]`, so escape `]`/`[`/backslash or
+                // it terminates the label early; the src goes inside `(...)`.
+                self.output.push_str("![");
+                self.output.push_str(&escape_link_text(alt));
+                self.output.push_str("](");
+                self.output.push_str(&format_link_destination(src));
+                self.output.push(')');
                 self.end_block(role);
             }
 
@@ -415,7 +426,37 @@ impl<'a> RenderContext<'a> {
 
             Role::Table => {
                 self.start_block();
-                let rows: Vec<NodeId> = self.chapter.children(id).collect();
+                // The optimizer (normalize_table_structure) wraps rows in
+                // TableHead/TableBody, so descend one level into section
+                // wrappers when collecting rows. Header rows are emitted
+                // first regardless of section order in the tree.
+                let mut header_rows: Vec<NodeId> = Vec::new();
+                let mut body_rows: Vec<NodeId> = Vec::new();
+                for child_id in self.chapter.children(id) {
+                    let Some(child) = self.chapter.node(child_id) else {
+                        continue;
+                    };
+                    match child.role {
+                        Role::TableHead => {
+                            header_rows.extend(self.chapter.children(child_id));
+                        }
+                        Role::TableBody => {
+                            body_rows.extend(self.chapter.children(child_id));
+                        }
+                        Role::TableRow => body_rows.push(child_id),
+                        _ => {}
+                    }
+                }
+                // GFM requires a delimiter row after the header so parsers
+                // recognize the block as a table rather than plain text.
+                // Rows from TableHead are the header; without a head, the
+                // first row serves as the header.
+                let header_count = if header_rows.is_empty() {
+                    1
+                } else {
+                    header_rows.len()
+                };
+                let rows: Vec<NodeId> = header_rows.into_iter().chain(body_rows).collect();
                 for (i, row_id) in rows.iter().enumerate() {
                     let cells = self.table_cells(*row_id);
                     self.ensure_line_started();
@@ -423,9 +464,7 @@ impl<'a> RenderContext<'a> {
                     self.output.push_str(&cells.join(" | "));
                     self.output.push_str(" |");
                     self.write_newline();
-                    // GFM requires a delimiter row after the header so parsers
-                    // recognize the block as a table rather than plain text.
-                    if i == 0 {
+                    if i + 1 == header_count {
                         self.ensure_line_started();
                         self.output.push('|');
                         for _ in 0..cells.len().max(1) {
@@ -468,7 +507,11 @@ impl<'a> RenderContext<'a> {
 
             Role::Footnote => {
                 self.ensure_line_started();
-                let text = self.collect_text(id);
+                // Escape like body text: the content is emitted verbatim after
+                // `[^n]:`, so unescaped `*`/`` ` ``/`[` would be interpreted as
+                // markdown. Newlines are flattened since the definition is one
+                // line.
+                let text = escape_markdown_at(&self.collect_text(id), false).replace('\n', " ");
                 let note_num = self.footnote_start + self.footnotes.len() + 1;
                 self.footnotes.push(Footnote {
                     number: note_num,
@@ -587,22 +630,60 @@ impl<'a> RenderContext<'a> {
                 self.end_block(role);
             }
 
+            Role::Math => {
+                // Clone the rendered LaTeX out first so the chapter borrow is
+                // dropped before the mutable writes below.
+                let Some((display, body)) = self
+                    .chapter
+                    .math
+                    .get(&id)
+                    .map(|m| (m.display, crate::math::latex::to_latex_body(&m.expr)))
+                else {
+                    return;
+                };
+                if display {
+                    // GitHub renders a `$$…$$` block as display math.
+                    self.start_block();
+                    if !self.at_line_start {
+                        self.write_newline();
+                    }
+                    self.ensure_line_started();
+                    self.output.push_str("$$");
+                    self.write_newline();
+                    for line in body.lines() {
+                        self.ensure_line_started();
+                        self.output.push_str(line);
+                        self.write_newline();
+                    }
+                    self.ensure_line_started();
+                    self.output.push_str("$$");
+                    self.end_block(role);
+                } else {
+                    self.ensure_line_started();
+                    self.output.push('$');
+                    self.output.push_str(&body);
+                    self.output.push('$');
+                }
+            }
+
             Role::Container | Role::Root | Role::TableHead | Role::TableBody => {
                 self.walk_children(id);
             }
         }
     }
 
-    /// Collect the cell texts of a table row, escaped for a GFM table cell
-    /// (pipes escaped, newlines flattened to spaces).
+    /// Collect the cell texts of a table row, escaped for a GFM table cell:
+    /// full markdown escaping (so `_italic_`, `` `code` ``, `<tag>`, `#` are
+    /// all handled like body text) plus the table-specific pipe escape and
+    /// newline flattening.
     fn table_cells(&mut self, row_id: NodeId) -> Vec<String> {
         let cell_ids: Vec<NodeId> = self.chapter.children(row_id).collect();
         cell_ids
             .into_iter()
             .map(|cell| {
-                self.collect_text(cell)
-                    .replace('|', "\\|")
-                    .replace('\n', " ")
+                // escape_markdown_at already escapes `|`; only the newline
+                // flatten is table-specific.
+                escape_markdown_at(&self.collect_text(cell), false).replace('\n', " ")
             })
             .collect()
     }
@@ -621,6 +702,12 @@ impl<'a> RenderContext<'a> {
     }
 
     fn write_text(&mut self, text: &str) {
+        // Whether this chunk lands at a block-start position: no inline
+        // content has been written on the current line yet (only the line
+        // prefix and/or block markers like `- ` or `> `, after which
+        // markdown still recognizes list/heading markers). Line-start-only
+        // characters are escaped only in that position.
+        let at_line_start = !self.has_line_content;
         self.ensure_line_started();
 
         let text = strip_ebook_chars(text);
@@ -642,7 +729,7 @@ impl<'a> RenderContext<'a> {
         }
 
         let joined = words.join(" ");
-        let escaped = escape_markdown(&joined);
+        let escaped = escape_markdown_at(&joined, at_line_start);
         self.output.push_str(&escaped);
         self.has_line_content = true;
 
@@ -664,7 +751,7 @@ impl<'a> RenderContext<'a> {
     fn collect_text_inner(&self, id: NodeId, verbatim: bool) -> String {
         let mut result = String::new();
         self.collect_text_recursive(id, &mut result, verbatim);
-        strip_ebook_chars(&result)
+        strip_ebook_chars(&result).into_owned()
     }
 
     fn collect_text_recursive(&self, id: NodeId, result: &mut String, verbatim: bool) {
@@ -700,6 +787,67 @@ impl<'a> RenderContext<'a> {
             self.collect_text_recursive(child_id, result, verbatim);
         }
     }
+}
+
+/// Escape text destined for a link/image label (`[...]`): the brackets and
+/// backslash would otherwise terminate the label early.
+fn escape_link_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '[' | ']' | '\\') {
+            out.push('\\');
+        }
+        if c == '\n' {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Format a link destination for `(...)`. CommonMark allows an unwrapped
+/// destination only when it has no spaces/control chars and balanced parens;
+/// anything else must be `<...>`-wrapped (with `<`, `>`, and `\` escaped
+/// inside the wrap).
+fn format_link_destination(dest: &str) -> String {
+    let needs_wrap =
+        dest.chars().any(|c| c.is_whitespace() || c.is_control()) || !parens_balanced(dest);
+    if !needs_wrap {
+        return dest.to_string();
+    }
+    let mut out = String::with_capacity(dest.len() + 2);
+    out.push('<');
+    for c in dest.chars() {
+        match c {
+            '<' | '>' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            // A literal newline can't appear inside <...>; drop it.
+            '\n' | '\r' => {}
+            _ => out.push(c),
+        }
+    }
+    out.push('>');
+    out
+}
+
+fn parens_balanced(s: &str) -> bool {
+    let mut depth: i32 = 0;
+    for c in s.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 /// Render a single chapter to markdown.
@@ -738,6 +886,45 @@ mod tests {
         let heading_slugs = HashMap::new();
         let result = render_chapter(chapter, ChapterId(0), &resolved, &heading_slugs, 0);
         result.content
+    }
+
+    #[test]
+    fn image_alt_and_src_are_escaped() {
+        let mut chapter = Chapter::new();
+        let img = chapter.alloc_node(Node::new(Role::Image));
+        chapter.append_child(NodeId::ROOT, img);
+        chapter.semantics.set_alt(img, "a [bracket] tag");
+        chapter.semantics.set_src(img, "images/a b(1).png");
+
+        let out = render_to_string(&chapter);
+        // `]` in the alt must be escaped; the spacey/paren src must be wrapped.
+        assert!(out.contains(r"![a \[bracket\] tag]"), "{out}");
+        assert!(out.contains("(<images/a b(1).png>)"), "{out}");
+    }
+
+    #[test]
+    fn footnote_content_is_escaped() {
+        let mut chapter = Chapter::new();
+        let note = chapter.alloc_node(Node::new(Role::Footnote));
+        chapter.append_child(NodeId::ROOT, note);
+        let t = chapter.append_text("see *ibid* [1]");
+        let tn = chapter.alloc_node(Node::text(t));
+        chapter.append_child(note, tn);
+
+        let resolved = ResolvedLinks::default();
+        let slugs = HashMap::new();
+        let result = render_chapter(&chapter, ChapterId(0), &resolved, &slugs, 0);
+        assert_eq!(result.footnotes.len(), 1);
+        assert_eq!(result.footnotes[0].content, r"see \*ibid\* \[1\]");
+    }
+
+    #[test]
+    fn format_link_destination_wraps_spaces_and_unbalanced_parens() {
+        assert_eq!(format_link_destination("simple.png"), "simple.png");
+        assert_eq!(format_link_destination("a b.png"), "<a b.png>");
+        assert_eq!(format_link_destination("bad)paren"), "<bad)paren>");
+        // Balanced parens are legal bare.
+        assert_eq!(format_link_destination("ok(1).png"), "ok(1).png");
     }
 
     #[test]
@@ -876,9 +1063,101 @@ mod tests {
         let resolved = ResolvedLinks::default();
         let heading_slugs = HashMap::new();
         let out = render_chapter(&chapter, ChapterId(0), &resolved, &heading_slugs, 0).content;
-        assert!(out.contains("| A | B\\|C |"), "header + escaped pipe: {out}");
+        assert!(
+            out.contains("| A | B\\|C |"),
+            "header + escaped pipe: {out}"
+        );
         assert!(out.contains("| --- | --- |"), "delimiter row: {out}");
         assert!(out.contains("| 1 | 2 |"), "body row: {out}");
+    }
+
+    #[test]
+    fn table_with_head_body_wrappers_renders_rows() {
+        // The optimizer (normalize_table_structure) wraps rows in
+        // TableHead/TableBody; the renderer must descend into the wrappers
+        // rather than treating them as rows.
+        let mut chapter = Chapter::new();
+        let table = chapter.alloc_node(Node::new(Role::Table));
+        chapter.append_child(NodeId::ROOT, table);
+
+        let head = chapter.alloc_node(Node::new(Role::TableHead));
+        chapter.append_child(table, head);
+        let body = chapter.alloc_node(Node::new(Role::TableBody));
+        chapter.append_child(table, body);
+
+        for (section, cells) in [(head, ["Sample", "Voltage"]), (body, ["A", "1.5"])] {
+            let row = chapter.alloc_node(Node::new(Role::TableRow));
+            chapter.append_child(section, row);
+            for cell in cells {
+                let c = chapter.alloc_node(Node::new(Role::TableCell));
+                chapter.append_child(row, c);
+                let t = chapter.append_text(cell);
+                let tn = chapter.alloc_node(Node::text(t));
+                chapter.append_child(c, tn);
+            }
+        }
+
+        let out = render_to_string(&chapter);
+        let header = out.find("| Sample | Voltage |").expect("header row");
+        let delim = out.find("| --- | --- |").expect("delimiter row");
+        let body_row = out.find("| A | 1.5 |").expect("body row");
+        assert!(header < delim && delim < body_row, "row order: {out}");
+    }
+
+    #[test]
+    fn table_cells_escape_inline_markers() {
+        let mut chapter = Chapter::new();
+        let table = chapter.alloc_node(Node::new(Role::Table));
+        chapter.append_child(NodeId::ROOT, table);
+        let row = chapter.alloc_node(Node::new(Role::TableRow));
+        chapter.append_child(table, row);
+        for cell in ["*star*", "[link]"] {
+            let c = chapter.alloc_node(Node::new(Role::TableCell));
+            chapter.append_child(row, c);
+            let t = chapter.append_text(cell);
+            let tn = chapter.alloc_node(Node::text(t));
+            chapter.append_child(c, tn);
+        }
+
+        let out = render_to_string(&chapter);
+        assert!(out.contains("\\*star\\*"), "star escaped: {out}");
+        // Both brackets are now escaped (full body escaping), which is safe.
+        assert!(out.contains("\\[link\\]"), "bracket escaped: {out}");
+    }
+
+    #[test]
+    fn paragraph_text_resembling_list_markers_is_escaped() {
+        for (text, escaped) in [
+            ("- not a list", "\\- not a list"),
+            ("1. not a list", "1\\. not a list"),
+        ] {
+            let mut chapter = Chapter::new();
+            let p = chapter.alloc_node(Node::new(Role::Paragraph));
+            chapter.append_child(NodeId::ROOT, p);
+            let t = chapter.append_text(text);
+            let tn = chapter.alloc_node(Node::text(t));
+            chapter.append_child(p, tn);
+
+            let out = render_to_string(&chapter);
+            assert!(out.contains(escaped), "expected {escaped:?} in {out:?}");
+        }
+    }
+
+    #[test]
+    fn mid_line_dash_not_escaped_across_chunks() {
+        // Two text nodes on one line: the second begins mid-line, so its
+        // leading dash must not be treated as a list marker.
+        let mut chapter = Chapter::new();
+        let p = chapter.alloc_node(Node::new(Role::Paragraph));
+        chapter.append_child(NodeId::ROOT, p);
+        for text in ["seven ", "- eight"] {
+            let t = chapter.append_text(text);
+            let tn = chapter.alloc_node(Node::text(t));
+            chapter.append_child(p, tn);
+        }
+
+        let out = render_to_string(&chapter);
+        assert!(out.contains("seven - eight"), "no escape mid-line: {out}");
     }
 
     #[test]

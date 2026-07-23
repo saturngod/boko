@@ -1,5 +1,8 @@
 //! Transform ArenaDom to Chapter.
 
+use selectors::Element as _;
+use selectors::bloom::BloomFilter;
+
 use super::arena::{ArenaDom, ArenaNodeData, ArenaNodeId};
 use super::element_ref::ElementRef;
 use super::role_map::element_to_role;
@@ -12,7 +15,8 @@ use crate::style::{
 /// User agent stylesheet (browser defaults).
 const UA_CSS: &str = include_str!("data/styles.css");
 
-pub fn user_agent_stylesheet() -> Stylesheet {
+#[cfg(test)]
+pub(crate) fn user_agent_stylesheet() -> Stylesheet {
     (*user_agent_stylesheet_arc()).clone()
 }
 
@@ -28,6 +32,143 @@ pub(crate) fn user_agent_stylesheet_arc() -> std::sync::Arc<Stylesheet> {
     UA_STYLESHEET.clone()
 }
 
+/// Synthesize CSS declarations from legacy presentational attributes
+/// (`align=`, `valign=`), which many older EPUB/MOBI-derived books rely on.
+/// Per CSS these are presentational hints: they apply before author rules
+/// (any matching selector overrides them) but beat inherited values.
+fn presentational_hints(
+    element: &html5ever::LocalName,
+    attrs: &[crate::dom::arena::Attribute],
+) -> Option<crate::style::InlineStyle> {
+    let name = element.as_ref();
+    let aligned = matches!(
+        name,
+        "p" | "div"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "td"
+            | "th"
+            | "tr"
+            | "table"
+            | "caption"
+            | "tbody"
+            | "thead"
+            | "tfoot"
+            | "center"
+    );
+    let cellish = matches!(name, "td" | "th" | "tr" | "tbody" | "thead" | "tfoot");
+    let font = name == "font";
+    // MOBI-7 spacing convention: height= is vertical space before the
+    // block, width= is the first-line indent.
+    let mobi_spaced = matches!(name, "p" | "div" | "blockquote");
+    if !aligned && !cellish && !font && !mobi_spaced {
+        return None;
+    }
+    let clean_len = |v: &str| {
+        !v.is_empty()
+            && v.len() <= 12
+            && v.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '%' || c == '-')
+    };
+    let mut css = String::new();
+    for attr in attrs {
+        match attr.name.local.as_ref() {
+            "align" if aligned => {
+                let v = attr.value.trim().to_ascii_lowercase();
+                if matches!(v.as_str(), "left" | "right" | "center" | "justify") {
+                    css.push_str("text-align: ");
+                    css.push_str(&v);
+                    css.push(';');
+                }
+            }
+            "valign" if cellish => {
+                let v = attr.value.trim().to_ascii_lowercase();
+                if matches!(v.as_str(), "top" | "middle" | "bottom" | "baseline") {
+                    css.push_str("vertical-align: ");
+                    css.push_str(&v);
+                    css.push(';');
+                }
+            }
+            // Legacy <font> element — the styling mechanism of old MOBI
+            // books (syntax-highlight colors, sized code and headings).
+            "size" if font => {
+                let v = attr.value.trim();
+                // Absolute 1-7 or relative +N/-N from the base size 3,
+                // mapped onto the browser scale.
+                let base: i32 = if let Some(rest) = v.strip_prefix('+') {
+                    3 + rest.parse::<i32>().unwrap_or(0)
+                } else if let Some(rest) = v.strip_prefix('-') {
+                    3 - rest.parse::<i32>().unwrap_or(0)
+                } else {
+                    v.parse().unwrap_or(3)
+                };
+                let em = match base.clamp(1, 7) {
+                    1 => "0.625",
+                    2 => "0.8125",
+                    3 => "1",
+                    4 => "1.125",
+                    5 => "1.5",
+                    6 => "2",
+                    _ => "3",
+                };
+                css.push_str("font-size: ");
+                css.push_str(em);
+                css.push_str("em;");
+            }
+            "color" if font => {
+                let v = attr.value.trim();
+                if !v.is_empty() {
+                    css.push_str("color: ");
+                    css.push_str(v);
+                    css.push(';');
+                }
+            }
+            "face" if font => {
+                let v = attr.value.trim();
+                if !v.is_empty() && v.chars().all(|c| !c.is_control() && c != ';') {
+                    css.push_str("font-family: ");
+                    css.push_str(v);
+                    css.push(';');
+                }
+            }
+            // MOBI-7 convention: a height=/width= attribute marks a
+            // legacy-spaced block — ALL of its vertical spacing comes from
+            // the attribute (paragraphs carry no implicit margins in that
+            // model), so both margins are pinned: top to the attribute
+            // value, bottom to zero.
+            "height" if mobi_spaced => {
+                let v = attr.value.trim();
+                if clean_len(v) {
+                    css.push_str("margin-top: ");
+                    css.push_str(v);
+                    css.push_str(";margin-bottom: 0;");
+                }
+            }
+            "width" if mobi_spaced => {
+                let v = attr.value.trim();
+                if clean_len(v) {
+                    css.push_str("text-indent: ");
+                    css.push_str(v);
+                    css.push_str(";margin-bottom: 0;");
+                    if !attrs.iter().any(|a| a.name.local.as_ref() == "height") {
+                        css.push_str("margin-top: 0;");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if css.is_empty() {
+        return None;
+    }
+    let parsed = crate::style::InlineStyle::parse(&css);
+    (!parsed.is_empty()).then_some(parsed)
+}
+
 /// Context for the transform operation.
 struct TransformContext<'a> {
     dom: &'a ArenaDom,
@@ -35,15 +176,29 @@ struct TransformContext<'a> {
     cascade_index: CascadeIndex<'a>,
     /// Reused across every element of the chapter (candidate buffer + selector caches).
     cascade_scratch: CascadeScratch,
+    /// Ancestor bloom filter for the selectors crate's fast-reject path.
+    /// Invariant: whenever styles are computed for an element, the filter
+    /// contains the hashes of exactly that element's element ancestors (the
+    /// DFS pushes each element before descending into its children and pops
+    /// it after). Only maintained when `use_bloom` is set.
+    bloom: BloomFilter,
+    /// Whether maintaining `bloom` can pay off: false when no selector has
+    /// ancestor requirements (then `None` is passed and matching skips the
+    /// bloom checks entirely).
+    use_bloom: bool,
     chapter: Chapter,
 }
 
 impl<'a> TransformContext<'a> {
     fn new(dom: &'a ArenaDom, stylesheets: &'a [(&'a Stylesheet, Origin)]) -> Self {
+        let cascade_index = CascadeIndex::build(stylesheets);
+        let use_bloom = cascade_index.has_complex_selectors();
         Self {
             dom,
-            cascade_index: CascadeIndex::build(stylesheets),
+            cascade_index,
             cascade_scratch: CascadeScratch::default(),
+            bloom: BloomFilter::new(),
+            use_bloom,
             chapter: Chapter::new(),
         }
     }
@@ -67,15 +222,56 @@ impl<'a> TransformContext<'a> {
             None
         });
 
+        // Seed the ancestor bloom filter with body's element ancestors (html):
+        // the filter must contain every element ancestor of whatever element
+        // styles are computed for, starting with body itself.
+        if self.use_bloom {
+            let mut ancestor = ElementRef::new(self.dom, body).parent_element();
+            while let Some(elem) = ancestor {
+                elem.each_bloom_hash(|hash| self.bloom.insert_hash(hash));
+                ancestor = elem.parent_element();
+            }
+        }
+
+        // Compute html's style first so properties set on the `html` selector
+        // (e.g. `html { color: … }`) inherit into body like in a browser.
+        // No bloom filter here: it is seeded for body's ancestors, not html's.
+        let html_style = self
+            .dom
+            .find_by_tag("html")
+            .filter(|&html_id| html_id != body)
+            .map(|html_id| {
+                let inline = self.inline_style_of(html_id);
+                compute_styles_indexed(
+                    ElementRef::new(self.dom, html_id),
+                    &self.cascade_index,
+                    None,
+                    &mut self.chapter.styles,
+                    &mut self.cascade_scratch,
+                    None,
+                    inline.as_ref(),
+                    None,
+                )
+            });
+
         // Compute body's style so its properties (like hyphens: auto) are inherited
         let mut body_style = {
             let elem_ref = ElementRef::new(self.dom, body);
+            let bloom = if self.use_bloom {
+                Some(&self.bloom)
+            } else {
+                None
+            };
+            let inline = self.inline_style_of(body);
             compute_styles_indexed(
                 elem_ref,
                 &self.cascade_index,
-                None,
+                html_style.as_ref(),
                 &mut self.chapter.styles,
                 &mut self.cascade_scratch,
+                bloom,
+                inline.as_ref(),
+                None,
             )
         };
 
@@ -86,7 +282,13 @@ impl<'a> TransformContext<'a> {
             body_style.language = Some(lang);
         }
 
-        // Process body's children as children of IR root, inheriting body's style
+        // Process body's children as children of IR root, inheriting body's
+        // style. Body becomes an ancestor of everything the DFS styles, so
+        // push it onto the filter first (a no-op when body is the document
+        // node rather than an element).
+        if self.use_bloom {
+            ElementRef::new(self.dom, body).each_bloom_hash(|hash| self.bloom.insert_hash(hash));
+        }
         self.process_children(body, NodeId::ROOT, Some(&body_style), 0);
 
         self.chapter
@@ -106,6 +308,40 @@ impl<'a> TransformContext<'a> {
         let dom = self.dom;
         for child_id in dom.children(dom_parent) {
             self.process_node(child_id, ir_parent, parent_style, depth);
+        }
+    }
+
+    /// Parse the `style` attribute of a DOM element, if present and non-empty.
+    fn inline_style_of(&self, dom_id: ArenaNodeId) -> Option<crate::style::InlineStyle> {
+        let node = self.dom.get(dom_id)?;
+        let ArenaNodeData::Element { attrs, .. } = &node.data else {
+            return None;
+        };
+        attrs
+            .iter()
+            .find(|a| a.name.local.as_ref() == "style" && !a.value.is_empty())
+            .map(|a| crate::style::InlineStyle::parse(&a.value))
+            .filter(|i| !i.is_empty())
+    }
+
+    /// Whether the DOM node's previous and next siblings are both
+    /// inline-level (non-blank text, or an element with an inline role).
+    /// Distinguishes a word separator between inline siblings from
+    /// inter-block indentation.
+    fn flanked_by_inline(&self, dom_id: ArenaNodeId) -> bool {
+        let Some(node) = self.dom.get(dom_id) else {
+            return false;
+        };
+        self.is_inline_level(node.prev_sibling) && self.is_inline_level(node.next_sibling)
+    }
+
+    fn is_inline_level(&self, id: ArenaNodeId) -> bool {
+        match self.dom.get(id).map(|n| &n.data) {
+            Some(ArenaNodeData::Text(t)) => !t.trim().is_empty(),
+            Some(ArenaNodeData::Element { name, .. }) => {
+                crate::dom::optimize::is_inline_role(element_to_role(&name.local))
+            }
+            _ => false,
         }
     }
 
@@ -129,12 +365,27 @@ impl<'a> TransformContext<'a> {
 
         match &node.data {
             ArenaNodeData::Text(text) => {
+                // In pre-like contexts every byte is content, including
+                // whitespace-only nodes: `<pre><span>a</span>\n  <span>b</span>`
+                // relies on that text node for its line structure, so this
+                // check must run before any whitespace-dropping heuristics.
+                let preserve_whitespace = parent_style
+                    .map(|s| {
+                        matches!(
+                            s.white_space,
+                            WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::PreLine
+                        )
+                    })
+                    .unwrap_or(false);
+
                 // Handle whitespace-only text nodes
-                if text.trim().is_empty() {
+                if text.trim().is_empty() && !preserve_whitespace {
+                    // No parent means we're at root level - skip whitespace
+                    if parent_style.is_none() {
+                        return;
+                    }
+
                     // Whitespace between inline elements should be preserved as a single space.
-                    // We preserve whitespace unless:
-                    // 1. We're at the root level (no parent style)
-                    // 2. The whitespace contains newlines and we're in a block context
                     //
                     // This handles cases like: <cite><abbr>A</abbr> <abbr>B</abbr></cite>
                     // where the space between abbrs must be preserved even though cite is block.
@@ -143,14 +394,12 @@ impl<'a> TransformContext<'a> {
                         .map(|s| s.display != Display::Inline)
                         .unwrap_or(true);
 
-                    // Skip pure-whitespace with newlines in block contexts (inter-element whitespace)
-                    // But preserve spaces without newlines (intra-line whitespace between inline elements)
-                    if has_newlines && is_block_parent {
-                        return;
-                    }
-
-                    // No parent means we're at root level - skip whitespace
-                    if parent_style.is_none() {
+                    // Whitespace containing newlines inside a block parent is
+                    // usually inter-element indentation noise — but between
+                    // two inline-level siblings it is a real word separator:
+                    // browsers render `<div><i>A</i>\n<i>B</i></div>` as
+                    // "A B". Drop it only when it touches a block boundary.
+                    if has_newlines && is_block_parent && !self.flanked_by_inline(dom_id) {
                         return;
                     }
 
@@ -161,16 +410,6 @@ impl<'a> TransformContext<'a> {
                     self.chapter.append_child(ir_parent, ir_id);
                     return;
                 }
-
-                // Check if whitespace should be preserved (pre, pre-wrap, pre-line)
-                let preserve_whitespace = parent_style
-                    .map(|s| {
-                        matches!(
-                            s.white_space,
-                            WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::PreLine
-                        )
-                    })
-                    .unwrap_or(false);
 
                 // Normalize whitespace unless we're in a pre-like context.
                 // Both paths append straight into the chapter's text buffer,
@@ -187,14 +426,32 @@ impl<'a> TransformContext<'a> {
             }
 
             ArenaNodeData::Element { name, attrs, .. } => {
-                // Compute style for this element
+                // Compute style for this element. The bloom filter holds the
+                // hashes of this element's ancestors (maintained by the
+                // push/pop around process_children below).
                 let elem_ref = ElementRef::new(self.dom, dom_id);
+                let bloom = if self.use_bloom {
+                    Some(&self.bloom)
+                } else {
+                    None
+                };
+                // Inline style="" declarations join the cascade above every
+                // selector-matched normal declaration.
+                let inline = attrs
+                    .iter()
+                    .find(|a| a.name.local.as_ref() == "style" && !a.value.is_empty())
+                    .map(|a| crate::style::InlineStyle::parse(&a.value))
+                    .filter(|i| !i.is_empty());
+                let hints = presentational_hints(&name.local, attrs.as_slice());
                 let mut computed = compute_styles_indexed(
                     elem_ref,
                     &self.cascade_index,
                     parent_style,
                     &mut self.chapter.styles,
                     &mut self.cascade_scratch,
+                    bloom,
+                    inline.as_ref(),
+                    hints.as_ref(),
                 );
 
                 // Merge lang attribute into style (for KFX language property)
@@ -204,6 +461,51 @@ impl<'a> TransformContext<'a> {
                         computed.language = Some(attr.value.to_string());
                         break;
                     }
+                }
+
+                // MathML: `<math>` (by namespace or local name) becomes a
+                // single `Role::Math` IR leaf whose expression tree lives in
+                // the chapter's `math` side-table. `element_to_role` only
+                // sees the local name, so the namespace test is done here.
+                // We take over the whole subtree — no generic child recursion.
+                if name.ns.as_ref() == crate::math::mathml::MATHML_NS
+                    || name.local.as_ref() == "math"
+                {
+                    if computed.display == Display::None {
+                        return;
+                    }
+                    let mut ir_node = Node::new(Role::Math);
+                    ir_node.style = self.chapter.styles.intern_ref(&computed);
+                    let ir_id = self.chapter.alloc_node(ir_node);
+                    self.chapter.append_child(ir_parent, ir_id);
+                    // Preserve the element id for anchor/link resolution.
+                    for attr in attrs {
+                        if attr.name.local.as_ref() == "id" {
+                            self.chapter.semantics.set_id(ir_id, &attr.value);
+                        }
+                    }
+                    let mut expr = crate::math::mathml::from_mathml(self.dom, dom_id);
+                    // Block context implies display math: a <math> that is
+                    // its parent's only non-whitespace content is a display
+                    // equation even without display="block" (the common
+                    // publisher shape — only ~2% of equations carry the
+                    // attribute in practice).
+                    if !expr.display
+                        && let Some(parent) = self.dom.get(dom_id).map(|n| n.parent)
+                    {
+                        let alone = self.dom.children(parent).all(|c| {
+                            c == dom_id
+                                || self
+                                    .dom
+                                    .text_content(c)
+                                    .is_some_and(|t| t.trim().is_empty())
+                        });
+                        if alone {
+                            expr.display = true;
+                        }
+                    }
+                    self.chapter.math.insert(ir_id, expr);
+                    return;
                 }
 
                 // Map to role first (needed for Break check)
@@ -292,8 +594,17 @@ impl<'a> TransformContext<'a> {
                     self.chapter.semantics.set_header_cell(ir_id, true);
                 }
 
-                // Process children
+                // Process children. This element is an ancestor of its
+                // children, so push its hashes onto the filter around the
+                // recursion (and pop them after, keeping the counting filter
+                // balanced).
+                if self.use_bloom {
+                    elem_ref.each_bloom_hash(|hash| self.bloom.insert_hash(hash));
+                }
                 self.process_children(dom_id, ir_id, Some(&computed), depth + 1);
+                if self.use_bloom {
+                    elem_ref.each_bloom_hash(|hash| self.bloom.remove_hash(hash));
+                }
             }
 
             // Skip other node types

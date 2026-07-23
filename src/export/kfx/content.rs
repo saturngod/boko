@@ -2,13 +2,16 @@ use super::*;
 
 /// Build chapter entities returning them separately for grouped emission.
 ///
-/// Returns (section, storyline, Option<content>) so they can be grouped by type.
+/// Returns (section, storyline). Text content accumulates in the book-global
+/// content chunks (`ExportContext::append_text`); the resulting `$145`
+/// fragments are emitted once after all chapters via
+/// [`build_content_fragments`].
 pub(super) fn build_chapter_entities_grouped(
     chapter: &Chapter,
     chapter_id: ChapterId,
     section_name: &str,
     ctx: &mut ExportContext,
-) -> (KfxFragment, KfxFragment, Option<KfxFragment>) {
+) -> (KfxFragment, KfxFragment) {
     use crate::kfx::storyline::{ir_to_tokens, tokens_to_ion};
 
     // Check if this is a cover chapter (image-only)
@@ -17,17 +20,14 @@ pub(super) fn build_chapter_entities_grouped(
     let is_cover = ctx.cover_fragment_id.is_none() && is_image_only_chapter(chapter);
 
     // =========================================================================
-    // 1. SETUP: Naming for this chapter's entity triad
+    // 1. SETUP: Naming for this chapter's entity pair
     // =========================================================================
     let story_name = format!("story_{}", section_name);
-    let content_name = format!("content_{}", section_name);
 
     let section_name_symbol = ctx.symbols.get_or_intern(section_name);
     let story_name_symbol = ctx.symbols.get_or_intern(&story_name);
-    let content_name_symbol = ctx.symbols.get_or_intern(&content_name);
 
-    // Tell tokens_to_ion what content name to use for references
-    ctx.begin_chapter(&content_name);
+    ctx.begin_chapter();
 
     // Get the section fragment ID assigned during Pass 1
     let section_id = ctx
@@ -35,47 +35,22 @@ pub(super) fn build_chapter_entities_grouped(
         .unwrap_or_else(|| ctx.next_fragment_id());
 
     // =========================================================================
-    // 2. GENERATE: Schema-driven token generation + text/structure split
+    // 2. GENERATE: Schema-driven token generation
     // =========================================================================
-    let (storyline_content_list, content_strings) = if is_cover {
+    let storyline_content_list = if is_cover {
         // For cover chapters, generate flat storyline with direct image
-        let content_list = build_cover_storyline(chapter, ctx);
-        let text = ctx.drain_text();
-        (content_list, text)
+        build_cover_storyline(chapter, ctx)
     } else {
         // Normal chapter: full token-based generation
         let tokens = ir_to_tokens(chapter, ctx);
-        let content_list = tokens_to_ion(&tokens, ctx);
-        let text = ctx.drain_text();
-        (content_list, text)
+        tokens_to_ion(&tokens, ctx)
     };
 
     // =========================================================================
-    // 3. ASSEMBLE: Package into three KFX Entities
+    // 3. ASSEMBLE: Package into two KFX Entities
     // =========================================================================
 
-    // Entity A: CONTENT ($145) - Holds the raw text strings
-    let content_fragment = if !content_strings.is_empty() {
-        let content_ion = IonValue::Struct(vec![
-            (
-                KfxSymbol::Name as u64,
-                IonValue::Symbol(content_name_symbol),
-            ),
-            (
-                KfxSymbol::ContentList as u64,
-                IonValue::List(content_strings.into_iter().map(IonValue::String).collect()),
-            ),
-        ]);
-        Some(KfxFragment::new(
-            KfxSymbol::Content,
-            &content_name,
-            content_ion,
-        ))
-    } else {
-        None
-    };
-
-    // Entity B: STORYLINE ($259) - Holds the structure, references Content by name
+    // STORYLINE ($259) - Holds the structure, references Content by name
     let storyline_ion = IonValue::Struct(vec![
         (
             KfxSymbol::StoryName as u64,
@@ -134,10 +109,30 @@ pub(super) fn build_chapter_entities_grouped(
             IonValue::List(vec![page_template]),
         ),
     ]);
-    let section_fragment =
-        KfxFragment::new_with_id(KfxSymbol::Section, section_id, section_name, section_ion);
+    let section_fragment = KfxFragment::new(KfxSymbol::Section, section_name, section_ion);
 
-    (section_fragment, storyline_fragment, content_fragment)
+    (section_fragment, storyline_fragment)
+}
+
+/// Build the book-global `$145` content fragments from the accumulated chunks.
+///
+/// Called once after every chapter's storyline has been generated; each chunk
+/// is at most [`crate::kfx::context::MAX_CONTENT_CHUNK_BYTES`] of UTF-8 text.
+pub(super) fn build_content_fragments(ctx: &mut ExportContext) -> Vec<KfxFragment> {
+    ctx.take_content_chunks()
+        .into_iter()
+        .map(|(name, segments)| {
+            let name_symbol = ctx.symbols.get_or_intern(&name);
+            let content_ion = IonValue::Struct(vec![
+                (KfxSymbol::Name as u64, IonValue::Symbol(name_symbol)),
+                (
+                    KfxSymbol::ContentList as u64,
+                    IonValue::List(segments.into_iter().map(IonValue::String).collect()),
+                ),
+            ]);
+            KfxFragment::new(KfxSymbol::Content, &name, content_ion)
+        })
+        .collect()
 }
 
 /// Build a simplified storyline for cover chapters.
@@ -161,8 +156,15 @@ pub(super) fn build_cover_storyline(chapter: &Chapter, ctx: &mut ExportContext) 
                 let resource_name = ctx.resource_registry.get_or_create_name(src);
                 let resource_name_symbol = ctx.symbols.get_or_intern(&resource_name);
 
-                // Register style and get symbol
-                let style_symbol = ctx.register_style_id(node.style, &chapter.styles);
+                // Use the default (empty) style, not the node's CSS style:
+                // scale-fit page templates carry all positioning themselves
+                // (fixed dims + scale_fit + float center), and readers require
+                // the image element to add no properties of its own — any
+                // leftover (max-width, borders, font shorthand) is flagged as
+                // an unexpected image style. Kindle Previewer does the same:
+                // its scale-fit images reference an empty style.
+                let style_symbol = ctx.default_style_symbol;
+                ctx.default_style_used = true;
 
                 // Generate unique container ID
                 let container_id = ctx.fragment_ids.next_id();
@@ -250,16 +252,26 @@ pub(super) fn build_symbol_table_ion(local_symbols: &[String]) -> Vec<u8> {
 }
 
 /// Build format capabilities ION.
-pub(super) fn build_format_capabilities_ion() -> Vec<u8> {
-    let caps = IonValue::Struct(vec![
-        (
-            KfxSymbol::Namespace as u64,
-            IonValue::String("yj".to_string()),
-        ),
-        (KfxSymbol::MajorVersion as u64, IonValue::Int(1)),
-        (KfxSymbol::MinorVersion as u64, IonValue::Int(0)),
-        (KfxSymbol::Features as u64, IonValue::List(vec![])),
-    ]);
+pub(super) fn build_format_capabilities_ion(has_text_content: bool) -> Vec<u8> {
+    // Reference shape (Kindle Previewer output, tests/fixtures/epictetus.kfx):
+    // a LIST of `{$492: <capability key>, version: <int>}` structs. Readers
+    // walk it with per-entry key lookups, so any other shape breaks them.
+    // `kfxgen.textBlock 1` declares that text lives in $145 content
+    // fragments; an image-only book (no $145 at all) must not declare it —
+    // capability/content mismatches are conformance errors. The flat
+    // $264/$265 position maps with no eid offsets declare neither
+    // `kfxgen.positionMaps` nor `pidMapWithOffset`, matching the reference.
+    let mut caps = Vec::new();
+    if has_text_content {
+        caps.push(IonValue::Struct(vec![
+            (
+                KfxSymbol::Key as u64,
+                IonValue::String("kfxgen.textBlock".to_string()),
+            ),
+            (KfxSymbol::Version as u64, IonValue::Int(1)),
+        ]));
+    }
+    let caps = IonValue::List(caps);
 
     // Annotate with $593 (format_capabilities)
     serialize_annotated_ion(KfxSymbol::FormatCapabilities as u64, &caps)
@@ -275,8 +287,8 @@ mod entity_structure_tests {
     #[test]
     fn test_entity_order_matches_reference() {
         // Build KFX from EPUB and verify entity order matches Amazon reference
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
-        let container_id = generate_container_id();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let container_id = generate_container_id("test-seed");
         let mut ctx = ExportContext::new();
 
         // Collect spine info
@@ -302,7 +314,7 @@ mod entity_structure_tests {
         // Pass 2: Build fragments in correct order
         let mut fragments = Vec::new();
 
-        fragments.push(build_content_features_fragment());
+        fragments.push(build_content_features_fragment(&ctx));
         fragments.push(build_book_metadata_fragment(&book, &container_id, &ctx));
         fragments.push(build_metadata_fragment(&ctx));
         fragments.push(build_document_data_fragment(&ctx));
@@ -314,15 +326,13 @@ mod entity_structure_tests {
 
         for (chapter_id, section_name) in &spine_info {
             if let Ok(chapter) = book.load_chapter(*chapter_id) {
-                let (section, storyline, content) =
+                let (section, storyline) =
                     build_chapter_entities_grouped(&chapter, *chapter_id, section_name, &mut ctx);
                 section_fragments.push(section);
                 storyline_fragments.push(storyline);
-                if let Some(c) = content {
-                    content_fragments.push(c);
-                }
             }
         }
+        content_fragments.extend(build_content_fragments(&mut ctx));
 
         fragments.extend(section_fragments);
         fragments.extend(storyline_fragments);
@@ -390,7 +400,7 @@ mod entity_structure_tests {
 
     #[test]
     fn test_chapter_entities_grouped_returns_correct_types() {
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
         let mut ctx = ExportContext::new();
 
         // Get first chapter
@@ -407,8 +417,9 @@ mod entity_structure_tests {
 
         // Build entities
         let chapter = book.load_chapter(chapter_id).unwrap();
-        let (section, storyline, content) =
+        let (section, storyline) =
             build_chapter_entities_grouped(&chapter, chapter_id, section_name, &mut ctx);
+        let content_fragments = build_content_fragments(&mut ctx);
 
         // Verify types
         assert_eq!(section.ftype, KfxSymbol::Section as u64);
@@ -438,8 +449,9 @@ mod entity_structure_tests {
             assert!(has_content_list, "storyline should have content_list");
         }
 
-        // Content is optional but if present should have name and content_list
-        if let Some(content_frag) = content {
+        // Content chunks are optional (image-only chapters produce none), but
+        // any that exist must carry a name and content_list.
+        for content_frag in &content_fragments {
             assert_eq!(content_frag.ftype, KfxSymbol::Content as u64);
             if let FragmentData::Ion(IonValue::Struct(fields)) = &content_frag.data {
                 let has_name = fields.iter().any(|(id, _)| *id == KfxSymbol::Name as u64);
@@ -464,17 +476,17 @@ mod section_type_tests {
     /// type: text, NOT type: container. The container type is reserved for c0.
     #[test]
     fn test_titlepage_section_has_text_type_when_standalone_cover_exists() {
-        let mut book = Book::open("tests/fixtures/epictetus.epub").unwrap();
+        let book = Book::open("tests/fixtures/epictetus.epub").unwrap();
         let mut ctx = ExportContext::new();
 
         // Verify this book needs a standalone cover (cover.jpg != titlepage.png)
-        let asset_paths: Vec<_> = book.list_assets().to_vec();
+        let asset_paths = book.list_assets();
         let cover_image = book
             .metadata()
             .cover_image
             .clone()
             .expect("should have cover");
-        let normalized = normalize_cover_path(&cover_image, &asset_paths);
+        let normalized = normalize_cover_path(&cover_image, asset_paths);
 
         // Get first chapter ID
         let first_chapter_id = book.spine().first().expect("should have spine").id;
@@ -496,7 +508,7 @@ mod section_type_tests {
 
         // Build the titlepage section (c1)
         let first_chapter = book.load_chapter(first_chapter_id).unwrap();
-        let (section, _, _) =
+        let (section, _) =
             build_chapter_entities_grouped(&first_chapter, first_chapter_id, "c1", &mut ctx);
 
         // Extract the page_template type from the section

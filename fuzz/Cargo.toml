@@ -18,6 +18,20 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ion_roundtrip"
+path = "fuzz_targets/ion_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "container_parse"
+path = "fuzz_targets/container_parse.rs"
+test = false
+doc = false
+bench = false
+
 # Keep the fuzz crate out of the parent workspace/publish.
 [workspace]
 members = ["."]

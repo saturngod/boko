@@ -35,8 +35,7 @@ pub fn bounded_inflate(
     const MAX_RESERVE: u64 = 16 * 1024 * 1024;
     let reserve = claimed_len.min(hard_cap as u64).min(MAX_RESERVE) as usize;
     let mut out = Vec::with_capacity(reserve);
-    let mut reader =
-        flate2::read::DeflateDecoder::new(compressed).take(hard_cap as u64 + 1);
+    let mut reader = flate2::read::DeflateDecoder::new(compressed).take(hard_cap as u64 + 1);
     reader.read_to_end(&mut out)?;
     if out.len() > hard_cap {
         return Err(io::Error::new(
@@ -131,6 +130,49 @@ pub fn decode_text<'a>(bytes: &'a [u8], hint_encoding: Option<&str>) -> Cow<'a, 
     // Fallback: Windows-1252 (common in old ebooks, superset of ISO-8859-1)
     let (result, _, _) = encoding_rs::WINDOWS_1252.decode(bytes);
     result
+}
+
+// ============================================================================
+// Percent Decoding (hrefs)
+// ============================================================================
+
+/// Percent-decode a single href component (path or fragment).
+///
+/// Hrefs in OPF manifests, NCX/nav documents, and chapter content are URLs
+/// (`my%20chapter.xhtml`), while ZIP archive entry names are literal bytes
+/// (`my chapter.xhtml`). Hrefs must be decoded at the parse boundary before
+/// being matched against archive names; archive names themselves are literal
+/// and must never be decoded.
+///
+/// Invalid escape sequences pass through untouched (per the
+/// `percent-encoding` crate) and non-UTF-8 decodes are replaced lossily, so
+/// decoding is safe on already-literal strings without a `%`.
+pub fn percent_decode(s: &str) -> Cow<'_, str> {
+    if !s.contains('%') {
+        return Cow::Borrowed(s);
+    }
+    percent_encoding::percent_decode_str(s).decode_utf8_lossy()
+}
+
+/// Percent-decode an href, treating the fragment separately from the path.
+///
+/// The `#` separating path from fragment is structural and must survive
+/// decoding: path and fragment are decoded independently and re-joined, so an
+/// encoded `%23` inside either component becomes a literal `#` in that
+/// component without being mistaken for the separator downstream (splitting
+/// on the first `#` was already done here).
+pub fn percent_decode_href(href: &str) -> Cow<'_, str> {
+    if !href.contains('%') {
+        return Cow::Borrowed(href);
+    }
+    match href.split_once('#') {
+        Some((path, fragment)) => Cow::Owned(format!(
+            "{}#{}",
+            percent_decode(path),
+            percent_decode(fragment)
+        )),
+        None => percent_decode(href),
+    }
 }
 
 // ============================================================================
@@ -246,6 +288,10 @@ pub enum MediaFormat {
     Ttf,
     /// OpenType font
     Otf,
+    /// WOFF web font
+    Woff,
+    /// WOFF2 web font
+    Woff2,
     /// Unknown/binary format
     Binary,
 }
@@ -261,6 +307,8 @@ impl MediaFormat {
             MediaFormat::WebP => "image/webp",
             MediaFormat::Ttf => "font/ttf",
             MediaFormat::Otf => "font/otf",
+            MediaFormat::Woff => "font/woff",
+            MediaFormat::Woff2 => "font/woff2",
             MediaFormat::Binary => "application/octet-stream",
         }
     }
@@ -279,7 +327,10 @@ impl MediaFormat {
 
     /// Check if this format represents a font.
     pub fn is_font(self) -> bool {
-        matches!(self, MediaFormat::Ttf | MediaFormat::Otf)
+        matches!(
+            self,
+            MediaFormat::Ttf | MediaFormat::Otf | MediaFormat::Woff | MediaFormat::Woff2
+        )
     }
 }
 
@@ -321,6 +372,12 @@ pub fn detect_media_format(path: &str, data: &[u8]) -> MediaFormat {
     if path_lower.ends_with(".otf") {
         return MediaFormat::Otf;
     }
+    if path_lower.ends_with(".woff") {
+        return MediaFormat::Woff;
+    }
+    if path_lower.ends_with(".woff2") {
+        return MediaFormat::Woff2;
+    }
 
     // Fallback to magic byte detection
     if data.len() >= 4 {
@@ -335,6 +392,13 @@ pub fn detect_media_format(path: &str, data: &[u8]) -> MediaFormat {
         // GIF: 47 49 46 (GIF)
         if data[0] == 0x47 && data[1] == 0x49 && data[2] == 0x46 {
             return MediaFormat::Gif;
+        }
+        // WOFF: "wOFF", WOFF2: "wOF2"
+        if data.starts_with(b"wOFF") {
+            return MediaFormat::Woff;
+        }
+        if data.starts_with(b"wOF2") {
+            return MediaFormat::Woff2;
         }
         // WebP: 52 49 46 46 ... 57 45 42 50 (RIFF...WEBP)
         if data.len() >= 12
@@ -389,14 +453,21 @@ pub(crate) fn guess_media_type(path: &str) -> &'static str {
 /// Removes:
 /// - U+00AD SOFT HYPHEN (hyphenation hints)
 /// - U+200B ZERO WIDTH SPACE (word-break hints)
-pub fn strip_ebook_chars(s: &str) -> String {
+pub fn strip_ebook_chars(s: &str) -> std::borrow::Cow<'_, str> {
+    // Soft hyphens / zero-width spaces are rare; scan first and borrow the
+    // input unchanged in the common case (this runs per text node on the
+    // markdown hot path), allocating only when there is actually something
+    // to strip.
+    if !s.contains(['\u{00AD}', '\u{200B}']) {
+        return std::borrow::Cow::Borrowed(s);
+    }
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if c != '\u{00AD}' && c != '\u{200B}' {
             out.push(c);
         }
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 /// Detect MIME type from file extension or magic bytes.
@@ -480,6 +551,62 @@ pub fn extract_xml_encoding(bytes: &[u8]) -> Option<&str> {
 }
 
 // ============================================================================
+// Image Transcoding
+// ============================================================================
+
+/// Re-encode a raster image (PNG or JPEG) as JPEG at the given quality
+/// (1-100), for shrinking oversized images. Alpha is flattened onto white.
+/// When `max_dimension` is set, images whose long edge exceeds it are
+/// downscaled (Lanczos3) to fit; images at or below it are never resized.
+///
+/// Returns `None` when the input fails to decode; callers keep the original
+/// bytes. Callers are also expected to keep the original when the result is
+/// not (meaningfully) smaller — PNG regularly beats JPEG on line art and
+/// flat-color images, and an already well-compressed JPEG gains nothing, so
+/// a size check, not a format rule, decides.
+#[cfg(feature = "optimize-images")]
+pub fn reencode_image_as_jpeg(
+    data: &[u8],
+    quality: u8,
+    max_dimension: Option<u32>,
+) -> Option<Vec<u8>> {
+    let mut img = image::load_from_memory(data).ok()?;
+
+    if let Some(max) = max_dimension
+        && img.width().max(img.height()) > max
+    {
+        img = img.resize(max, max, image::imageops::FilterType::Lanczos3);
+    }
+
+    // Flatten transparency onto white: JPEG has no alpha, and Kindle pages
+    // are white; compositing beats dropping the channel outright.
+    let rgb = match img {
+        image::DynamicImage::ImageRgb8(rgb) => rgb,
+        other => {
+            let rgba = other.into_rgba8();
+            let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
+            for (out, px) in rgb.pixels_mut().zip(rgba.pixels()) {
+                let [r, g, b, a] = px.0;
+                let over = |c: u8| ((c as u32 * a as u32 + 255 * (255 - a as u32)) / 255) as u8;
+                out.0 = [over(r), over(g), over(b)];
+            }
+            rgb
+        }
+    };
+
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+        .encode(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .ok()?;
+    Some(out.into_inner())
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -493,8 +620,7 @@ mod tests {
         // below its true size: it must error instead of allocating unbounded.
         use std::io::Write;
         let raw = vec![0u8; 1 << 20]; // 1 MiB of zeros -> tiny deflate stream
-        let mut enc =
-            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
         enc.write_all(&raw).unwrap();
         let compressed = enc.finish().unwrap();
         assert!(compressed.len() < 4096, "payload should compress tiny");
@@ -506,6 +632,37 @@ mod tests {
         // A cap above the true size succeeds and round-trips.
         let out = bounded_inflate(&compressed, 0, 1 << 21).unwrap();
         assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn test_percent_decode_basic() {
+        // No escapes: borrowed passthrough.
+        assert!(matches!(percent_decode("plain.xhtml"), Cow::Borrowed(_)));
+        assert_eq!(percent_decode("my%20chapter.xhtml"), "my chapter.xhtml");
+        // Invalid escape sequences pass through untouched.
+        assert_eq!(percent_decode("100%.png"), "100%.png");
+        assert_eq!(percent_decode("bad%zzseq"), "bad%zzseq");
+        // Non-ASCII UTF-8.
+        assert_eq!(percent_decode("caf%C3%A9.xhtml"), "café.xhtml");
+    }
+
+    #[test]
+    fn test_percent_decode_href_fragment_separate() {
+        // No escapes: borrowed passthrough.
+        assert!(matches!(
+            percent_decode_href("ch1.xhtml#sec1"),
+            Cow::Borrowed(_)
+        ));
+        // Path and fragment decoded independently; separator preserved.
+        assert_eq!(
+            percent_decode_href("my%20chapter.xhtml#sec%201"),
+            "my chapter.xhtml#sec 1"
+        );
+        // Encoded %23 in the path becomes a literal '#' in the path component
+        // but the structural separator is the first literal '#'.
+        assert_eq!(percent_decode_href("a%23b.xhtml#frag"), "a#b.xhtml#frag");
+        // Fragment-only href.
+        assert_eq!(percent_decode_href("#note%201"), "#note 1");
     }
 
     #[test]

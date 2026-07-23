@@ -4,11 +4,12 @@
 //! which style declarations apply to an element based on specificity,
 //! importance, and source order.
 
-use std::cmp::Ordering;
 use rustc_hash::FxHashMap;
+use std::cmp::Ordering;
 
-use selectors::context::{MatchingContext, SelectorCaches};
-use selectors::parser::{Component, Selector};
+use selectors::bloom::BloomFilter;
+use selectors::context::{MatchingContext, QuirksMode, SelectorCaches};
+use selectors::parser::{AncestorHashes, Component, Selector};
 
 use super::declaration::Declaration;
 use super::parse::{CssRule, Origin, Specificity, Stylesheet};
@@ -42,10 +43,11 @@ struct MatchedDecl {
 ///
 /// Non-inherited properties (width, height, margin, padding, display, etc.)
 /// are NOT copied from the parent.
-fn inherit_from_parent(parent: &ComputedStyle) -> ComputedStyle {
+pub(crate) fn inherit_from_parent(parent: &ComputedStyle) -> ComputedStyle {
     ComputedStyle {
         // Font properties (inherited)
         font_size: parent.font_size,
+        font_size_abs: parent.font_size_abs,
         font_weight: parent.font_weight,
         font_style: parent.font_style,
         font_variant: parent.font_variant,
@@ -146,6 +148,16 @@ pub struct CascadeIndex<'a> {
     by_class: FxHashMap<String, Vec<RuleRef>>,
     by_local: FxHashMap<String, Vec<RuleRef>>,
     universal: Vec<RuleRef>,
+    /// Per-sheet, per-rule ancestor hashes for the bloom-filter fast path,
+    /// indexed as `ancestor_hashes[sheet][rule][selector]` (parallel to
+    /// `rule.selectors`). Passed to `matches_selector` so it can fast-reject
+    /// candidates whose ancestor requirements the current ancestor bloom
+    /// filter cannot satisfy.
+    ancestor_hashes: Vec<Vec<Box<[AncestorHashes]>>>,
+    /// Whether any selector produced a non-empty ancestor-hash set, i.e.
+    /// whether an ancestor bloom filter could reject anything at all. When
+    /// false, callers can skip maintaining a filter entirely.
+    has_ancestor_hashes: bool,
 }
 
 impl<'a> CascadeIndex<'a> {
@@ -160,8 +172,11 @@ impl<'a> CascadeIndex<'a> {
             by_class: FxHashMap::default(),
             by_local: FxHashMap::default(),
             universal: Vec::new(),
+            ancestor_hashes: Vec::with_capacity(stylesheets.len()),
+            has_ancestor_hashes: false,
         };
         for (sheet_idx, (sheet, _origin)) in stylesheets.iter().enumerate() {
+            let mut sheet_hashes = Vec::with_capacity(sheet.rules.len());
             for (rule_idx, rule) in sheet.rules.iter().enumerate() {
                 let rref = (sheet_idx as u32, rule_idx as u32);
                 // A rule matches if any of its selectors match, so file it under
@@ -174,9 +189,31 @@ impl<'a> CascadeIndex<'a> {
                         BucketKey::Universal => index.universal.push(rref),
                     }
                 }
+                // Matching always runs with QuirksMode::NoQuirks, and these
+                // hashes must be collected under the same quirks mode.
+                let rule_hashes: Box<[AncestorHashes]> = rule
+                    .selectors
+                    .iter()
+                    .map(|selector| {
+                        let hashes = AncestorHashes::new(selector, QuirksMode::NoQuirks);
+                        // A zero first hash means "no usable ancestor hashes"
+                        // (the fast path bails on the first zero).
+                        index.has_ancestor_hashes |= hashes.packed_hashes[0] != 0;
+                        hashes
+                    })
+                    .collect();
+                sheet_hashes.push(rule_hashes);
             }
+            index.ancestor_hashes.push(sheet_hashes);
         }
         index
+    }
+
+    /// Whether any selector in the index has combinators whose ancestor
+    /// requirements the bloom-filter fast path could reject on. When this is
+    /// false, maintaining an ancestor filter cannot help matching.
+    pub fn has_complex_selectors(&self) -> bool {
+        self.has_ancestor_hashes
     }
 
     /// Fill `out` with the candidate rules for an element, in source order and
@@ -206,7 +243,7 @@ impl<'a> CascadeIndex<'a> {
             out.extend_from_slice(v);
         }
         for class in elem.dom.element_classes(elem.id) {
-            if let Some(v) = self.by_class.get(class.as_str()) {
+            if let Some(v) = self.by_class.get(class) {
                 out.extend_from_slice(v);
             }
         }
@@ -234,16 +271,44 @@ pub fn compute_styles(
         parent_style,
         style_pool,
         &mut CascadeScratch::default(),
+        None,
+        None,
+        None,
     )
 }
 
 /// Compute styles for an element using a prebuilt [`CascadeIndex`].
+///
+/// `bloom`, when provided, must be an ancestor bloom filter containing the
+/// hashes (`ElementRef::each_bloom_hash`) of every *element ancestor* of
+/// `elem` — and nothing else, in particular not `elem` itself. It lets
+/// selector matching fast-reject descendant/child-combinator candidates
+/// without walking the ancestor chain. Passing a filter that is missing an
+/// ancestor would silently drop matching rules; pass `None` when no
+/// correctly-maintained filter is available.
+///
+/// `inline_style`, when provided, holds the element's parsed `style`
+/// attribute. Its normal declarations apply after every selector-matched
+/// normal declaration (inline beats any specificity), and its `!important`
+/// declarations apply last of all, per the CSS cascade.
+///
+/// `presentational`, when provided, holds declarations synthesized from
+/// legacy presentational attributes (`align=`, `valign=`, ...). Per CSS,
+/// presentational hints apply before every author rule — any matching
+/// selector overrides them — but they beat inherited values.
+// The parameters are the distinct cascade inputs (element, index, parent,
+// scratch, bloom, inline style, presentational hints); each is load-bearing
+// and grouping them into a struct would only add indirection on the hot path.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_styles_indexed(
     elem: ElementRef<'_>,
     index: &CascadeIndex<'_>,
     parent_style: Option<&ComputedStyle>,
     _style_pool: &mut StylePool,
     scratch: &mut CascadeScratch,
+    bloom: Option<&BloomFilter>,
+    inline_style: Option<&crate::style::InlineStyle>,
+    presentational: Option<&crate::style::InlineStyle>,
 ) -> ComputedStyle {
     let CascadeScratch {
         caches,
@@ -259,7 +324,8 @@ pub fn compute_styles_indexed(
     for &(sheet_idx, rule_idx) in candidates.iter() {
         let (stylesheet, origin) = index.stylesheets[sheet_idx as usize];
         let rule = &stylesheet.rules[rule_idx as usize];
-        if let Some(specificity) = rule_match_specificity(elem, rule, caches) {
+        let hashes = &index.ancestor_hashes[sheet_idx as usize][rule_idx as usize];
+        if let Some(specificity) = rule_match_specificity(elem, rule, hashes, bloom, caches) {
             // Collect normal declarations
             for decl_idx in 0..rule.declarations.len() {
                 matched.push(MatchedDecl {
@@ -329,8 +395,42 @@ pub fn compute_styles_indexed(
         ComputedStyle::default()
     };
 
-    // Apply matched declarations in cascade order
+    // Apply matched declarations in cascade order. `matched` is sorted with
+    // all normal declarations before all `!important` ones, so the inline
+    // style's normal declarations are injected at that boundary: inline
+    // normal beats every selector-matched normal declaration but loses to
+    // stylesheet `!important`; inline `!important` beats everything.
+    //
+    // `font_size_declared` tracks whether any declaration set font-size:
+    // the inherited `font_size` value is parent-relative (`Em(1.2)` copied
+    // verbatim), so resolving the absolute size must multiply only when this
+    // element actually declared one — an inherited value keeps the parent's
+    // absolute size.
+    let mut font_size_declared = false;
+    let mut apply = |style: &mut ComputedStyle, decl: &Declaration| {
+        font_size_declared |= matches!(decl, Declaration::FontSize(_));
+        apply_declaration(style, decl);
+    };
+    // Presentational hints sit between the user-agent and author origins:
+    // any author rule overrides them, but they beat UA defaults (and
+    // inherited values). They're injected when the first non-UA normal
+    // declaration is reached; `matched` is sorted importance-then-origin,
+    // so UA normal declarations come first.
+    let mut hints_pending = presentational.is_some_and(|h| !h.declarations.is_empty());
+    let mut inline_normal_pending = inline_style.is_some_and(|i| !i.declarations.is_empty());
     for m in matched.iter() {
+        if hints_pending && (m.important || m.origin != Origin::UserAgent) {
+            for decl in &presentational.expect("checked above").declarations {
+                apply(&mut style, decl);
+            }
+            hints_pending = false;
+        }
+        if m.important && inline_normal_pending {
+            for decl in &inline_style.expect("checked above").declarations {
+                apply(&mut style, decl);
+            }
+            inline_normal_pending = false;
+        }
         let (stylesheet, _) = index.stylesheets[m.sheet as usize];
         let rule = &stylesheet.rules[m.rule as usize];
         let decl = if m.important {
@@ -338,10 +438,45 @@ pub fn compute_styles_indexed(
         } else {
             &rule.declarations[m.decl as usize]
         };
-        apply_declaration(&mut style, decl);
+        apply(&mut style, decl);
+    }
+    if hints_pending {
+        // Only UA rules (or nothing) matched; the hints still apply.
+        for decl in &presentational.expect("checked above").declarations {
+            apply(&mut style, decl);
+        }
+    }
+    if let Some(inline) = inline_style {
+        if inline_normal_pending {
+            for decl in &inline.declarations {
+                apply(&mut style, decl);
+            }
+        }
+        for decl in &inline.important_declarations {
+            apply(&mut style, decl);
+        }
     }
 
+    let parent_abs = parent_style.map(|p| p.font_size_abs.0).unwrap_or(1.0);
+    style.font_size_abs = super::AbsFontSize(if font_size_declared {
+        resolve_font_size_abs(style.font_size, parent_abs)
+    } else {
+        parent_abs
+    });
+
     style
+}
+
+/// Resolve a declared font-size to an absolute root-relative multiple.
+fn resolve_font_size_abs(size: crate::style::Length, parent_abs: f32) -> f32 {
+    use crate::style::Length;
+    match size {
+        Length::Auto => parent_abs,
+        Length::Em(x) => parent_abs * x,
+        Length::Percent(p) => parent_abs * p / 100.0,
+        Length::Px(x) => x / 16.0,
+        Length::Rem(x) => x,
+    }
 }
 
 /// Return the specificity of the highest-specificity selector in `rule` that
@@ -351,24 +486,28 @@ pub fn compute_styles_indexed(
 fn rule_match_specificity(
     elem: ElementRef<'_>,
     rule: &CssRule,
+    hashes: &[AncestorHashes],
+    bloom: Option<&BloomFilter>,
     caches: &mut SelectorCaches,
 ) -> Option<Specificity> {
     let mut context = MatchingContext::new(
         selectors::matching::MatchingMode::Normal,
-        None,
+        bloom,
         caches,
-        selectors::context::QuirksMode::NoQuirks,
+        QuirksMode::NoQuirks,
         selectors::matching::NeedsSelectorFlags::No,
         selectors::matching::MatchingForInvalidation::No,
     );
 
+    debug_assert_eq!(rule.selectors.len(), hashes.len());
     rule.selectors
         .iter()
         .zip(&rule.selector_specificities)
-        .filter(|(selector, _)| {
-            selectors::matching::matches_selector(selector, 0, None, &elem, &mut context)
+        .zip(hashes)
+        .filter(|&((selector, _), hashes)| {
+            selectors::matching::matches_selector(selector, 0, Some(hashes), &elem, &mut context)
         })
-        .map(|(_, spec)| *spec)
+        .map(|((_, spec), _)| *spec)
         .max()
 }
 
@@ -401,6 +540,7 @@ fn apply_declaration(style: &mut ComputedStyle, decl: &Declaration) {
         Declaration::TextDecoration(d) => {
             style.text_decoration_underline = d.underline;
             style.text_decoration_line_through = d.line_through;
+            style.overline = d.overline;
         }
         Declaration::TextDecorationStyle(s) => style.underline_style = *s,
         Declaration::TextDecorationColor(c) => style.underline_color = Some(*c),
@@ -548,5 +688,31 @@ mod tests {
             p_color(".never, p { color: red } p { color: blue }"),
             Some(Color::rgb(0, 0, 255))
         );
+    }
+
+    #[test]
+    fn box_shorthand_keeps_important() {
+        // `parse_length` used to eat the `!` while probing for a 2nd..4th
+        // value, silently demoting 1-3 value shorthands to normal priority.
+        for css in [
+            "p { margin: 5px !important }",
+            "p { margin: 5px 6px !important }",
+            "p { padding: 1px 2px 3px !important }",
+            "p { border-width: 1px !important }",
+            "p { border-style: solid !important }",
+            "p { border-color: #123 !important }",
+        ] {
+            let sheet = Stylesheet::parse(css);
+            let rule = &sheet.rules[0];
+            assert!(
+                rule.declarations.is_empty(),
+                "{css}: normal declarations should be empty, got {:?}",
+                rule.declarations
+            );
+            assert!(
+                !rule.important_declarations.is_empty(),
+                "{css}: expected important declarations"
+            );
+        }
     }
 }

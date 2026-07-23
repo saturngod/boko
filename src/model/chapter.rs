@@ -8,8 +8,11 @@
 //! - Universal link representation (handles both EPUB IDs and Kindle offsets)
 //! - Global text buffer with range references
 
+use rustc_hash::FxHashMap;
+
 use super::node::{Node, NodeId, Role, TextRange};
 use super::semantic::SemanticMap;
+use crate::math::Math;
 use crate::style::StylePool;
 
 /// A chapter's content in normalized IR form.
@@ -24,6 +27,8 @@ pub struct Chapter {
     pub styles: StylePool,
     /// Sparse semantic attributes (href, src, alt, id).
     pub semantics: SemanticMap,
+    /// Math expressions for `Role::Math` nodes, keyed by node id.
+    pub math: FxHashMap<NodeId, Math>,
     /// Global text buffer (nodes reference ranges into this).
     text: String,
 }
@@ -41,6 +46,7 @@ impl Chapter {
             nodes: vec![Node::new(Role::Root)],
             styles: StylePool::new(),
             semantics: SemanticMap::new(),
+            math: FxHashMap::default(),
             text: String::new(),
         }
     }
@@ -163,11 +169,11 @@ impl Chapter {
         }
     }
 
-    /// Iterate over all nodes in depth-first order.
+    /// Iterate over all nodes in depth-first (preorder) order.
     pub fn iter_dfs(&self) -> DfsIter<'_> {
         DfsIter {
             chapter: self,
-            stack: vec![NodeId::ROOT],
+            next: Some(NodeId::ROOT),
         }
     }
 }
@@ -214,22 +220,42 @@ impl Iterator for ChildIter<'_> {
     }
 }
 
-/// Depth-first iterator over all nodes.
+/// Depth-first (preorder) iterator over all nodes.
+///
+/// Allocation-free: the first-child/next-sibling/parent links let it walk the
+/// tree with a single cursor instead of a heap stack, so a full traversal
+/// (every export path runs several) makes zero allocations.
 pub struct DfsIter<'a> {
     chapter: &'a Chapter,
-    stack: Vec<NodeId>,
+    next: Option<NodeId>,
 }
 
 impl Iterator for DfsIter<'_> {
     type Item = NodeId;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let current = self.stack.pop()?;
+        let current = self.next?;
 
-        // Push children in reverse order so they're visited left-to-right
-        let mut children: Vec<NodeId> = self.chapter.children(current).collect();
-        children.reverse();
-        self.stack.extend(children);
+        // Descend to the first child; else move to the next sibling; else
+        // climb through ancestors until one has a next sibling. The climb is
+        // bounded by the node count: a well-formed ancestor chain is shorter
+        // than that, so exceeding it means a corrupt parent-pointer cycle
+        // (unreachable via the construction API, but the old stack iterator
+        // never read `parent` and so couldn't hang on one) — terminate
+        // instead of spinning forever.
+        self.next = self.chapter.node(current).and_then(|node| {
+            if let Some(child) = node.first_child {
+                return Some(child);
+            }
+            let mut n = node;
+            for _ in 0..self.chapter.node_count() {
+                if let Some(sib) = n.next_sibling {
+                    return Some(sib);
+                }
+                n = self.chapter.node(n.parent?)?;
+            }
+            None
+        });
 
         Some(current)
     }

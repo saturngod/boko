@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::dom::Stylesheet;
 use crate::import::{ChapterId, Importer, SpineEntry, resolve_path_based_href};
@@ -59,24 +59,34 @@ pub struct Azw3Importer {
     kf8: Kf8Structure,
 
     /// Cached decompressed text (loaded on first chapter request).
-    text_cache: Option<Vec<u8>>,
+    text_cache: OnceLock<Vec<u8>>,
+
+    /// Cached per-chapter (name, raw HTML) parts, assembled once. Without
+    /// this, every `build_chapter` cache miss re-ran `build_parts` over the
+    /// whole book, making a full N-chapter load O(N x book size).
+    parts_cache: OnceLock<Vec<(String, Vec<u8>)>>,
+
+    /// Serializes the first text extraction: parallel chapter loads would
+    /// otherwise each decompress the whole book before the OnceLock settles.
+    text_init: Mutex<()>,
 
     /// Cached chapter content.
-    chapter_cache: HashMap<u32, Vec<u8>>,
+    chapter_cache: RwLock<HashMap<u32, Vec<u8>>>,
 
     /// Discovered asset paths.
     assets: Vec<String>,
 
     /// Cached parsed stylesheets.
-    css_cache: HashMap<String, Arc<Stylesheet>>,
+    css_cache: RwLock<HashMap<String, Arc<Stylesheet>>>,
 
     // --- Link resolution ---
     /// Maps "path#id" -> GlobalNodeId (built during index_anchors)
-    element_id_map: HashMap<String, GlobalNodeId>,
+    element_id_map: RwLock<HashMap<String, GlobalNodeId>>,
 
     // --- TOC resolution ---
-    /// NCX positions for TOC entries, keyed by (title, chapter_path).
-    toc_positions: HashMap<(String, String), TocPosition>,
+    /// NCX byte positions keyed by flat NCX entry index (carried on
+    /// `TocEntry::play_order`), so duplicate titles can't collide.
+    toc_positions: HashMap<usize, TocPosition>,
 }
 
 /// Position metadata for a TOC entry (from NCX).
@@ -113,10 +123,6 @@ impl Importer for Azw3Importer {
         &self.toc
     }
 
-    fn toc_mut(&mut self) -> &mut [TocEntry] {
-        &mut self.toc
-    }
-
     fn landmarks(&self) -> &[Landmark] {
         &self.landmarks
     }
@@ -129,22 +135,20 @@ impl Importer for Azw3Importer {
         self.chapter_paths.get(id.0 as usize).map(|s| s.as_str())
     }
 
-    fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
+    fn load_raw(&self, id: ChapterId) -> crate::Result<Vec<u8>> {
         // Check chapter cache first
-        if let Some(content) = self.chapter_cache.get(&id.0) {
+        if let Ok(cache) = self.chapter_cache.read()
+            && let Some(content) = cache.get(&id.0)
+        {
             return Ok(content.clone());
         }
 
-        // Ensure text is loaded
-        if self.text_cache.is_none() {
-            self.text_cache = Some(self.extract_text()?);
+        // Build the requested chapter from the (lazily decompressed) text
+        let content = self.build_chapter(id.0, self.cached_text()?)?;
+
+        if let Ok(mut cache) = self.chapter_cache.write() {
+            cache.insert(id.0, content.clone());
         }
-
-        // Build the requested chapter
-        let text = self.text_cache.as_ref().unwrap();
-        let content = self.build_chapter(id.0, text)?;
-
-        self.chapter_cache.insert(id.0, content.clone());
         Ok(content)
     }
 
@@ -152,7 +156,29 @@ impl Importer for Azw3Importer {
         &self.assets
     }
 
-    fn load_asset(&mut self, path: &str) -> crate::Result<Vec<u8>> {
+    fn load_asset(&self, path: &str) -> crate::Result<Vec<u8>> {
+        // KF8 stylesheets live in FDST flows (flow 0 is the HTML; the
+        // `kindle:flow:N` links are rewritten to styles/style{N-1:04}.css by
+        // the markup transform). Serve them from the flow table — without
+        // this every KF8 book's CSS silently vanished.
+        if let Some(rest) = path.strip_prefix("styles/style") {
+            let css_idx: usize = rest
+                .split('.')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| crate::Error::NotFound {
+                    what: format!("asset {}", path),
+                })?;
+            let flow_idx = css_idx + 1;
+            let (start, end) = self.kf8.flow_table.get(flow_idx).copied().ok_or_else(|| {
+                crate::Error::NotFound {
+                    what: format!("asset {}", path),
+                }
+            })?;
+            let text = self.cached_text()?;
+            return Ok(flow_slice(text, start, end).to_vec());
+        }
+
         // Parse index from path (images/image_XXXX.ext or fonts/font_XXXX.ext).
         // Images and fonts share the same record-index space, so the prefix
         // selects naming but the underlying lookup is the same.
@@ -168,19 +194,23 @@ impl Importer for Azw3Importer {
         Ok(self.load_image_record(idx)?)
     }
 
-    fn load_stylesheet(&mut self, path: &str) -> Option<Arc<Stylesheet>> {
-        if let Some(sheet) = self.css_cache.get(path) {
+    fn load_stylesheet(&self, path: &str) -> Option<Arc<Stylesheet>> {
+        if let Ok(cache) = self.css_cache.read()
+            && let Some(sheet) = cache.get(path)
+        {
             return Some(Arc::clone(sheet));
         }
         let css_bytes = self.load_asset(path).ok()?;
         let css_str = String::from_utf8_lossy(&css_bytes);
         let sheet = Arc::new(Stylesheet::parse(&css_str));
-        self.css_cache.insert(path.to_string(), Arc::clone(&sheet));
-        Some(sheet)
+        match self.css_cache.write() {
+            Ok(mut cache) => Some(Arc::clone(cache.entry(path.to_string()).or_insert(sheet))),
+            Err(_) => Some(sheet),
+        }
     }
 
-    fn index_anchors(&mut self, chapters: &[(ChapterId, Arc<Chapter>)]) {
-        self.element_id_map.clear();
+    fn index_anchors(&self, chapters: &[(ChapterId, Arc<Chapter>)]) {
+        let mut element_id_map = HashMap::new();
 
         // Build path#id → GlobalNodeId map from chapters (same format as EPUB)
         for (chapter_id, chapter) in chapters {
@@ -193,10 +223,13 @@ impl Importer for Azw3Importer {
             for node_id in chapter.iter_dfs() {
                 if let Some(id) = chapter.semantics.id(node_id) {
                     let key = format!("{}#{}", chapter_path, id);
-                    self.element_id_map
-                        .insert(key, GlobalNodeId::new(*chapter_id, node_id));
+                    element_id_map.insert(key, GlobalNodeId::new(*chapter_id, node_id));
                 }
             }
+        }
+
+        if let Ok(mut map) = self.element_id_map.write() {
+            *map = element_id_map;
         }
     }
 
@@ -211,21 +244,17 @@ impl Importer for Azw3Importer {
                     .position(|cp| cp == p)
                     .map(|i| ChapterId(i as u32))
             },
-            |k| self.element_id_map.get(k).copied(),
+            |k| {
+                self.element_id_map
+                    .read()
+                    .ok()
+                    .and_then(|m| m.get(k).copied())
+            },
         )
     }
 
-    fn resolve_toc(&mut self) {
-        // Load text if not cached
-        if self.text_cache.is_none() {
-            if let Ok(text) = self.extract_text() {
-                self.text_cache = Some(text);
-            } else {
-                return;
-            }
-        }
-
-        let text = self.text_cache.as_ref().unwrap();
+    fn resolve_toc(&self) -> Option<Vec<TocEntry>> {
+        let text = self.cached_text().ok()?;
 
         // Get HTML flow (flow 0)
         let (html_start, html_end) = self
@@ -244,24 +273,42 @@ impl Importer for Azw3Importer {
             .map(|f| (f.start_pos, f.file_number as u32))
             .collect();
 
-        // Resolve TOC entries using stored positions
-        resolve_toc_with_positions(&mut self.toc, &self.toc_positions, html_text, &file_starts);
+        // Resolve TOC entries using stored positions, into a copy — the
+        // importer's own entries stay untouched (Book caches the result).
+        let mut toc = self.toc.clone();
+        resolve_toc_with_positions(&mut toc, &self.toc_positions, html_text, &file_starts);
+        Some(toc)
+    }
+}
+
+impl Azw3Importer {
+    /// The decompressed text stream, extracted on first use.
+    fn cached_text(&self) -> crate::Result<&Vec<u8>> {
+        if let Some(text) = self.text_cache.get() {
+            return Ok(text);
+        }
+        // Hold the init lock across extraction so N parallel chapter loads
+        // don't each decompress the entire book; losers of the race re-check
+        // and find the cache populated.
+        let _guard = self.text_init.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(text) = self.text_cache.get() {
+            return Ok(text);
+        }
+        let text = self.extract_text()?;
+        Ok(self.text_cache.get_or_init(|| text))
     }
 }
 
 /// Recursively resolve TOC entry hrefs with fragment IDs using position map.
 fn resolve_toc_with_positions(
     entries: &mut [TocEntry],
-    positions: &HashMap<(String, String), TocPosition>,
+    positions: &HashMap<usize, TocPosition>,
     html_text: &[u8],
     file_starts: &[(u32, u32)],
 ) {
     for entry in entries {
-        // Look up position by (title, chapter_path)
-        let chapter_path = entry.href.split('#').next().unwrap_or(&entry.href);
-        let key = (entry.title.clone(), chapter_path.to_string());
-
-        if let Some(pos) = positions.get(&key) {
+        // Look up position by the entry's flat NCX index (play_order).
+        if let Some(pos) = entry.play_order.and_then(|po| positions.get(&po)) {
             // Find nearest ID at this position
             if let Some(id) = transform::find_nearest_id_fast(
                 html_text,
@@ -346,7 +393,7 @@ impl Azw3Importer {
         }
 
         // Build metadata
-        let mut metadata = build_metadata(&pdb, &mobi, &exth);
+        let metadata = build_metadata(&pdb, &mobi, &exth);
 
         // Parse KF8 indices (without reading text content)
         let codec = match mobi.encoding {
@@ -412,7 +459,7 @@ impl Azw3Importer {
         // Build hierarchical TOC and collect positions for later resolution
         let mut toc_positions = HashMap::new();
         let toc = {
-            let nodes = build_toc_from_ncx(&ncx, |entry| {
+            let nodes = build_toc_from_ncx(&ncx, |ncx_idx, entry| {
                 // KF8 uses pos_fid (frag_idx, offset) - calculate actual byte position
                 // frag_idx is index into fragment/div table, offset is added to insert_pos
                 let (file_num, byte_pos) = if let Some((frag_idx, offset)) = entry.pos_fid
@@ -430,14 +477,8 @@ impl Azw3Importer {
 
                 let chapter_path = format!("part{:04}.html", file_num);
 
-                // Store position keyed by (title, chapter_path)
-                // Use unescaped title to match TocEntry.title
-                let title = quick_xml::escape::unescape(&entry.text)
-                    .map(|s| s.into_owned())
-                    .unwrap_or_else(|_| entry.text.clone());
-                let key = (title, chapter_path.clone());
                 toc_positions.insert(
-                    key,
+                    ncx_idx,
                     TocPosition {
                         byte_pos,
                         file_num: file_num as u32,
@@ -449,12 +490,7 @@ impl Azw3Importer {
             nodes.into_iter().map(toc_node_to_entry).collect()
         };
 
-        // Find cover image
-        if let Some(exth) = exth
-            && let Some(cover_idx) = exth.cover_offset
-        {
-            metadata.cover_image = Some(format!("images/image_{:04}.jpg", cover_idx));
-        }
+        let cover_record_idx = exth.and_then(|e| e.cover_offset);
 
         let mut importer = Self {
             source,
@@ -472,15 +508,28 @@ impl Azw3Importer {
                 files,
                 elems,
             },
-            text_cache: None,
-            chapter_cache: HashMap::new(),
+            text_cache: OnceLock::new(),
+            parts_cache: OnceLock::new(),
+            text_init: Mutex::new(()),
+            chapter_cache: RwLock::new(HashMap::new()),
             assets: Vec::new(),
-            css_cache: HashMap::new(),
-            element_id_map: HashMap::new(),
+            css_cache: RwLock::new(HashMap::new()),
+            element_id_map: RwLock::new(HashMap::new()),
             toc_positions,
         };
 
         importer.assets = importer.discover_assets();
+
+        // Find the cover among the discovered assets: their names embed the
+        // record index and the record's *real* extension (the cover may be
+        // PNG or GIF, not the .jpg previously hardcoded here, and a metadata
+        // entry that matches no asset breaks cover export downstream).
+        if let Some(cover_idx) = cover_record_idx {
+            let needle = format!("images/image_{cover_idx:04}.");
+            if let Some(path) = importer.assets.iter().find(|p| p.starts_with(&needle)) {
+                importer.metadata.cover_image = Some(path.clone());
+            }
+        }
 
         Ok(importer)
     }
@@ -515,7 +564,9 @@ impl Azw3Importer {
             None
         };
 
-        // Read and decompress text records
+        // Read and decompress text records, sharing one whole-book output
+        // budget across records (see `total_text_budget`).
+        let mut text_budget = crate::mobi::huffcdic::total_text_budget(self.file_len);
         for i in 1..=self.mobi.text_record_count as usize {
             let record = read_record(i)?;
             let stripped = strip_trailing_data(&record, self.mobi.extra_data_flags);
@@ -525,7 +576,7 @@ impl Azw3Importer {
                 Compression::PalmDoc => palmdoc::decompress(stripped)?,
                 Compression::Huffman => {
                     if let Some(ref mut reader) = huff_reader {
-                        reader.decompress(stripped)?
+                        reader.decompress(stripped, &mut text_budget)?
                     } else {
                         stripped.to_vec()
                     }
@@ -550,8 +601,10 @@ impl Azw3Importer {
             .unwrap_or((0, text.len()));
         let html_text = flow_slice(text, html_start, html_end);
 
-        // Build all parts and return the requested one
-        let parts = build_parts(html_text, &self.kf8.files, &self.kf8.elems);
+        // Assemble all parts once and reuse across chapters.
+        let parts = self
+            .parts_cache
+            .get_or_init(|| build_parts(html_text, &self.kf8.files, &self.kf8.elems));
 
         let content = parts
             .get(chapter_id as usize)
@@ -576,7 +629,12 @@ impl Azw3Importer {
             transform::transform_kindle_refs(&content, &self.kf8.elems, html_text, &file_starts);
 
         // Strip Amazon-specific attributes (aid, data-Amzn*)
-        let cleaned = transform::strip_kindle_attributes_fast(&transformed);
+        let mut cleaned = transform::strip_kindle_attributes_fast(&transformed);
+
+        // Fix stray solidi between attributes (`src="x.gif"/ alt=""`, a real
+        // AZW3 markup quirk that glues the next attribute into the value
+        // under the XML parse path).
+        crate::mobi::filepos::fix_stray_attribute_solidus(&mut cleaned);
 
         Ok(cleaned)
     }
@@ -584,6 +642,12 @@ impl Azw3Importer {
     /// Discover asset paths by scanning image and font records.
     fn discover_assets(&self) -> Vec<String> {
         let mut assets = Vec::new();
+
+        // KF8 stylesheet flows (flow 0 is the HTML) — listed so exporters
+        // that copy assets ship the CSS the chapters link to.
+        for css_idx in 0..self.kf8.flow_table.len().saturating_sub(1) {
+            assets.push(format!("styles/style{:04}.css", css_idx));
+        }
 
         if self.mobi.first_image_index == NULL_INDEX {
             return assets;
@@ -800,6 +864,7 @@ fn find_file_for_position(files: &[SkeletonFile], pos: u32) -> Option<&SkeletonF
 /// Convert TocNode to TocEntry recursively.
 fn toc_node_to_entry(node: TocNode) -> TocEntry {
     let mut entry = TocEntry::new(&node.title, &node.href);
+    entry.play_order = Some(node.ncx_index);
     entry.children = node.children.into_iter().map(toc_node_to_entry).collect();
     entry
 }

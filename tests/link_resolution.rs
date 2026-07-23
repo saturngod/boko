@@ -15,7 +15,7 @@ fn test_azw3_toc_resolution() {
         return;
     }
 
-    let mut book = Book::open(path).expect("Should open AZW3");
+    let book = Book::open(path).expect("Should open AZW3");
 
     // Before resolve_links: TOC hrefs don't have fragments
     // Resolve links (also resolves TOC)
@@ -96,7 +96,7 @@ fn test_epub_toc_resolution() {
         return;
     }
 
-    let mut book = Book::open(path).expect("Should open EPUB");
+    let book = Book::open(path).expect("Should open EPUB");
     let _ = book.resolve_links().expect("Should resolve links");
 
     assert_unique_toc_hrefs(book.toc(), "EPUB");
@@ -110,7 +110,7 @@ fn test_mobi_toc_resolution() {
         return;
     }
 
-    let mut book = Book::open(path).expect("Should open MOBI");
+    let book = Book::open(path).expect("Should open MOBI");
     let _ = book.resolve_links().expect("Should resolve links");
 
     assert_unique_toc_hrefs(book.toc(), "MOBI");
@@ -124,7 +124,7 @@ fn test_kfx_toc_resolution() {
         return;
     }
 
-    let mut book = Book::open(path).expect("Should open KFX");
+    let book = Book::open(path).expect("Should open KFX");
     let _ = book.resolve_links().expect("Should resolve links");
 
     assert_unique_toc_hrefs(book.toc(), "KFX");
@@ -138,7 +138,7 @@ fn test_kfx_named_resource_returns_binary_asset() {
         return;
     }
 
-    let mut book = Book::open(path).expect("Should open KFX");
+    let book = Book::open(path).expect("Should open KFX");
 
     let expected = [
         ("resource/rsrc7", "dae4335aa095d1109e81a413cea05e1a3225e4ed"),
@@ -185,7 +185,7 @@ fn test_kfx_direct_asset_id_1102_matches_named_resource_and_hash() {
         return;
     }
 
-    let mut book = Book::open(path).expect("Should open KFX");
+    let book = Book::open(path).expect("Should open KFX");
 
     assert!(
         book.list_assets().iter().any(|p| p == "#1102"),

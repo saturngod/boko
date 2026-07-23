@@ -31,7 +31,8 @@ use crate::import::ChapterId;
 use crate::model::{Book, Chapter, NodeId, Role};
 use crate::style::{StyleId, StylePool};
 
-use super::{generate_css, synthesize_xhtml_document_with_class_list};
+use super::html_synth::MathForm;
+use super::{generate_css, synthesize_xhtml_document_with_class_list_math};
 
 /// Collects styles from all chapters into a unified pool.
 ///
@@ -150,6 +151,11 @@ pub struct NormalizedContent {
     /// callers turn a bare `#anchor` (as KFX TOCs use) or a cross-chapter link
     /// into a `chapter_{i}.xhtml#anchor` reference that actually resolves.
     pub anchor_to_output: HashMap<String, String>,
+    /// Resolved-link overrides: original href string -> emitted target.
+    /// Built from `Book::resolve_links()`, this bridges importer-specific
+    /// anchor schemes (KFX `#a1CJ` anchor symbols) to the target node's real
+    /// emitted id, which the id-based maps above cannot do.
+    pub href_remap: HashMap<String, String>,
 }
 
 impl NormalizedContent {
@@ -158,9 +164,19 @@ impl NormalizedContent {
         toc.iter().map(|e| self.rewrite_toc_entry(e)).collect()
     }
 
+    /// Rewrite a single book-global href (e.g. a landmark target) onto the
+    /// emitted `chapter_{i}.xhtml` files, like [`Self::rewrite_toc`] does for
+    /// TOC entries.
+    pub fn rewrite_link(&self, href: &str) -> String {
+        if let Some(mapped) = self.href_remap.get(href) {
+            return mapped.clone();
+        }
+        rewrite_href(&self.source_to_output, &self.anchor_to_output, None, href)
+    }
+
     fn rewrite_toc_entry(&self, entry: &crate::model::TocEntry) -> crate::model::TocEntry {
         let mut out = entry.clone();
-        out.href = rewrite_href(&self.source_to_output, &self.anchor_to_output, None, &entry.href);
+        out.href = self.rewrite_link(&entry.href);
         out.children = entry
             .children
             .iter()
@@ -218,6 +234,40 @@ fn rewrite_href(
     }
 }
 
+/// Reverse the exact set of entities [`escape_xml_into`] produces
+/// (`&amp; &lt; &gt; &quot; &#39;`, plus `&apos;`). Borrows unchanged when
+/// there is no `&`. Unknown entities keep their literal `&`.
+fn xml_unescape(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains('&') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let (repl, len) = if tail.starts_with("&amp;") {
+            ("&", 5)
+        } else if tail.starts_with("&lt;") {
+            ("<", 4)
+        } else if tail.starts_with("&gt;") {
+            (">", 4)
+        } else if tail.starts_with("&quot;") {
+            ("\"", 6)
+        } else if tail.starts_with("&#39;") {
+            ("'", 5)
+        } else if tail.starts_with("&apos;") {
+            ("'", 6)
+        } else {
+            ("&", 1) // not a recognized entity: keep the literal ampersand
+        };
+        out.push_str(repl);
+        rest = &tail[len..];
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
 /// Rewrite the `href="…"` attributes inside a synthesized document so internal
 /// links point at the emitted chapter files.
 fn rewrite_document_hrefs(
@@ -225,6 +275,7 @@ fn rewrite_document_hrefs(
     base_source: &str,
     source_to_output: &HashMap<String, String>,
     anchor_to_output: &HashMap<String, String>,
+    href_remap: &HashMap<String, String>,
 ) -> String {
     const NEEDLE: &str = " href=\"";
     if !doc.contains(NEEDLE) {
@@ -236,13 +287,21 @@ fn rewrite_document_hrefs(
         let (before, after) = rest.split_at(pos + NEEDLE.len());
         out.push_str(before);
         if let Some(end) = after.find('"') {
-            let rewritten = rewrite_href(
-                source_to_output,
-                anchor_to_output,
-                Some(base_source),
-                &after[..end],
-            );
-            out.push_str(&rewritten);
+            // The href in the document is XML-escaped (html_synth wrote it),
+            // but every rewrite map is keyed on the raw, unescaped href — so
+            // unescape before lookup or a link containing `&`/`<`/`>` misses
+            // and stays pointed at a nonexistent source path. Re-escape the
+            // result for the attribute context; for the common (no-entity)
+            // href this whole dance is a no-op.
+            let unescaped = xml_unescape(&after[..end]);
+            let key: &str = &unescaped;
+            // Resolved-link overrides win: they carry importer knowledge the
+            // string-based maps below don't have (see `href_remap`).
+            let rewritten = match href_remap.get(key) {
+                Some(mapped) => mapped.clone(),
+                None => rewrite_href(source_to_output, anchor_to_output, Some(base_source), key),
+            };
+            super::escape_xml_into(&mut out, &rewritten);
             rest = &after[end..];
         } else {
             rest = after;
@@ -268,8 +327,15 @@ fn rewrite_document_hrefs(
 /// # Returns
 ///
 /// A `NormalizedContent` containing all normalized data ready for export.
-pub fn normalize_book(book: &mut Book) -> crate::Result<NormalizedContent> {
-    let spine: Vec<_> = book.spine().to_vec();
+pub fn normalize_book(book: &Book) -> crate::Result<NormalizedContent> {
+    normalize_book_math(book, MathForm::MathMl)
+}
+
+/// [`normalize_book`] with an explicit math serialization form — KF8/MOBI
+/// targets pass [`MathForm::Text`] because their renderers cannot display
+/// MathML.
+pub fn normalize_book_math(book: &Book, math_form: MathForm) -> crate::Result<NormalizedContent> {
+    let spine = book.spine();
 
     // =========================================================================
     // Pass 1: Load all chapters and merge styles
@@ -313,6 +379,58 @@ pub fn normalize_book(book: &mut Book) -> crate::Result<NormalizedContent> {
     }
 
     // =========================================================================
+    // Resolve importer-specific link anchors
+    // =========================================================================
+    //
+    // Some importers use anchor schemes that don't correspond to element ids
+    // in the IR (KFX links carry anchor *symbols* like "#a1CJ" while the
+    // target nodes carry numeric eids). The string maps above can't bridge
+    // that, so consult the book's resolved links and point each such href at
+    // the target node's real emitted location.
+    let chapter_pos: HashMap<ChapterId, usize> = ir_chapters
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _, _))| (*id, i))
+        .collect();
+    let mut per_chapter_remap: Vec<HashMap<String, String>> =
+        vec![HashMap::new(); ir_chapters.len()];
+    let mut href_remap: HashMap<String, String> = HashMap::new();
+    if let Ok(resolved) = book.resolve_links() {
+        for (idx, (chapter_id, _, chapter)) in ir_chapters.iter().enumerate() {
+            for node_id in chapter.iter_dfs() {
+                let Some(href) = chapter.semantics.href(node_id) else {
+                    continue;
+                };
+                if href.is_empty() || href.contains("://") || href.starts_with("mailto:") {
+                    continue;
+                }
+                let target = resolved.get(crate::model::GlobalNodeId::new(*chapter_id, node_id));
+                let output = match target {
+                    Some(crate::model::AnchorTarget::Internal(gid)) => {
+                        let Some(&tidx) = chapter_pos.get(&gid.chapter) else {
+                            continue;
+                        };
+                        let frag = ir_chapters[tidx].2.semantics.id(gid.node);
+                        match frag {
+                            Some(frag) => format!("chapter_{tidx}.xhtml#{frag}"),
+                            None => format!("chapter_{tidx}.xhtml"),
+                        }
+                    }
+                    Some(crate::model::AnchorTarget::Chapter(cid)) => {
+                        let Some(&tidx) = chapter_pos.get(cid) else {
+                            continue;
+                        };
+                        format!("chapter_{tidx}.xhtml")
+                    }
+                    _ => continue,
+                };
+                per_chapter_remap[idx].insert(href.to_string(), output.clone());
+                href_remap.entry(href.to_string()).or_insert(output);
+            }
+        }
+    }
+
+    // =========================================================================
     // Generate unified CSS
     // =========================================================================
 
@@ -346,16 +464,22 @@ pub fn normalize_book(book: &mut Book) -> crate::Result<NormalizedContent> {
         let title = extract_chapter_title(ir).unwrap_or_else(|| source_path.clone());
 
         // Synthesize XHTML document
-        let result = synthesize_xhtml_document_with_class_list(
+        let result = synthesize_xhtml_document_with_class_list_math(
             ir,
             &remapped_class_list,
             &title,
             Some("style.css"),
+            math_form,
         );
 
         // Rewrite internal links to target the emitted chapter files.
-        let document =
-            rewrite_document_hrefs(&result.body, source_path, &source_to_output, &anchor_to_output);
+        let document = rewrite_document_hrefs(
+            &result.body,
+            source_path,
+            &source_to_output,
+            &anchor_to_output,
+            &per_chapter_remap[idx],
+        );
 
         (
             ChapterContent {
@@ -394,6 +518,7 @@ pub fn normalize_book(book: &mut Book) -> crate::Result<NormalizedContent> {
         css: css_artifact.stylesheet,
         source_to_output,
         anchor_to_output,
+        href_remap,
     })
 }
 
@@ -433,6 +558,39 @@ mod tests {
     use super::*;
     use crate::model::Node;
     use crate::style::{ComputedStyle, FontWeight};
+
+    #[test]
+    fn xml_unescape_reverses_escape_xml() {
+        // Round-trips the exact entity set escape_xml_into produces.
+        for raw in ["a&b", "x<y>z", "he said \"hi\"", "it's", "plain/path#frag"] {
+            let escaped = super::super::escape_xml(raw);
+            assert_eq!(xml_unescape(&escaped), raw, "round trip for {raw:?}");
+        }
+        // No-ampersand fast path borrows unchanged.
+        assert!(matches!(
+            xml_unescape("chapter_0.xhtml#frag"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // Unknown entity keeps its literal ampersand.
+        assert_eq!(xml_unescape("a&unknown;b"), "a&unknown;b");
+    }
+
+    #[test]
+    fn rewrite_document_hrefs_handles_escaped_ampersand() {
+        // A resolved link whose raw href contains `&` is escaped in the doc
+        // as `&amp;`; the rewrite must still find it and retarget it.
+        let mut href_remap = HashMap::new();
+        href_remap.insert("ch1.xhtml#a&b".to_string(), "chapter_0.xhtml#x".to_string());
+        let doc = r#"<a href="ch1.xhtml#a&amp;b">link</a>"#;
+        let out = rewrite_document_hrefs(
+            doc,
+            "src.xhtml",
+            &HashMap::new(),
+            &HashMap::new(),
+            &href_remap,
+        );
+        assert!(out.contains(r#"href="chapter_0.xhtml#x""#), "{out}");
+    }
 
     #[test]
     fn test_global_style_pool_new() {
@@ -521,8 +679,7 @@ mod tests {
     fn rewrite_href_maps_anchors_and_paths() {
         let source_to_output =
             HashMap::from([("text/ch2.xhtml".to_string(), "chapter_1.xhtml".to_string())]);
-        let anchor_to_output =
-            HashMap::from([("sec3".to_string(), "chapter_1.xhtml".to_string())]);
+        let anchor_to_output = HashMap::from([("sec3".to_string(), "chapter_1.xhtml".to_string())]);
         let rw = |href: &str| rewrite_href(&source_to_output, &anchor_to_output, None, href);
 
         // Bare "#anchor" (as KFX TOCs use) -> the chapter that defines it.

@@ -50,7 +50,7 @@ fn epub_export_writes_font_assets_from_kfx() {
         return;
     };
 
-    let mut book = Book::open(tmp.path()).expect("open KFX fonts_only fixture");
+    let book = Book::open(tmp.path()).expect("open KFX fonts_only fixture");
 
     // Sanity: the importer surfaces the fonts via list_assets.
     let surfaced_fonts: Vec<_> = book
@@ -68,7 +68,7 @@ fn epub_export_writes_font_assets_from_kfx() {
     // Export to an in-memory EPUB.
     let mut buf = Cursor::new(Vec::<u8>::new());
     EpubExporter::new()
-        .export(&mut book, &mut buf)
+        .export(&book, &mut buf)
         .expect("epub export");
 
     let epub_bytes = buf.into_inner();
@@ -141,10 +141,10 @@ fn epub_export_resolves_azw3_toc_fragments() {
 
     // Export to in-memory EPUB. The exporter must call `resolve_toc()`
     // internally so the generated NCX has fragments populated.
-    let mut book = Book::open(azw3_path).expect("re-open epictetus.azw3");
+    let book = Book::open(azw3_path).expect("re-open epictetus.azw3");
     let mut buf = Cursor::new(Vec::<u8>::new());
     EpubExporter::new()
-        .export(&mut book, &mut buf)
+        .export(&book, &mut buf)
         .expect("epub export");
 
     let epub_bytes = buf.into_inner();

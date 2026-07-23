@@ -5,8 +5,8 @@ use std::io;
 pub use super::headers::{Compression, Encoding, ExthHeader, MobiHeader, NULL_INDEX};
 pub use super::huffcdic::HuffCdicReader;
 pub use super::index::{
-    Cncx, DivElement, IndexEntry, NcxEntry, SkeletonFile, parse_div_index, parse_ncx_index,
-    parse_skel_index, read_index,
+    DivElement, NcxEntry, SkeletonFile, parse_div_index, parse_ncx_index, parse_skel_index,
+    read_index,
 };
 
 /// PDB (Palm Database) header info extracted from bytes.
@@ -131,29 +131,12 @@ impl MobiFormat {
     }
 }
 
-/// Detect format from headers.
-pub fn detect_format(mobi: &MobiHeader, exth: Option<&ExthHeader>) -> MobiFormat {
-    // Pure KF8: version 8
-    if mobi.mobi_version == 8 {
-        return MobiFormat::Kf8;
-    }
-
-    // Check for combo file: EXTH 121 points to KF8 boundary
-    if let Some(kf8_idx) = exth.and_then(|e| e.kf8_boundary)
-        && kf8_idx > 0
-    {
-        return MobiFormat::Combo {
-            kf8_record_offset: kf8_idx as usize,
-        };
-    }
-
-    MobiFormat::Mobi6
-}
-
 /// Parse EXTH header if present.
 pub fn parse_exth(record0: &[u8], header: &MobiHeader) -> Option<ExthHeader> {
     if header.has_exth() && header.header_length > 0 {
-        let exth_start = 16 + header.header_length as usize;
+        // checked_add: header_length is an untrusted u32; 16 + u32::MAX
+        // overflows 32-bit usize (wasm32) under the release overflow checks.
+        let exth_start = (header.header_length as usize).checked_add(16)?;
         if exth_start < record0.len() {
             return ExthHeader::parse(&record0[exth_start..], header.encoding).ok();
         }
@@ -176,10 +159,15 @@ pub fn parse_fdst(data: &[u8]) -> io::Result<Vec<(usize, usize)>> {
     // check runs.
     let mut flows = Vec::with_capacity(num_sections.min(data.len() / 8));
     for i in 0..num_sections {
-        let offset = sec_start + i * 8;
-        if offset + 8 > data.len() {
+        // Checked: sec_start + i*8 can overflow 32-bit usize for a bogus
+        // num_sections before the bounds check gets a chance to break.
+        let Some(offset) = i
+            .checked_mul(8)
+            .and_then(|o| o.checked_add(sec_start))
+            .filter(|&o| o.checked_add(8).is_some_and(|e| e <= data.len()))
+        else {
             break;
-        }
+        };
 
         let start = u32::from_be_bytes([
             data[offset],
@@ -301,6 +289,12 @@ pub fn detect_font_type(data: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// Maximum bytes a single FONT record may decompress to. Even the largest
+/// real embedded fonts (full CJK families) are well under this; a crafted
+/// zlib stream ("font bomb") hits the cap and errors instead of exhausting
+/// memory. Mirrors `util::MAX_DECOMPRESSED_ENTRY` / `MAX_DECOMPRESSED_RECORD`.
+const MAX_FONT_DECOMPRESSED: usize = 32 * 1024 * 1024;
+
 /// Decode a Kindle `FONT` container record into raw font bytes.
 ///
 /// AZW3 and MOBI ebooks may embed fonts wrapped in a `FONT` FourCC container
@@ -365,14 +359,24 @@ pub fn decode_font_record(data: &[u8]) -> io::Result<Vec<u8>> {
         }
     }
 
-    // Decompress
+    // Decompress. The zlib stream is untrusted, so cap the output (same
+    // `.take(cap + 1)` pattern as `util::bounded_inflate`, which handles raw
+    // DEFLATE; FONT records are zlib-wrapped): a tiny crafted record could
+    // otherwise inflate to gigabytes. No real font approaches this cap.
     if is_compressed {
         use std::io::Read;
-        let mut decoder = flate2::read::ZlibDecoder::new(&font_data[..]);
+        let mut decoder =
+            flate2::read::ZlibDecoder::new(&font_data[..]).take(MAX_FONT_DECOMPRESSED as u64 + 1);
         let mut decompressed = Vec::new();
         decoder.read_to_end(&mut decompressed).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("FONT zlib error: {e}"))
         })?;
+        if decompressed.len() > MAX_FONT_DECOMPRESSED {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FONT record decompresses beyond size limit",
+            ));
+        }
         Ok(decompressed)
     } else {
         Ok(font_data)
@@ -413,6 +417,10 @@ pub fn is_metadata_record(data: &[u8]) -> bool {
 pub struct TocNode {
     pub title: String,
     pub href: String,
+    /// Index of this node's entry in the flat NCX list (its play order).
+    /// Lets importers key per-entry side data (e.g. byte positions) without
+    /// relying on (title, href) pairs, which collide for duplicate titles.
+    pub ncx_index: usize,
     pub children: Vec<TocNode>,
 }
 
@@ -424,7 +432,7 @@ pub struct TocNode {
 /// - KF8/AZW3: `part{file_number:04}.html`
 pub fn build_toc_from_ncx<F>(ncx: &[NcxEntry], mut href_fn: F) -> Vec<TocNode>
 where
-    F: FnMut(&NcxEntry) -> String,
+    F: FnMut(usize, &NcxEntry) -> String,
 {
     use quick_xml::escape::unescape;
     use std::collections::HashMap;
@@ -436,14 +444,16 @@ where
     // Build flat entries
     let entries: Vec<TocNode> = ncx
         .iter()
-        .map(|entry| {
-            let href = href_fn(entry);
+        .enumerate()
+        .map(|(i, entry)| {
+            let href = href_fn(i, entry);
             let title = unescape(&entry.text)
                 .map(|s| s.into_owned())
                 .unwrap_or_else(|_| entry.text.clone());
             TocNode {
                 title,
                 href,
+                ncx_index: i,
                 children: Vec::new(),
             }
         })
@@ -507,6 +517,53 @@ mod tests {
         data.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // num_sections (lie)
         let flows = parse_fdst(&data).unwrap();
         assert!(flows.is_empty());
+    }
+
+    /// Build a FONT record (no obfuscation) wrapping the given zlib payload.
+    fn make_font_record(compressed: &[u8]) -> Vec<u8> {
+        let mut rec = Vec::with_capacity(24 + compressed.len());
+        rec.extend_from_slice(b"FONT");
+        rec.extend_from_slice(&0u32.to_be_bytes()); // uncompressed size (unused)
+        rec.extend_from_slice(&1u32.to_be_bytes()); // flags: bit 0 = compressed
+        rec.extend_from_slice(&24u32.to_be_bytes()); // data offset
+        rec.extend_from_slice(&0u32.to_be_bytes()); // xor key len
+        rec.extend_from_slice(&0u32.to_be_bytes()); // xor key offset
+        rec.extend_from_slice(compressed);
+        rec
+    }
+
+    fn zlib_compress(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn test_decode_font_record_compressed_roundtrip() {
+        let font = b"OTTO fake font bytes";
+        let record = make_font_record(&zlib_compress(font));
+        let decoded = decode_font_record(&record).unwrap();
+        assert_eq!(decoded, font);
+    }
+
+    #[test]
+    fn test_decode_font_record_rejects_decompression_bomb() {
+        // A few KB of zlib-compressed zeros that inflate past the 32 MB cap.
+        // Unbounded read_to_end would previously balloon this into memory;
+        // it must now error cleanly at the cap.
+        let bomb = zlib_compress(&vec![0u8; MAX_FONT_DECOMPRESSED + 1]);
+        assert!(
+            bomb.len() < MAX_FONT_DECOMPRESSED / 100,
+            "bomb should be tiny relative to its expansion"
+        );
+        let record = make_font_record(&bomb);
+        let err = decode_font_record(&record).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("size limit"),
+            "Expected size-limit error, got: {err}"
+        );
     }
 
     fn make_pdb_header(name: &str, num_records: u16, offsets: &[u32]) -> Vec<u8> {
@@ -593,46 +650,6 @@ mod tests {
     fn test_pdb_info_too_short() {
         let data = vec![0u8; 50];
         assert!(PdbInfo::parse(&data).is_err());
-    }
-
-    #[test]
-    fn test_detect_format_kf8() {
-        let mut header = MobiHeader::parse(&[0u8; 0x6C]).unwrap();
-        header.mobi_version = 8;
-
-        let format = detect_format(&header, None);
-        assert!(matches!(format, MobiFormat::Kf8));
-        assert!(format.is_kf8());
-        assert_eq!(format.record_offset(), 0);
-    }
-
-    #[test]
-    fn test_detect_format_combo() {
-        let header = MobiHeader::parse(&[0u8; 32]).unwrap();
-        let exth = ExthHeader {
-            kf8_boundary: Some(100),
-            ..Default::default()
-        };
-
-        let format = detect_format(&header, Some(&exth));
-        assert!(matches!(
-            format,
-            MobiFormat::Combo {
-                kf8_record_offset: 100
-            }
-        ));
-        assert!(format.is_kf8());
-        assert_eq!(format.record_offset(), 100);
-    }
-
-    #[test]
-    fn test_detect_format_mobi6() {
-        let header = MobiHeader::parse(&[0u8; 32]).unwrap();
-
-        let format = detect_format(&header, None);
-        assert!(matches!(format, MobiFormat::Mobi6));
-        assert!(!format.is_kf8());
-        assert_eq!(format.record_offset(), 0);
     }
 
     #[test]
@@ -890,7 +907,7 @@ mod tests {
             },
         ];
 
-        let toc = build_toc_from_ncx(&ncx, |e| format!("ch{}.html", e.pos));
+        let toc = build_toc_from_ncx(&ncx, |_, e| format!("ch{}.html", e.pos));
 
         assert_eq!(toc.len(), 2);
         assert_eq!(toc[0].title, "Chapter 1");
@@ -931,7 +948,7 @@ mod tests {
             },
         ];
 
-        let toc = build_toc_from_ncx(&ncx, |e| format!("#{}", e.pos));
+        let toc = build_toc_from_ncx(&ncx, |_, e| format!("#{}", e.pos));
 
         assert_eq!(toc.len(), 1);
         assert_eq!(toc[0].title, "Part 1");
@@ -942,7 +959,7 @@ mod tests {
 
     #[test]
     fn test_build_toc_from_ncx_empty() {
-        let toc = build_toc_from_ncx(&[], |_| String::new());
+        let toc = build_toc_from_ncx(&[], |_, _| String::new());
         assert!(toc.is_empty());
     }
 
@@ -958,7 +975,7 @@ mod tests {
             pos_fid: None,
         }];
 
-        let toc = build_toc_from_ncx(&ncx, |_| "#0".to_string());
+        let toc = build_toc_from_ncx(&ncx, |_, _| "#0".to_string());
         assert_eq!(toc[0].title, "Tom & Jerry");
     }
 }

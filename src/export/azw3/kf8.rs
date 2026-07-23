@@ -15,8 +15,14 @@ pub(super) struct Kf8Builder {
     chunker_result: Option<ChunkerResult>,
     /// Maps resource href to 1-indexed resource record number
     resource_map: HashMap<String, usize>,
-    /// CSS flows (flow 0 is text, flows 1+ are CSS)
+    /// Source CSS flows (flow 0 is text, flows 1+ are CSS), before rewriting.
     css_flows: Vec<String>,
+    /// Byte length of each rewritten CSS flow, in the exact bytes that land in
+    /// the text records. Kept separately from the lossy-decoded `css_flows`
+    /// strings because FDST flow boundaries must be measured in real bytes —
+    /// `from_utf8_lossy` inflates invalid bytes to 3-byte U+FFFD and would
+    /// desync the boundary from the record contents.
+    css_flow_lengths: Vec<usize>,
     /// Total flows length (text + CSS)
     flows_length: usize,
     /// Ordered list of image hrefs
@@ -32,7 +38,7 @@ pub(super) struct Kf8Builder {
 }
 
 impl Kf8Builder {
-    pub(super) fn new(book: &mut Book, normalize: bool) -> crate::Result<Self> {
+    pub(super) fn new(book: &Book, normalize: bool) -> crate::Result<Self> {
         let ctx = BookContext::from_book(book, normalize)?;
 
         let mut builder = Self {
@@ -49,6 +55,7 @@ impl Kf8Builder {
             chunker_result: None,
             resource_map: HashMap::new(),
             css_flows: Vec::new(),
+            css_flow_lengths: Vec::new(),
             flows_length: 0,
             image_hrefs: Vec::new(),
             font_hrefs: Vec::new(),
@@ -213,17 +220,35 @@ impl Kf8Builder {
         }
         self.flows_length = all_flows.len();
 
-        // Split into records and PalmDoc-compress.
-        let mut pos = 0;
-        while pos < all_flows.len() {
-            let end = (pos + RECORD_SIZE).min(all_flows.len());
-            let chunk = &all_flows[pos..end];
+        // Split into records and PalmDoc-compress. Records are compressed
+        // independently, so this fans out across chunks (the compression is
+        // the bulk of AZW3 export time on large books).
+        fn compress_record(chunk: &[u8]) -> Vec<u8> {
             let mut record = crate::mobi::palmdoc::compress(chunk);
             record.push(0); // multibyte indicator (0 = no UTF-8 overlap)
-            self.records.push(record);
-            pos = end;
+            record
+        }
+        #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+        {
+            use rayon::prelude::*;
+            self.records
+                .par_extend(all_flows.par_chunks(RECORD_SIZE).map(compress_record));
+        }
+        #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+        {
+            self.records
+                .extend(all_flows.chunks(RECORD_SIZE).map(compress_record));
         }
 
+        // The PDB record count is a u16, so the whole book is capped at 65535
+        // records (~256 MB of text at 4 KB each). Fail cleanly at the format
+        // ceiling instead of truncating the count and emitting a corrupt file.
+        if self.records.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "book exceeds the 65535-record PDB limit",
+            ));
+        }
         self.last_text_record = (self.records.len() - 1) as u16;
         // Insert a zero-padding record after text so the next (non-text)
         // record starts at a 4-byte boundary in the rawml stream. Calibre
@@ -242,10 +267,9 @@ impl Kf8Builder {
         }
         self.chunker_result = Some(chunker_result);
 
-        self.css_flows = rewritten_css
-            .into_iter()
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .collect();
+        // Record the real (rewritten) byte length of each CSS flow for FDST;
+        // these bytes were already appended to `all_flows` above verbatim.
+        self.css_flow_lengths = rewritten_css.iter().map(Vec::len).collect();
 
         Ok(())
     }
@@ -364,7 +388,7 @@ impl Kf8Builder {
             // Build SKEL index
             if !chunker_result.skel_table.is_empty() {
                 self.skel_index = self.records.len() as u32;
-                let skel_records = build_skel_indx(&chunker_result.skel_table);
+                let skel_records = build_skel_indx(&chunker_result.skel_table)?;
                 for record in skel_records {
                     self.records.push(record);
                 }
@@ -377,17 +401,23 @@ impl Kf8Builder {
                     .iter()
                     .map(|c| c.selector.clone())
                     .collect();
+                // `calculate_cncx_offsets` and `build_cncx` share the same
+                // record-rollover logic, so the offsets already encode
+                // `record_number << 16 | offset_within_record`.
                 let cncx_offsets = calculate_cncx_offsets(&selectors);
-                let cncx = build_cncx(&selectors);
+                let cncx_records = build_cncx(&selectors)?;
 
                 self.frag_index = self.records.len() as u32;
-                let chunk_records = build_chunk_indx(&chunker_result.chunk_table, &cncx_offsets);
+                let chunk_records = build_chunk_indx(
+                    &chunker_result.chunk_table,
+                    &cncx_offsets,
+                    cncx_records.len() as u32,
+                )?;
                 for record in chunk_records {
                     self.records.push(record);
                 }
-
-                if !cncx.is_empty() {
-                    self.records.push(cncx);
+                for record in cncx_records {
+                    self.records.push(record);
                 }
             }
         }
@@ -406,12 +436,12 @@ impl Kf8Builder {
 
             if !ncx_entries.is_empty() {
                 self.ncx_index = self.records.len() as u32;
-                let (ncx_records, ncx_cncx) = build_ncx_indx(&ncx_entries);
+                let (ncx_records, ncx_cncx) = build_ncx_indx(&ncx_entries)?;
                 for record in ncx_records {
                     self.records.push(record);
                 }
-                if !ncx_cncx.is_empty() {
-                    self.records.push(ncx_cncx);
+                for record in ncx_cncx {
+                    self.records.push(record);
                 }
                 self.ncx_entries = ncx_entries;
             }
@@ -428,12 +458,12 @@ impl Kf8Builder {
             );
             if !guide_entries.is_empty() {
                 self.guide_index = self.records.len() as u32;
-                let (guide_records, guide_cncx) = build_guide_indx(&guide_entries);
+                let (guide_records, guide_cncx) = build_guide_indx(&guide_entries)?;
                 for record in guide_records {
                     self.records.push(record);
                 }
-                if !guide_cncx.is_empty() {
-                    self.records.push(guide_cncx);
+                for record in guide_cncx {
+                    self.records.push(record);
                 }
             }
         }
@@ -492,7 +522,7 @@ impl Kf8Builder {
     }
 
     pub(super) fn build_fdst_record(&mut self) -> io::Result<()> {
-        let num_flows = 1 + self.css_flows.len();
+        let num_flows = 1 + self.css_flow_lengths.len();
 
         let mut fdst = Vec::new();
         fdst.extend_from_slice(b"FDST");
@@ -505,9 +535,9 @@ impl Kf8Builder {
 
         // CSS flows
         let mut offset = self.text_length;
-        for css in &self.css_flows {
+        for &css_len in &self.css_flow_lengths {
             let start = offset;
-            let end = offset + css.len();
+            let end = offset + css_len;
             fdst.extend_from_slice(&(start as u32).to_be_bytes());
             fdst.extend_from_slice(&(end as u32).to_be_bytes());
             offset = end;
@@ -567,7 +597,9 @@ impl Kf8Builder {
         record0.extend_from_slice(&mobi_header_len.to_be_bytes());
         record0.extend_from_slice(&2u32.to_be_bytes()); // Book type
         record0.extend_from_slice(&65001u32.to_be_bytes()); // UTF-8
-        record0.extend_from_slice(&rand_uid().to_be_bytes());
+        record0.extend_from_slice(
+            &book_uid(&self.ctx.metadata.identifier, &self.ctx.metadata.title).to_be_bytes(),
+        );
         record0.extend_from_slice(&8u32.to_be_bytes()); // KF8 version
 
         // Meta indices (40-80)
@@ -622,7 +654,7 @@ impl Kf8Builder {
         // FDST
         let fdst_record = (self.records.len() - 4) as u32;
         record0.extend_from_slice(&fdst_record.to_be_bytes());
-        let fdst_count = 1 + self.css_flows.len() as u32;
+        let fdst_count = 1 + self.css_flow_lengths.len() as u32;
         record0.extend_from_slice(&fdst_count.to_be_bytes());
 
         // FCIS
@@ -822,7 +854,14 @@ impl Kf8Builder {
             content.push(0);
         }
 
-        let header_len = 12 + content.len() as u32;
+        // The EXTH `length` field is the whole block: "EXTH"(4) + this
+        // length field(4) + content — and `content` already includes the
+        // 4-byte record count. So it is `8 + content.len()`, NOT
+        // `12 + content.len()` (that double-counts the count and overstates
+        // the field by 4, sending a spec-strict consumer 4 bytes into the
+        // title region). Calibre's `len(records) + 12` matches because its
+        // `records` excludes the count.
+        let header_len = 8 + content.len() as u32;
         exth.extend_from_slice(&header_len.to_be_bytes());
         exth.extend_from_slice(&content);
 
@@ -830,6 +869,16 @@ impl Kf8Builder {
     }
 
     pub(super) fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        // The PDB record count is a u16 (written below); guard the *total*
+        // (text + images + indices) so a large book fails cleanly instead of
+        // truncating the count and pointer table into a corrupt file.
+        if self.records.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "book exceeds the 65535-record PDB limit",
+            ));
+        }
+
         // Calculate offsets
         let mut offsets = Vec::new();
         let pdb_header_size = 78 + 8 * self.records.len() + 2;
@@ -938,9 +987,14 @@ pub(super) fn write_font_record(data: &[u8]) -> io::Result<Vec<u8>> {
     Ok(record)
 }
 
-pub(super) fn rand_uid() -> u32 {
-    let seed = crate::util::time_seed_nanos() as u32;
-    seed.wrapping_mul(1103515245).wrapping_add(12345)
+/// Derive the MOBI-header unique ID deterministically from the book's
+/// identity, so exporting the same book twice is byte-reproducible.
+/// (Previously clock-seeded, which made every export differ.)
+pub(super) fn book_uid(identifier: &str, title: &str) -> u32 {
+    let digest = sha1_smol::Sha1::from(format!("{identifier}\n{title}").as_bytes())
+        .digest()
+        .bytes();
+    u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
 }
 
 pub(super) fn sanitize_title(title: &str) -> String {

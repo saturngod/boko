@@ -15,6 +15,18 @@ const MAX_HUFF_DEPTH: usize = 32;
 /// decompress to at most tens of KB; this ceiling is far above that.
 const MAX_DECOMPRESSED_RECORD: usize = 16 * 1024 * 1024;
 
+/// Total decompressed bytes allowed across every text record of one book,
+/// proportional to the compressed input size. Real HUFF/CDIC ratios are well
+/// under 10x; 64x plus a fixed floor leaves generous headroom while stopping
+/// the per-record cap from being multiplied across 65k tiny records into
+/// terabyte-scale output from a sub-megabyte file.
+pub fn total_text_budget(compressed_len: u64) -> usize {
+    let proportional = compressed_len.saturating_mul(64);
+    usize::try_from(proportional)
+        .unwrap_or(usize::MAX)
+        .saturating_add(4 * 1024 * 1024)
+}
+
 /// Charge `n` bytes against the remaining decompression budget, erroring if the
 /// record would exceed [`MAX_DECOMPRESSED_RECORD`].
 fn take_budget(budget: &mut usize, n: usize) -> io::Result<()> {
@@ -96,12 +108,21 @@ impl HuffCdicReader {
             let term = (v & 0x80) != 0;
             let maxcode_raw = v >> 8;
 
+            // A zero code length would make the decode loop consume zero bits
+            // and emit zero bytes per iteration — an infinite loop on hostile
+            // input (the output budget never fires because nothing is
+            // emitted). Real HUFF tables always use 1..=32-bit codes, so
+            // reject codelen == 0 outright. (The 0x1f mask already caps the
+            // value at 31, so > 32 is impossible.)
+            if codelen == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HUFF dict1 entry has zero code length",
+                ));
+            }
+
             // Calculate maxcode for this entry
-            let maxcode = if codelen > 0 {
-                ((maxcode_raw + 1) << (32 - codelen)).wrapping_sub(1)
-            } else {
-                0
-            };
+            let maxcode = ((maxcode_raw + 1) << (32 - codelen)).wrapping_sub(1);
 
             self.dict1.push((codelen, term, maxcode));
         }
@@ -159,8 +180,7 @@ impl HuffCdicReader {
         let n = std::cmp::min(entry_cap, phrases.saturating_sub(self.dictionary.len()));
 
         // Read offset table
-        if n
-            .checked_mul(2)
+        if n.checked_mul(2)
             .and_then(|b| b.checked_add(16))
             .is_none_or(|end| cdic.len() < end)
         {
@@ -200,10 +220,17 @@ impl HuffCdicReader {
     }
 
     /// Decompress a text record
-    pub fn decompress(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
+    /// Decompress one text record, charging output bytes against both the
+    /// per-record cap and `shared_budget` (the whole-book allowance from
+    /// [`total_text_budget`]). The shared budget is what stops a crafted
+    /// file with thousands of maximally-amplifying records from producing
+    /// terabytes of output 16 MiB at a time.
+    pub fn decompress(&mut self, data: &[u8], shared_budget: &mut usize) -> io::Result<Vec<u8>> {
         let mut result = Vec::new();
-        let mut budget = MAX_DECOMPRESSED_RECORD;
+        let allowed = MAX_DECOMPRESSED_RECORD.min(*shared_budget);
+        let mut budget = allowed;
         self.unpack_into(data, &mut result, 0, &mut budget)?;
+        *shared_budget -= allowed - budget;
         Ok(result)
     }
 
@@ -426,6 +453,41 @@ mod tests {
         };
         assert!(reader.load_huff(&huff).is_ok());
         assert_eq!(reader.dict1.len(), 256);
+    }
+
+    #[test]
+    fn test_load_huff_rejects_zero_codelen() {
+        // A dict1 entry with codelen == 0 used to make the decode loop consume
+        // zero bits and emit zero bytes forever (the output budget never fires
+        // because nothing is emitted) — an infinite loop on hostile input.
+        // Craft a HUFF record whose dict1 entries are all terminal with
+        // codelen == 0; load_huff must reject it up front.
+        let mut huff = make_huff();
+        // Overwrite every dict1 entry (at off1 = 24) with codelen = 0, term set:
+        // (maxcode_raw << 8) | 0x80 | 0 = 0x0000FF80
+        let bad_entry = 0x0000_FF80u32.to_be_bytes();
+        for i in 0..256 {
+            let pos = 24 + i * 4;
+            huff[pos..pos + 4].copy_from_slice(&bad_entry);
+        }
+
+        let mut reader = HuffCdicReader {
+            dict1: Vec::new(),
+            mincode: Vec::new(),
+            maxcode: Vec::new(),
+            dictionary: Vec::new(),
+        };
+        let err = reader.load_huff(&huff).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("zero code length"),
+            "Expected zero-code-length error, got: {err}"
+        );
+
+        // The full constructor path must also fail (this is the path that
+        // previously produced a reader whose decompress() spun forever).
+        let cdic = make_cdic();
+        assert!(HuffCdicReader::new(&huff, &[cdic.as_slice()]).is_err());
     }
 
     #[test]

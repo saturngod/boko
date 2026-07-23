@@ -3,9 +3,10 @@
 use cssparser::{ParseError, Parser, Token};
 
 use crate::model::FontFace;
+use crate::style::Declaration;
 use crate::style::properties::{FontStyle, FontWeight, Length};
 
-use super::keywords::parse_font_style;
+use super::keywords::{parse_font_style, parse_font_variant};
 
 /// Parse font-size value (handles lengths, percentages, and keywords).
 ///
@@ -55,6 +56,10 @@ pub(crate) fn parse_line_height(input: &mut Parser<'_, '_>) -> Option<Length> {
                 "em" => Length::Em(*value),
                 "rem" => Length::Rem(*value),
                 "%" => Length::Percent(*value),
+                // ex = x-height, approximately 0.5em
+                "ex" => Length::Em(*value * 0.5),
+                // pt = points, 1pt = 96/72 px
+                "pt" => Length::Px(*value * 96.0 / 72.0),
                 _ => return None,
             };
             Some(length)
@@ -124,6 +129,56 @@ pub(crate) fn parse_font_family(input: &mut Parser<'_, '_>) -> Option<String> {
     } else {
         Some(families.join(", "))
     }
+}
+
+/// Parse the `font` shorthand.
+///
+/// Grammar (CSS 2.1 / css-fonts-3):
+///   `[ <style> || <variant> || <weight> ]? <size> [ / <line-height> ]? <family>`
+///
+/// The leading style/variant/weight components are order-independent and
+/// optional; `<size>` and `<family>` are required (a value missing either —
+/// e.g. a system-font keyword like `menu`, or `inherit` — yields no
+/// declarations, exactly as when this shorthand was unhandled). `font-stretch`
+/// is not parsed. Without this, `font: italic bold 14px/1.5 Georgia, serif`
+/// — a very common authoring form — dropped every sub-property.
+pub(crate) fn parse_font_shorthand(input: &mut Parser<'_, '_>) -> Option<Vec<Declaration>> {
+    let mut decls = Vec::new();
+
+    // Leading components, in any order. `normal` matches any of them and is
+    // harmless (all three default to normal). Bounded so a stray token can't
+    // spin; three slots cover style + variant + weight.
+    for _ in 0..3 {
+        if let Ok(s) = input.try_parse(|i| parse_font_style(i).ok_or(())) {
+            decls.push(Declaration::FontStyle(s));
+            continue;
+        }
+        if let Ok(v) = input.try_parse(|i| parse_font_variant(i).ok_or(())) {
+            decls.push(Declaration::FontVariant(v));
+            continue;
+        }
+        if let Ok(w) = input.try_parse(|i| parse_font_weight(i).ok_or(())) {
+            decls.push(Declaration::FontWeight(w));
+            continue;
+        }
+        break;
+    }
+
+    // Required font-size.
+    decls.push(Declaration::FontSize(parse_font_size(input)?));
+
+    // Optional `/ <line-height>`.
+    if input.try_parse(|i| i.expect_delim('/')).is_ok()
+        && let Some(lh) = parse_line_height(input)
+    {
+        decls.push(Declaration::LineHeight(lh));
+    }
+
+    // Required font-family (consumes the rest of the value).
+    let family = parse_font_family(input)?;
+    decls.push(Declaration::FontFamily(family));
+
+    Some(decls)
 }
 
 // ============================================================================
@@ -251,5 +306,92 @@ mod tests {
             family("\"Times New Roman\", Georgia, serif").as_deref(),
             Some("Times New Roman, Georgia, serif")
         );
+    }
+
+    fn font(css: &str) -> Vec<Declaration> {
+        let mut input = ParserInput::new(css);
+        parse_font_shorthand(&mut Parser::new(&mut input)).unwrap_or_default()
+    }
+
+    #[test]
+    fn font_shorthand_full_form() {
+        use crate::style::properties::FontStyle;
+        // The headline case: was dropped wholesale before.
+        let decls = font("italic bold 14px/1.5 Georgia, serif");
+        assert!(
+            decls
+                .iter()
+                .any(|d| matches!(d, Declaration::FontStyle(FontStyle::Italic))),
+            "{decls:?}"
+        );
+        assert!(
+            decls
+                .iter()
+                .any(|d| matches!(d, Declaration::FontWeight(w) if *w == FontWeight::BOLD)),
+            "{decls:?}"
+        );
+        assert!(
+            decls
+                .iter()
+                .any(|d| matches!(d, Declaration::FontSize(Length::Px(v)) if *v == 14.0)),
+            "{decls:?}"
+        );
+        assert!(
+            decls
+                .iter()
+                .any(|d| matches!(d, Declaration::LineHeight(Length::Em(v)) if *v == 1.5)),
+            "{decls:?}"
+        );
+        assert!(
+            decls
+                .iter()
+                .any(|d| matches!(d, Declaration::FontFamily(f) if f == "Georgia, serif")),
+            "{decls:?}"
+        );
+    }
+
+    #[test]
+    fn font_shorthand_minimal_size_and_family() {
+        let decls = font("12pt serif");
+        assert!(decls.iter().any(|d| matches!(d, Declaration::FontSize(_))));
+        assert!(
+            decls
+                .iter()
+                .any(|d| matches!(d, Declaration::FontFamily(f) if f == "serif"))
+        );
+        assert!(
+            !decls
+                .iter()
+                .any(|d| matches!(d, Declaration::LineHeight(_)))
+        );
+    }
+
+    #[test]
+    fn font_shorthand_weight_only_leading() {
+        let decls = font("bold 1em \"Fira Sans\"");
+        assert!(
+            decls
+                .iter()
+                .any(|d| matches!(d, Declaration::FontWeight(w) if *w == FontWeight::BOLD))
+        );
+        assert!(
+            decls
+                .iter()
+                .any(|d| matches!(d, Declaration::FontSize(Length::Em(v)) if *v == 1.0))
+        );
+        assert!(
+            decls
+                .iter()
+                .any(|d| matches!(d, Declaration::FontFamily(f) if f == "Fira Sans"))
+        );
+    }
+
+    #[test]
+    fn font_shorthand_without_size_or_family_is_dropped() {
+        // System-font keywords / inherit have no size+family → no declarations
+        // (same as before the shorthand was handled — never a partial parse).
+        assert!(font("menu").is_empty());
+        assert!(font("inherit").is_empty());
+        assert!(font("bold").is_empty()); // weight but no size/family
     }
 }

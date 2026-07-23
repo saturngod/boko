@@ -4,7 +4,31 @@ use super::properties::*;
 
 /// Unique identifier for a style in the StylePool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct StyleId(pub u32);
+pub struct StyleId(
+    /// Index into the owning `StylePool`; 0 is the default style.
+    pub u32,
+);
+
+/// An absolute font size as a multiple of the root (user default) size —
+/// the fully-resolved product of every relative `font-size` on the ancestor
+/// chain. `1.0` is the root size. Wrapped so `ComputedStyle` keeps derived
+/// `Eq`/`Hash` (bitwise, like `Length`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AbsFontSize(pub f32);
+
+impl Default for AbsFontSize {
+    fn default() -> Self {
+        AbsFontSize(1.0)
+    }
+}
+
+impl Eq for AbsFontSize {}
+
+impl std::hash::Hash for AbsFontSize {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
+}
 
 impl StyleId {
     /// The default style (always 0).
@@ -12,118 +36,289 @@ impl StyleId {
 }
 
 /// Computed style for a node (all properties resolved).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+///
+/// One flat struct with every property boko tracks after the cascade.
+/// Enum-typed and `Length` fields use their `Default` (usually the CSS
+/// initial value; `Length::Auto` for lengths); `Option` fields are `None`
+/// when the property was never set, letting exporters skip emitting them.
+///
+/// Margins are the exception to the `Length::Auto`-as-unset convention:
+/// their CSS initial value is `0`, so [`Default`] gives them `Px(0)` and
+/// `Length::Auto` means the author explicitly wrote `margin: auto`
+/// (horizontal centering). Conflating the two centered every block whose
+/// margins were simply never set.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ComputedStyle {
     // Font properties
+    /// `font-family`; `None` means inherit the reader default.
     pub font_family: Option<String>,
+    /// `font-size`; `Length::Auto` means unset (reader default size).
     pub font_size: Length,
+    /// Fully-resolved absolute font size (root-relative multiple), computed
+    /// by the cascade from the ancestor chain. Exporters that need the
+    /// rendered size (KFX emits absolute `rem`) read this instead of
+    /// interpreting the parent-relative `font_size`.
+    pub font_size_abs: AbsFontSize,
+    /// `font-weight` as a numeric weight (default 0 means unset; 400 normal, 700 bold).
     pub font_weight: FontWeight,
+    /// `font-style` (normal, italic, oblique).
     pub font_style: FontStyle,
 
     // Colors
+    /// `color` (text foreground); `None` means unset.
     pub color: Option<Color>,
+    /// `background-color`; `None` means unset (transparent).
     pub background_color: Option<Color>,
 
     // Text
+    /// `text-align` for block content.
     pub text_align: TextAlign,
+    /// `text-indent` for the first line; `Length::Auto` means unset.
     pub text_indent: Length,
+    /// `line-height`; unitless values are stored as em, `Auto` means unset.
     pub line_height: Length,
+    /// Export-time line-height scale (leading normalization); 1.0 outside
+    /// KFX export. Kept on the style so emission can clamp the authored
+    /// leading before scaling, the way reference output does.
+    pub line_scale: AbsFontSize,
+    /// Whether `text-decoration` includes an underline line.
     pub text_decoration_underline: bool,
+    /// Whether `text-decoration` includes a line-through (strikethrough) line.
     pub text_decoration_line_through: bool,
 
     // Box model
+    /// `display` box mode (block, inline, none, list-item, ...).
     pub display: Display,
+    /// `margin-top`; initial value `Px(0)`, `Length::Auto` means explicit `auto`.
     pub margin_top: Length,
+    /// `margin-bottom`; initial value `Px(0)`, `Length::Auto` means explicit `auto`.
     pub margin_bottom: Length,
+    /// `margin-left`; initial value `Px(0)`, `Length::Auto` means explicit `auto`.
     pub margin_left: Length,
+    /// `margin-right`; initial value `Px(0)`, `Length::Auto` means explicit `auto`.
     pub margin_right: Length,
+    /// `padding-top`; `Length::Auto` means unset.
     pub padding_top: Length,
+    /// `padding-bottom`; `Length::Auto` means unset.
     pub padding_bottom: Length,
+    /// `padding-left`; `Length::Auto` means unset.
     pub padding_left: Length,
+    /// `padding-right`; `Length::Auto` means unset.
     pub padding_right: Length,
 
-    // Vertical alignment for inline and table-cell elements
+    /// `vertical-align` for inline and table-cell elements; `Super`/`Sub`
+    /// drive superscript/subscript detection in exporters.
     pub vertical_align: VerticalAlign,
 
-    // List properties
+    /// `list-style-type` (marker kind for list items).
     pub list_style_type: ListStyleType,
 
-    // Font variant
+    /// `font-variant` (normal or small-caps).
     pub font_variant: FontVariant,
 
     // Text spacing
+    /// `letter-spacing`; `Length::Auto` means unset.
     pub letter_spacing: Length,
+    /// `word-spacing`; `Length::Auto` means unset.
     pub word_spacing: Length,
 
-    // Text transform
+    /// `text-transform` case transformation.
     pub text_transform: TextTransform,
 
-    // Hyphenation
+    /// `hyphens` automatic hyphenation mode (defaults to `Manual`).
     pub hyphens: Hyphens,
 
-    // White-space handling
+    /// `white-space` collapsing/wrapping behavior.
     pub white_space: WhiteSpace,
 
-    // Phase 2: Text decoration extensions
+    // Text decoration extensions
+    /// `text-decoration-style` for the underline line (solid, dotted, ...).
     pub underline_style: DecorationStyle,
+    /// Whether `text-decoration` includes an overline line.
     pub overline: bool,
+    /// `text-decoration-color`; `None` means the current text color.
     pub underline_color: Option<Color>,
 
-    // Phase 3: Layout properties
+    // Layout properties
+    /// `width`; `Length::Auto` means unset.
     pub width: Length,
+    /// `height`; `Length::Auto` means unset.
     pub height: Length,
+    /// `max-width`; `Length::Auto` means unset.
     pub max_width: Length,
+    /// `min-height`; `Length::Auto` means unset.
     pub min_height: Length,
+    /// `float` positioning (none, left, right).
     pub float: Float,
 
-    // Phase 4: Page break properties
+    // Page break properties
+    /// `break-before` / `page-break-before`.
     pub break_before: BreakValue,
+    /// `break-after` / `page-break-after`.
     pub break_after: BreakValue,
+    /// `break-inside` / `page-break-inside`.
     pub break_inside: BreakValue,
 
-    // Phase 5: Border properties (4 sides)
+    // Border properties (4 sides)
+    /// `border-top-style`.
     pub border_style_top: BorderStyle,
+    /// `border-right-style`.
     pub border_style_right: BorderStyle,
+    /// `border-bottom-style`.
     pub border_style_bottom: BorderStyle,
+    /// `border-left-style`.
     pub border_style_left: BorderStyle,
+    /// `border-top-width`; `Length::Auto` means unset.
     pub border_width_top: Length,
+    /// `border-right-width`; `Length::Auto` means unset.
     pub border_width_right: Length,
+    /// `border-bottom-width`; `Length::Auto` means unset.
     pub border_width_bottom: Length,
+    /// `border-left-width`; `Length::Auto` means unset.
     pub border_width_left: Length,
+    /// `border-top-color`; `None` means the current text color.
     pub border_color_top: Option<Color>,
+    /// `border-right-color`; `None` means the current text color.
     pub border_color_right: Option<Color>,
+    /// `border-bottom-color`; `None` means the current text color.
     pub border_color_bottom: Option<Color>,
+    /// `border-left-color`; `None` means the current text color.
     pub border_color_left: Option<Color>,
     // Border radius (corners)
+    /// `border-top-left-radius`; `Length::Auto` means unset.
     pub border_radius_top_left: Length,
+    /// `border-top-right-radius`; `Length::Auto` means unset.
     pub border_radius_top_right: Length,
+    /// `border-bottom-left-radius`; `Length::Auto` means unset.
     pub border_radius_bottom_left: Length,
+    /// `border-bottom-right-radius`; `Length::Auto` means unset.
     pub border_radius_bottom_right: Length,
 
-    // Phase 6: List properties
+    /// `list-style-position` (marker inside or outside the item box).
     pub list_style_position: ListStylePosition,
 
-    // Phase 7: Amazon properties
+    // Language & rendering
+    /// Content language (from `xml:lang`/`lang` attributes, not CSS); used by
+    /// KFX export for hyphenation dictionaries. `None` means unset.
     pub language: Option<String>,
+    /// `visibility` (visible, hidden, collapse).
     pub visibility: Visibility,
+    /// `box-sizing` (content-box or border-box).
     pub box_sizing: BoxSizing,
 
-    // Phase 8: Additional layout properties
+    // Additional layout properties
+    /// `max-height`; `Length::Auto` means unset.
     pub max_height: Length,
+    /// `min-width`; `Length::Auto` means unset.
     pub min_width: Length,
+    /// `clear` (which floated sides following content must clear).
     pub clear: Clear,
 
-    // Phase 9: Pagination control
+    // Pagination control
+    /// `orphans`: minimum lines kept at the bottom of a page (0 = unset).
     pub orphans: u32,
+    /// `widows`: minimum lines carried to the next page (0 = unset).
     pub widows: u32,
 
-    // Phase 10: Text wrapping
+    // Text wrapping
+    /// `word-break` (where lines may break within words).
     pub word_break: WordBreak,
+    /// `overflow-wrap` (emergency breaking of long words).
     pub overflow_wrap: OverflowWrap,
 
-    // Phase 11: Table properties
+    // Table properties
+    /// `border-collapse` for tables (separate or collapse).
     pub border_collapse: BorderCollapse,
+    /// `border-spacing` between table cells; `Length::Auto` means unset.
     pub border_spacing: Length,
+
+    /// Dropcap span line height in text lines (0 = not a dropcap). Set by
+    /// the dropcap-detection pass on the paragraph; drives the KFX
+    /// `dropcap_lines`/`dropcap_chars` properties.
+    pub dropcap_lines: u8,
+    /// Number of leading characters rendered as the dropcap (0 = none).
+    pub dropcap_chars: u8,
+}
+
+impl Default for ComputedStyle {
+    fn default() -> Self {
+        Self {
+            // CSS initial margin is 0; `Length::Auto` is reserved for an
+            // explicit `margin: auto` (see the struct docs).
+            margin_top: Length::Px(0.0),
+            margin_bottom: Length::Px(0.0),
+            margin_left: Length::Px(0.0),
+            margin_right: Length::Px(0.0),
+            font_family: Default::default(),
+            font_size: Default::default(),
+            font_size_abs: Default::default(),
+            font_weight: Default::default(),
+            font_style: Default::default(),
+            color: Default::default(),
+            background_color: Default::default(),
+            text_align: Default::default(),
+            text_indent: Default::default(),
+            line_height: Default::default(),
+            line_scale: Default::default(),
+            text_decoration_underline: Default::default(),
+            text_decoration_line_through: Default::default(),
+            display: Default::default(),
+            padding_top: Default::default(),
+            padding_bottom: Default::default(),
+            padding_left: Default::default(),
+            padding_right: Default::default(),
+            vertical_align: Default::default(),
+            list_style_type: Default::default(),
+            font_variant: Default::default(),
+            letter_spacing: Default::default(),
+            word_spacing: Default::default(),
+            text_transform: Default::default(),
+            hyphens: Default::default(),
+            white_space: Default::default(),
+            underline_style: Default::default(),
+            overline: Default::default(),
+            underline_color: Default::default(),
+            width: Default::default(),
+            height: Default::default(),
+            max_width: Default::default(),
+            min_height: Default::default(),
+            float: Default::default(),
+            break_before: Default::default(),
+            break_after: Default::default(),
+            break_inside: Default::default(),
+            border_style_top: Default::default(),
+            border_style_right: Default::default(),
+            border_style_bottom: Default::default(),
+            border_style_left: Default::default(),
+            border_width_top: Default::default(),
+            border_width_right: Default::default(),
+            border_width_bottom: Default::default(),
+            border_width_left: Default::default(),
+            border_color_top: Default::default(),
+            border_color_right: Default::default(),
+            border_color_bottom: Default::default(),
+            border_color_left: Default::default(),
+            border_radius_top_left: Default::default(),
+            border_radius_top_right: Default::default(),
+            border_radius_bottom_left: Default::default(),
+            border_radius_bottom_right: Default::default(),
+            list_style_position: Default::default(),
+            language: Default::default(),
+            visibility: Default::default(),
+            box_sizing: Default::default(),
+            max_height: Default::default(),
+            min_width: Default::default(),
+            clear: Default::default(),
+            orphans: Default::default(),
+            widows: Default::default(),
+            word_break: Default::default(),
+            overflow_wrap: Default::default(),
+            border_collapse: Default::default(),
+            border_spacing: Default::default(),
+            dropcap_lines: 0,
+            dropcap_chars: 0,
+        }
+    }
 }
 
 impl ComputedStyle {

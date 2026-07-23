@@ -204,23 +204,88 @@ pub fn transform_mobi_html(
     // Step 6: Remove empty anchors (like KindleUnpack does)
     remove_empty_anchors(&mut output);
 
+    // Step 7: Fix stray solidi between attributes (real AZW3 quirk)
+    fix_stray_attribute_solidus(&mut output);
+
     output
 }
 
+/// Fix a misplaced self-closing solidus between a quoted attribute value
+/// and a following attribute: `<img src="x.gif"/ alt="">` (seen verbatim in
+/// real AZW3 markup). Left alone, the XML parse path glues the next
+/// attribute into the value (`src="x.gifalt=""`), breaking the reference;
+/// merely dropping it leaves the tag unclosed and the XML parser swallows
+/// following content as children. The solidus is relocated to the end of
+/// the tag (`<img src="x.gif" alt=""/>`), which is what the author meant.
+pub(crate) fn fix_stray_attribute_solidus(html: &mut Vec<u8>) {
+    let mut cleaned = Vec::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut in_quote = false;
+    let mut relocate_solidus = false;
+    let mut i = 0;
+    while i < html.len() {
+        let b = html[i];
+        if in_tag && in_quote {
+            cleaned.push(b);
+            i += 1;
+            if b == b'"' {
+                in_quote = false;
+                // Just closed a value: a solidus that doesn't close the tag
+                // is a misplaced self-closing marker.
+                if html.get(i) == Some(&b'/') && html.get(i + 1).is_some_and(|&n| n != b'>') {
+                    i += 1;
+                    relocate_solidus = true;
+                    if html.get(i).is_some_and(|n| !n.is_ascii_whitespace()) {
+                        cleaned.push(b' ');
+                    }
+                }
+            }
+            continue;
+        }
+        match b {
+            b'<' => in_tag = true,
+            b'>' => {
+                in_tag = false;
+                if relocate_solidus {
+                    relocate_solidus = false;
+                    if cleaned.last() != Some(&b'/') {
+                        cleaned.push(b'/');
+                    }
+                }
+            }
+            b'"' if in_tag => in_quote = true,
+            _ => {}
+        }
+        cleaned.push(b);
+        i += 1;
+    }
+    *html = cleaned;
+}
+
 /// Remove empty anchor tags: `<a />` and `<a></a>`
+///
+/// Operates on raw bytes: the text may be CP1252 (the MOBI default), and the
+/// previous `from_utf8_lossy` round-trip irreversibly replaced every
+/// non-ASCII byte (curly quotes, accents) with U+FFFD. The patterns are pure
+/// ASCII, so a single byte-level pass is both correct and allocation-light.
 fn remove_empty_anchors(html: &mut Vec<u8>) {
-    // This is a simple implementation - could be optimized
-    let html_str = String::from_utf8_lossy(html);
+    const PATTERNS: [&[u8]; 4] = [b"<a />", b"<a  />", b"<a></a>", b"<a ></a>"];
 
-    // Remove <a /> and <a  /> patterns
-    let cleaned = html_str
-        .replace("<a />", "")
-        .replace("<a  />", "")
-        .replace("<a></a>", "")
-        .replace("<a ></a>", "");
-
-    html.clear();
-    html.extend_from_slice(cleaned.as_bytes());
+    let mut cleaned = Vec::with_capacity(html.len());
+    let mut pos = 0;
+    'outer: while pos < html.len() {
+        if html[pos] == b'<' {
+            for pattern in PATTERNS {
+                if html[pos..].starts_with(pattern) {
+                    pos += pattern.len();
+                    continue 'outer;
+                }
+            }
+        }
+        cleaned.push(html[pos]);
+        pos += 1;
+    }
+    *html = cleaned;
 }
 
 #[cfg(test)]
@@ -291,6 +356,49 @@ mod tests {
 
         assert!(result_str.contains("src=\"images/image_0000.jpg\""));
         assert!(!result_str.contains("recindex"));
+    }
+
+    /// A stray solidus between a quoted attribute value and further
+    /// attributes (`src="x.gif"/ alt=""`, seen verbatim in real AZW3s) must
+    /// not survive: the XML parse path glues the next attribute into the
+    /// value, breaking the image reference.
+    #[test]
+    fn test_transform_stray_attribute_solidus() {
+        let assets = vec!["images/image_0000.gif".to_string()];
+
+        // After the recindex rewrite. The misplaced self-closing solidus is
+        // relocated to the tag end so the XML parse neither glues the next
+        // attribute into the value nor leaves the tag unclosed.
+        let html = b"<img id=\"c1\" recindex=\"00001\"/ alt=\"\">";
+        let result = transform_mobi_html(html, &assets, &[]);
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(
+            result_str.contains("src=\"images/image_0000.gif\" alt=\"\"/>"),
+            "solidus must be relocated: {result_str}"
+        );
+
+        // Directly in source markup, with and without a following space.
+        let html = b"<img src=\"images/x.gif\"/ alt=\"\"><img src=\"images/y.gif\"/alt=\"a\">";
+        let result = transform_mobi_html(html, &[], &[]);
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(
+            result_str.contains("src=\"images/x.gif\" alt=\"\"/>"),
+            "{result_str}"
+        );
+        assert!(
+            result_str.contains("src=\"images/y.gif\" alt=\"a\"/>"),
+            "{result_str}"
+        );
+
+        // Legitimate self-closing tags are untouched; quotes in text too.
+        let html = b"<img src=\"images/x.gif\"/><p>a \"quoted\"/ thing</p>";
+        let result = transform_mobi_html(html, &[], &[]);
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(
+            result_str.contains("src=\"images/x.gif\"/>"),
+            "{result_str}"
+        );
+        assert!(result_str.contains("\"quoted\"/ thing"), "{result_str}");
     }
 
     #[test]

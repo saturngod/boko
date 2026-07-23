@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::dom::Stylesheet;
 use crate::import::{ChapterId, Importer, SpineEntry, resolve_path_based_href};
@@ -61,11 +61,11 @@ pub struct MobiImporter {
     assets: Vec<String>,
 
     /// Cached parsed stylesheets.
-    css_cache: HashMap<String, Arc<Stylesheet>>,
+    css_cache: RwLock<HashMap<String, Arc<Stylesheet>>>,
 
     // --- Link resolution ---
     /// Maps "path#id" -> GlobalNodeId (built during index_anchors)
-    element_id_map: HashMap<String, GlobalNodeId>,
+    element_id_map: RwLock<HashMap<String, GlobalNodeId>>,
 }
 
 impl Importer for MobiImporter {
@@ -83,10 +83,6 @@ impl Importer for MobiImporter {
         &self.toc
     }
 
-    fn toc_mut(&mut self) -> &mut [TocEntry] {
-        &mut self.toc
-    }
-
     fn landmarks(&self) -> &[Landmark] {
         &self.landmarks
     }
@@ -99,7 +95,7 @@ impl Importer for MobiImporter {
         self.chapter_paths.get(id.0 as usize).map(|s| s.as_str())
     }
 
-    fn load_raw(&mut self, id: ChapterId) -> crate::Result<Vec<u8>> {
+    fn load_raw(&self, id: ChapterId) -> crate::Result<Vec<u8>> {
         self.chapter_cache
             .get(id.0 as usize)
             .cloned()
@@ -112,7 +108,7 @@ impl Importer for MobiImporter {
         &self.assets
     }
 
-    fn load_asset(&mut self, path: &str) -> crate::Result<Vec<u8>> {
+    fn load_asset(&self, path: &str) -> crate::Result<Vec<u8>> {
         // Parse index from path (images/image_XXXX.ext or fonts/font_XXXX.ext).
         // Images and fonts share the same record-index space, so the prefix
         // selects naming but the underlying lookup is the same.
@@ -128,19 +124,23 @@ impl Importer for MobiImporter {
         Ok(self.load_image_record(idx)?)
     }
 
-    fn load_stylesheet(&mut self, path: &str) -> Option<Arc<Stylesheet>> {
-        if let Some(sheet) = self.css_cache.get(path) {
+    fn load_stylesheet(&self, path: &str) -> Option<Arc<Stylesheet>> {
+        if let Ok(cache) = self.css_cache.read()
+            && let Some(sheet) = cache.get(path)
+        {
             return Some(Arc::clone(sheet));
         }
         let css_bytes = self.load_asset(path).ok()?;
         let css_str = String::from_utf8_lossy(&css_bytes);
         let sheet = Arc::new(Stylesheet::parse(&css_str));
-        self.css_cache.insert(path.to_string(), Arc::clone(&sheet));
-        Some(sheet)
+        match self.css_cache.write() {
+            Ok(mut cache) => Some(Arc::clone(cache.entry(path.to_string()).or_insert(sheet))),
+            Err(_) => Some(sheet),
+        }
     }
 
-    fn index_anchors(&mut self, chapters: &[(ChapterId, Arc<Chapter>)]) {
-        self.element_id_map.clear();
+    fn index_anchors(&self, chapters: &[(ChapterId, Arc<Chapter>)]) {
+        let mut element_id_map = HashMap::new();
 
         for (chapter_id, chapter) in chapters {
             let chapter_path = match self.chapter_paths.get(chapter_id.0 as usize) {
@@ -151,10 +151,13 @@ impl Importer for MobiImporter {
             for node_id in chapter.iter_dfs() {
                 if let Some(id) = chapter.semantics.id(node_id) {
                     let key = format!("{}#{}", chapter_path, id);
-                    self.element_id_map
-                        .insert(key, GlobalNodeId::new(*chapter_id, node_id));
+                    element_id_map.insert(key, GlobalNodeId::new(*chapter_id, node_id));
                 }
             }
+        }
+
+        if let Ok(mut map) = self.element_id_map.write() {
+            *map = element_id_map;
         }
     }
 
@@ -169,7 +172,12 @@ impl Importer for MobiImporter {
                     .position(|cp| cp == p)
                     .map(|i| ChapterId(i as u32))
             },
-            |k| self.element_id_map.get(k).copied(),
+            |k| {
+                self.element_id_map
+                    .read()
+                    .ok()
+                    .and_then(|m| m.get(k).copied())
+            },
         )
     }
 }
@@ -224,12 +232,16 @@ impl MobiImporter {
         // Discover assets to get cover image path with correct extension
         let assets = discover_assets_from_source(&source, &pdb, &mobi, file_len);
 
-        // Find cover image using discovered asset path
+        // Find cover image using discovered asset path. EXTH cover_offset is
+        // a record index relative to first_image_index, and the asset names
+        // embed exactly that index — so match by name. Indexing the compacted
+        // asset list positionally would desync whenever a metadata or
+        // unrecognized record precedes the cover.
         if let Some(ref exth) = exth
             && let Some(cover_idx) = exth.cover_offset
         {
-            // cover_offset is 0-indexed relative to first image
-            if let Some(cover_path) = assets.get(cover_idx as usize) {
+            let needle = format!("images/image_{cover_idx:04}.");
+            if let Some(cover_path) = assets.iter().find(|p| p.starts_with(&needle)) {
                 metadata.cover_image = Some(cover_path.clone());
             }
         }
@@ -267,29 +279,34 @@ impl MobiImporter {
         let text = extract_text_from_source(&source, &pdb, &mobi, file_len)?;
         let wrapped = wrap_text_as_html(&text, &metadata.title, &mobi);
 
-        // Transform HTML (without NCX anchors initially for clean pagebreak splitting)
-        let transformed = filepos::transform_mobi_html(&wrapped, &assets, &[]);
+        // Transform HTML (without NCX anchors initially for clean pagebreak splitting).
+        // Re-encode as UTF-8 *after* the transform (anchor insertion works on
+        // raw byte offsets, which decoding would shift) and *before* splitting
+        // (the split emits documents that declare utf-8; CP1252 bytes used to
+        // survive to a from_utf8_lossy and turn every curly quote into U+FFFD).
+        let transformed = ensure_utf8(filepos::transform_mobi_html(&wrapped, &assets, &[]), codec);
 
         // Try pagebreak-based splitting first. If it produces only 1 chapter
         // and NCX positions are available, re-transform with NCX anchors and
         // force NCX-based splitting (bypassing the pagebreak check that failed).
-        let (split, transformed) = {
+        let split = {
             let initial = split_mobi_html(&transformed, None);
             if initial.chapters.len() > 1 || ncx_positions.is_empty() {
-                (initial, transformed)
+                initial
             } else {
                 // Re-transform with NCX anchors at byte positions, force NCX split
-                let with_ncx = filepos::transform_mobi_html(&wrapped, &assets, &ncx_positions);
+                let with_ncx = ensure_utf8(
+                    filepos::transform_mobi_html(&wrapped, &assets, &ncx_positions),
+                    codec,
+                );
                 let ncx_split = split_mobi_html_ncx_only(&with_ncx, &ncx_positions);
                 if ncx_split.chapters.len() > 1 {
-                    (ncx_split, with_ncx)
+                    ncx_split
                 } else {
-                    (initial, transformed)
+                    initial
                 }
             }
         };
-        // Keep transformed for potential later use
-        let _ = transformed;
 
         // Build spine from split chapters
         let spine: Vec<SpineEntry> = (0..split.chapters.len())
@@ -301,7 +318,7 @@ impl MobiImporter {
 
         // Build TOC from NCX entries (using split result for chapter mapping)
         let toc = if let Some(ref ncx) = ncx_entries {
-            let nodes = build_toc_from_ncx(ncx, |entry| {
+            let nodes = build_toc_from_ncx(ncx, |_, entry| {
                 let filepos_key = format!("filepos{}", entry.pos);
                 let chapter_idx = split
                     .filepos_to_chapter
@@ -316,7 +333,9 @@ impl MobiImporter {
             vec![TocEntry::new(&metadata.title, &split.chapter_paths[0])]
         };
 
-        let mut importer = Self {
+        // `assets` was already discovered above for the cover/filepos
+        // transformation; reuse it instead of re-scanning every record.
+        let importer = Self {
             source,
             pdb,
             mobi,
@@ -327,57 +346,12 @@ impl MobiImporter {
             spine,
             chapter_cache: split.chapters,
             chapter_paths: split.chapter_paths,
-            assets: Vec::new(),
-            css_cache: HashMap::new(),
-            element_id_map: HashMap::new(),
+            assets,
+            css_cache: RwLock::new(HashMap::new()),
+            element_id_map: RwLock::new(HashMap::new()),
         };
 
-        importer.assets = importer.discover_assets();
-
         Ok(importer)
-    }
-
-    /// Discover asset paths by scanning image and font records.
-    fn discover_assets(&self) -> Vec<String> {
-        let mut assets = Vec::new();
-
-        if self.mobi.first_image_index == NULL_INDEX {
-            return assets;
-        }
-
-        let first_img = self.mobi.first_image_index as usize;
-        for i in first_img..self.pdb.num_records as usize {
-            if let Ok((start, end)) = self.pdb.record_range(i, self.file_len) {
-                // min against a small constant before the cast so a >4 GiB
-                // record length can't truncate on 32-bit targets.
-                let read_len = (end - start).min(16) as usize;
-                let mut header = [0u8; 16];
-                if self
-                    .source
-                    .read_at_into(start, &mut header[..read_len])
-                    .is_ok()
-                {
-                    let header = &header[..read_len];
-                    if is_metadata_record(header) {
-                        continue;
-                    }
-                    let idx = i - first_img;
-                    if let Some(media_type) = detect_image_type(header) {
-                        let ext = match media_type {
-                            "image/jpeg" => "jpg",
-                            "image/png" => "png",
-                            "image/gif" => "gif",
-                            _ => "bin",
-                        };
-                        assets.push(format!("images/image_{idx:04}.{ext}"));
-                    } else if let Some(font_ext) = detect_font_type(header) {
-                        assets.push(format!("fonts/font_{idx:04}.{font_ext}"));
-                    }
-                }
-            }
-        }
-
-        assets
     }
 
     /// Load an image or font record by index.
@@ -442,7 +416,9 @@ fn extract_text_from_source(
             None
         };
 
-    // Read and decompress text records
+    // Read and decompress text records, sharing one whole-book output budget
+    // across records (see `total_text_budget`).
+    let mut text_budget = crate::mobi::huffcdic::total_text_budget(file_len);
     for i in 1..=mobi.text_record_count as usize {
         let record = read_record(i)?;
         let stripped = strip_trailing_data(&record, mobi.extra_data_flags);
@@ -452,7 +428,7 @@ fn extract_text_from_source(
             Compression::PalmDoc => palmdoc::decompress(stripped)?,
             Compression::Huffman => {
                 if let Some(ref mut reader) = huff_reader {
-                    reader.decompress(stripped)?
+                    reader.decompress(stripped, &mut text_budget)?
                 } else {
                     stripped.to_vec()
                 }
@@ -556,6 +532,18 @@ fn build_metadata(
 }
 
 /// Wrap raw text as HTML.
+/// Re-encode text as UTF-8 using the MOBI header's declared codec.
+///
+/// No-op (and allocation-free) when the bytes are already valid UTF-8, so it
+/// is safe to apply to both the CP1252 passthrough and the already-decoded
+/// wrapped output.
+fn ensure_utf8(bytes: Vec<u8>, codec: &str) -> Vec<u8> {
+    match crate::util::decode_text(&bytes, Some(codec)) {
+        std::borrow::Cow::Borrowed(_) => bytes,
+        std::borrow::Cow::Owned(s) => s.into_bytes(),
+    }
+}
+
 fn wrap_text_as_html(text: &[u8], title: &str, mobi: &MobiHeader) -> Vec<u8> {
     // Decode using the header-declared encoding *before* wrapping. Previously
     // the bytes were run through `from_utf8_lossy` — which replaces every
@@ -604,6 +592,7 @@ fn html_escape(s: &str) -> String {
 /// Convert TocNode to TocEntry recursively.
 fn toc_node_to_entry(node: TocNode) -> TocEntry {
     let mut entry = TocEntry::new(&node.title, &node.href);
+    entry.play_order = Some(node.ncx_index);
     entry.children = node.children.into_iter().map(toc_node_to_entry).collect();
     entry
 }

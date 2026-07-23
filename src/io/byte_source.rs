@@ -46,12 +46,15 @@ pub trait ByteSource: Send + Sync {
 
 // --- Implementation: Local File ---
 
+/// A [`ByteSource`] backed by a local file, using positioned reads
+/// (`pread`) so no seek state is shared between readers.
 pub struct FileSource {
     file: File, // internal file handle
     len: u64,
 }
 
 impl FileSource {
+    /// Wrap an open file, capturing its current length for bounds checks.
     pub fn new(file: File) -> io::Result<Self> {
         let len = file.metadata()?.len();
         Ok(Self { file, len })
@@ -124,7 +127,11 @@ impl ByteSource for MemorySource {
     }
 
     fn read_at_into(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let offset = offset as usize;
+        // try_from, not `as`: on 32-bit targets a >4 GiB offset would
+        // truncate, pass the bounds check, and silently read wrong bytes.
+        let offset = usize::try_from(offset).map_err(|_| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "offset beyond end of data")
+        })?;
         if offset > self.data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,

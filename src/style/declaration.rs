@@ -11,7 +11,7 @@ use super::parse::border::{
 };
 use super::parse::box_model::parse_box_shorthand_values;
 use super::parse::font::{
-    parse_font_family, parse_font_size, parse_font_weight, parse_line_height,
+    parse_font_family, parse_font_shorthand, parse_font_size, parse_font_weight, parse_line_height,
 };
 use super::parse::keywords::{
     parse_border_collapse, parse_border_style_value, parse_box_sizing, parse_break_inside,
@@ -22,7 +22,8 @@ use super::parse::keywords::{
     parse_word_break,
 };
 use super::parse::values::{
-    parse_background_shorthand, parse_color, parse_integer, parse_length, parse_text_decoration,
+    parse_background_shorthand, parse_color, parse_integer, parse_length, parse_spacing,
+    parse_text_decoration,
 };
 use super::properties::*;
 
@@ -33,108 +34,190 @@ use super::properties::*;
 #[derive(Debug, Clone)]
 pub enum Declaration {
     // Colors
+    /// `color`: foreground text color.
     Color(Color),
+    /// `background-color`: element background color (also produced by the
+    /// `background` shorthand, from which only the color component is kept).
     BackgroundColor(Color),
 
     // Font properties
+    /// `font-family`: the first font family from the list, unquoted.
     FontFamily(String),
+    /// `font-size`: font size as a [`Length`] (keywords like `small` are
+    /// resolved to em values during parsing).
     FontSize(Length),
+    /// `font-weight`: numeric weight 100-900 (`normal` = 400, `bold` = 700).
     FontWeight(FontWeight),
+    /// `font-style`: normal, italic, or oblique.
     FontStyle(FontStyle),
+    /// `font-variant` / `font-variant-caps`: normal or small-caps.
     FontVariant(FontVariant),
 
     // Text properties
+    /// `text-align`: horizontal alignment of inline content.
     TextAlign(TextAlign),
+    /// `text-indent`: first-line indentation.
     TextIndent(Length),
+    /// `line-height`: line box height; unitless numbers are stored as em.
     LineHeight(Length),
+    /// `letter-spacing`: extra spacing between characters.
     LetterSpacing(Length),
+    /// `word-spacing`: extra spacing between words.
     WordSpacing(Length),
+    /// `text-transform`: case transformation (uppercase, lowercase, capitalize).
     TextTransform(TextTransform),
+    /// `hyphens`: automatic hyphenation mode.
     Hyphens(Hyphens),
+    /// `white-space`: whitespace collapsing and line-wrapping behavior.
     WhiteSpace(WhiteSpace),
+    /// `vertical-align`: inline/table-cell vertical alignment (includes
+    /// `super`/`sub` used for superscript/subscript detection).
     VerticalAlign(VerticalAlign),
 
     // Text decoration
+    /// `text-decoration` / `text-decoration-line`: which decoration lines
+    /// (underline, overline, line-through) are enabled or explicitly `none`.
     TextDecoration(super::parse::TextDecorationValue),
+    /// `text-decoration-style`: line rendering style (solid, dotted, ...).
     TextDecorationStyle(DecorationStyle),
+    /// `text-decoration-color`: color of the decoration line.
     TextDecorationColor(Color),
 
     // Box model - margins
+    /// `margin` applied uniformly to all four sides (the `margin` shorthand
+    /// itself is parsed into the four per-side variants; this variant exists
+    /// for programmatic use and applies to all sides during cascade).
     Margin(Length),
+    /// `margin-top`.
     MarginTop(Length),
+    /// `margin-right`.
     MarginRight(Length),
+    /// `margin-bottom`.
     MarginBottom(Length),
+    /// `margin-left`.
     MarginLeft(Length),
 
     // Box model - padding
+    /// `padding` applied uniformly to all four sides (the `padding` shorthand
+    /// itself expands to the four per-side variants).
     Padding(Length),
+    /// `padding-top`.
     PaddingTop(Length),
+    /// `padding-right`.
     PaddingRight(Length),
+    /// `padding-bottom`.
     PaddingBottom(Length),
+    /// `padding-left`.
     PaddingLeft(Length),
 
     // Dimensions
+    /// `width`: content box width.
     Width(Length),
+    /// `height`: content box height.
     Height(Length),
+    /// `max-width`: maximum content box width.
     MaxWidth(Length),
+    /// `max-height`: maximum content box height.
     MaxHeight(Length),
+    /// `min-width`: minimum content box width.
     MinWidth(Length),
+    /// `min-height`: minimum content box height.
     MinHeight(Length),
 
     // Display & positioning
+    /// `display`: box display mode (block, inline, none, list-item, ...).
     Display(Display),
+    /// `float`: left/right float positioning.
     Float(Float),
+    /// `clear`: which floated sides subsequent content must clear.
     Clear(Clear),
+    /// `visibility`: visible, hidden, or collapse.
     Visibility(Visibility),
+    /// `box-sizing`: whether width/height include padding and border.
     BoxSizing(BoxSizing),
 
     // Pagination control
+    /// `orphans`: minimum lines left at the bottom of a page before a break.
     Orphans(u32),
+    /// `widows`: minimum lines carried to the top of a page after a break.
     Widows(u32),
 
     // Text wrapping
+    /// `word-break`: where lines may break within words.
     WordBreak(WordBreak),
+    /// `overflow-wrap`: emergency breaking of otherwise-unbreakable words.
     OverflowWrap(OverflowWrap),
 
     // Page breaks
+    /// `break-before` / `page-break-before`: page break before the element.
     BreakBefore(BreakValue),
+    /// `break-after` / `page-break-after`: page break after the element.
     BreakAfter(BreakValue),
+    /// `break-inside` / `page-break-inside`: page breaks within the element.
     BreakInside(BreakValue),
 
     // Border style
+    /// `border-style` applied uniformly to all four sides (the shorthand with
+    /// multiple values expands to the per-side variants instead).
     BorderStyle(BorderStyle),
+    /// `border-top-style`.
     BorderTopStyle(BorderStyle),
+    /// `border-right-style`.
     BorderRightStyle(BorderStyle),
+    /// `border-bottom-style`.
     BorderBottomStyle(BorderStyle),
+    /// `border-left-style`.
     BorderLeftStyle(BorderStyle),
 
     // Border width
+    /// `border-width` applied uniformly to all four sides (the shorthand with
+    /// multiple values expands to the per-side variants instead).
     BorderWidth(Length),
+    /// `border-top-width`.
     BorderTopWidth(Length),
+    /// `border-right-width`.
     BorderRightWidth(Length),
+    /// `border-bottom-width`.
     BorderBottomWidth(Length),
+    /// `border-left-width`.
     BorderLeftWidth(Length),
 
     // Border color
+    /// `border-color` applied uniformly to all four sides (the shorthand with
+    /// multiple values expands to the per-side variants instead).
     BorderColor(Color),
+    /// `border-top-color`.
     BorderTopColor(Color),
+    /// `border-right-color`.
     BorderRightColor(Color),
+    /// `border-bottom-color`.
     BorderBottomColor(Color),
+    /// `border-left-color`.
     BorderLeftColor(Color),
 
     // Border radius
+    /// `border-radius` applied uniformly to all four corners.
     BorderRadius(Length),
+    /// `border-top-left-radius`.
     BorderTopLeftRadius(Length),
+    /// `border-top-right-radius`.
     BorderTopRightRadius(Length),
+    /// `border-bottom-left-radius`.
     BorderBottomLeftRadius(Length),
+    /// `border-bottom-right-radius`.
     BorderBottomRightRadius(Length),
 
     // List properties
+    /// `list-style-type`: list marker kind (disc, decimal, roman, ...).
     ListStyleType(ListStyleType),
+    /// `list-style-position`: marker inside or outside the item's box.
     ListStylePosition(ListStylePosition),
 
     // Table properties
+    /// `border-collapse`: separate vs. collapsed table borders.
     BorderCollapse(BorderCollapse),
+    /// `border-spacing`: gap between table cell borders (single value; used
+    /// for both axes).
     BorderSpacing(Length),
 }
 
@@ -207,6 +290,7 @@ impl Declaration {
             "border-bottom" => parse_border_side_shorthand(input, BorderSide::Bottom),
             "border-left" => parse_border_side_shorthand(input, BorderSide::Left),
             "list-style" => parse_list_style_shorthand(input),
+            "font" => parse_font_shorthand(input).unwrap_or_default(),
             _ => return None,
         })
     }
@@ -242,10 +326,14 @@ impl Declaration {
             "text-align" => parse_text_align(input).map(Self::TextAlign),
             "text-indent" => parse_length(input).map(Self::TextIndent),
             "line-height" => parse_line_height(input).map(Self::LineHeight),
-            "letter-spacing" => parse_length(input).map(Self::LetterSpacing),
-            "word-spacing" => parse_length(input).map(Self::WordSpacing),
+            // `normal` is the spacing reset keyword (parse_length only knows
+            // `auto`); both mean "no extra spacing" (`Length::Auto`).
+            "letter-spacing" => parse_spacing(input).map(Self::LetterSpacing),
+            "word-spacing" => parse_spacing(input).map(Self::WordSpacing),
             "text-transform" => parse_text_transform(input).map(Self::TextTransform),
-            "hyphens" => parse_hyphens(input).map(Self::Hyphens),
+            // Vendor-prefixed hyphenation aliases are common in EPUB CSS.
+            "hyphens" | "-epub-hyphens" | "-webkit-hyphens" | "-moz-hyphens"
+            | "adobe-hyphenate" => parse_hyphens(input).map(Self::Hyphens),
             "white-space" => parse_white_space(input).map(Self::WhiteSpace),
             "vertical-align" => parse_vertical_align(input).map(Self::VerticalAlign),
 

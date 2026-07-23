@@ -84,9 +84,32 @@ fn descendant_book() -> EpubBuilder {
 // HTML5 DOCTYPE / `<meta charset>` and internal-link href rewriting. The cascade
 // output (matched declarations) is unchanged — only the surrounding document
 // markup differs.
-const FP_EPICTETUS: &str = "92888004a84273c70366220364f8007dd6619760";
-const FP_CLASS: &str = "8e084650371da2cab255c51438fd8bdb401ebc42";
-const FP_DESCENDANT: &str = "e6c0a96d4233a78a589342f442811d84bd15c23f";
+// Updated again for the inter-inline whitespace fix: newline-separated
+// whitespace between two inline siblings (poetry `<span>…</span>\n<br/>`,
+// colophon text before links) is now preserved as a single space instead of
+// being dropped, which previously glued words together ("toEpictetus").
+// Updated again for semantic-marker preservation: synthesized documents now
+// declare `xmlns:epub` on <html> and re-emit epub:type / ARIA role / datetime
+// (928 epub:type markers survive the epictetus round trip). The matched
+// cascade declarations are unchanged — only the emitted markup gained
+// attributes.
+// Updated again when the computed margin initial value became `0` with
+// `Length::Auto` reserved for explicit `margin: auto`: authored auto margins
+// (Standard Ebooks centering idiom) now survive into the normalized CSS,
+// while explicit `margin: 0` folds into the initial value and is omitted.
+// Updated again when `ComputedStyle` gained the cascade-resolved absolute
+// font size (`font_size_abs`): styles used under different ancestor font
+// scales intern separately now, so the synthesized `.cNN` classes partition
+// differently — the emitted declarations are unchanged.
+// Updated again when anonymous mixed-content wrappers started interning an
+// inherit-only style (CSS anonymous-box semantics) instead of the default
+// StyleId — the pool gains entries, so class numbering shifts.
+const FP_EPICTETUS: &str = "2f62e95c8fba1a676cf91f2921768e0ddcd4ebfc";
+const FP_CLASS: &str = "0011593d1051d42ce417aa0bd9d63012fdaf42b7";
+// Updated when the UA stylesheet's blockquote/figure/dd margins moved from
+// the browser-literal 40px to 2.5em (same length at the default font size,
+// but it scales with the font instead of freezing at a device-pixel size).
+const FP_DESCENDANT: &str = "1794dcb313c9799f0c5c9fff01c8ffedfd886c68";
 
 #[test]
 fn cascade_output_is_stable_epictetus() {

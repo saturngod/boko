@@ -10,8 +10,6 @@
 
 #![no_main]
 
-use std::path::Path;
-
 use boko::{Book, Format};
 use libfuzzer_sys::fuzz_target;
 
@@ -26,7 +24,7 @@ fuzz_target!(|data: &[u8]| {
         _ => Format::Kfx,
     };
 
-    let Ok(mut book) = Book::from_bytes(payload, format) else {
+    let Ok(book) = Book::from_bytes(payload, format) else {
         return;
     };
     let _ = book.metadata();
@@ -40,5 +38,5 @@ fuzz_target!(|data: &[u8]| {
     for asset in assets.iter().take(8) {
         let _ = book.load_asset(asset);
     }
-    let _ = book.load_asset(Path::new("does/not/exist"));
+    let _ = book.load_asset("does/not/exist");
 });

@@ -16,16 +16,44 @@ use boko::model::{Format, TocEntry};
 use boko::{Book, export::Exporter};
 
 fn export_epub_to_azw3_bytes(epub_path: &str) -> Vec<u8> {
-    let mut book = Book::open(epub_path).expect("opening source epub");
+    let book = Book::open(epub_path).expect("opening source epub");
     let mut buf = Cursor::new(Vec::new());
     boko::export::Azw3Exporter::new()
-        .export(&mut book, &mut buf)
+        .export(&book, &mut buf)
         .expect("azw3 export");
     buf.into_inner()
 }
 
 fn count_toc(entries: &[TocEntry]) -> usize {
     entries.iter().map(|e| 1 + count_toc(&e.children)).sum()
+}
+
+/// The EXTH `length` field must equal the actual block length
+/// (magic + length + count + records + pad). It was overstated by 4 bytes
+/// because `content` already includes the record count.
+#[test]
+fn exth_length_field_matches_actual_block() {
+    let bytes = export_epub_to_azw3_bytes("tests/fixtures/epictetus.epub");
+    let pos = bytes
+        .windows(4)
+        .position(|w| w == b"EXTH")
+        .expect("EXTH block present");
+    let hdr_len = u32::from_be_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+    let count = u32::from_be_bytes(bytes[pos + 8..pos + 12].try_into().unwrap()) as usize;
+    let mut p = pos + 12;
+    for _ in 0..count {
+        let rlen = u32::from_be_bytes(bytes[p + 4..p + 8].try_into().unwrap()) as usize;
+        p += rlen;
+    }
+    // Content padding to a 4-byte boundary (content starts at pos + 8).
+    while (p - (pos + 8)) % 4 != 0 {
+        p += 1;
+    }
+    assert_eq!(
+        hdr_len,
+        p - pos,
+        "EXTH length field must equal the actual block length"
+    );
 }
 
 fn max_depth(entries: &[TocEntry], current: usize) -> usize {
@@ -48,7 +76,7 @@ fn azw3_roundtrip_preserves_structure() {
     assert!(src_toc_depth >= 2, "fixture must have nested TOC");
 
     let bytes = export_epub_to_azw3_bytes(src_path);
-    let mut book = Book::from_bytes(&bytes, Format::Azw3).expect("reopen azw3");
+    let book = Book::from_bytes(&bytes, Format::Azw3).expect("reopen azw3");
 
     // Metadata survives the EXTH round-trip.
     assert_eq!(book.metadata().title, src_title);
@@ -144,13 +172,66 @@ fn azw3_roundtrip_resource_records_are_recognisable() {
             .extension()
             .and_then(|s| s.to_str())
             .map(str::to_ascii_lowercase);
-        matches!(
-            ext.as_deref(),
-            Some("jpg" | "jpeg" | "png" | "gif")
-        )
+        matches!(ext.as_deref(), Some("jpg" | "jpeg" | "png" | "gif"))
     });
     assert!(
         has_real_image,
         "expected at least one JPEG/PNG/GIF asset; got {assets:?}"
+    );
+}
+
+/// KF8 stylesheets live in FDST flows referenced as `kindle:flow:N` links.
+/// The importer must serve them through `load_asset`/`load_stylesheet` —
+/// they were previously unreachable, silently dropping every KF8 book's CSS.
+#[test]
+fn azw3_roundtrip_preserves_stylesheet_styles() {
+    let src_path = "tests/fixtures/epictetus.epub";
+    let bytes = export_epub_to_azw3_bytes(src_path);
+    let book = Book::from_bytes(&bytes, Format::Azw3).expect("reopen azw3");
+
+    // The style flows are listed as assets and load as CSS text.
+    let css_assets: Vec<&String> = book
+        .list_assets()
+        .iter()
+        .filter(|a| a.starts_with("styles/"))
+        .collect();
+    assert!(
+        !css_assets.is_empty(),
+        "KF8 style flows must appear in list_assets"
+    );
+    let css = book.load_asset(css_assets[0]).expect("load style flow");
+    let css_text = String::from_utf8_lossy(&css);
+    assert!(
+        css_text.contains('{'),
+        "style flow must contain CSS rules, got: {}",
+        &css_text[..css_text.len().min(80)]
+    );
+
+    // Authored styles reach computed chapter styles: epictetus sets
+    // small-caps/italic/centered classes; at least one non-default computed
+    // style must carry an authored (non-UA) property such as small-caps.
+    let spine = book.spine().to_vec();
+    let mut found_small_caps = false;
+    for entry in &spine {
+        let Ok(chapter) = book.load_chapter_cached(entry.id) else {
+            continue;
+        };
+        for node_id in chapter.iter_dfs() {
+            if let Some(node) = chapter.node(node_id)
+                && let Some(style) = chapter.styles.get(node.style)
+                && style.font_variant == boko::style::FontVariant::SmallCaps
+            {
+                found_small_caps = true;
+                break;
+            }
+        }
+        if found_small_caps {
+            break;
+        }
+    }
+    assert!(
+        found_small_caps,
+        "authored small-caps styling must survive the AZW3 roundtrip \
+         (KF8 flow CSS regression)"
     );
 }

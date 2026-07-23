@@ -22,7 +22,7 @@ const KFX: &[u8] = include_bytes!("fixtures/epictetus.kfx");
 /// Drive a book as hard as the importers allow. Any `Err` is fine; the point is
 /// that none of these calls panic on malformed input.
 fn drive(data: &[u8], format: Format) {
-    let Ok(mut book) = Book::from_bytes(data, format) else {
+    let Ok(book) = Book::from_bytes(data, format) else {
         return;
     };
     let _ = book.metadata();

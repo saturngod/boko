@@ -43,8 +43,9 @@ pub use azw3::{Azw3Config, Azw3Exporter};
 pub use css_gen::{CssArtifact, generate_css, generate_css_all};
 pub use epub::{EpubConfig, EpubExporter};
 pub use html_synth::{
-    SynthesisResult, escape_xml, escape_xml_into, synthesize_html, synthesize_html_with_class_list,
-    synthesize_xhtml_document, synthesize_xhtml_document_with_class_list,
+    MathForm, SynthesisResult, escape_xml, escape_xml_into, synthesize_html,
+    synthesize_html_with_class_list, synthesize_xhtml_document,
+    synthesize_xhtml_document_with_class_list, synthesize_xhtml_document_with_class_list_math,
 };
 pub use kfx::KfxExporter;
 pub use normalize::{ChapterContent, GlobalStylePool, NormalizedContent, normalize_book};
@@ -62,5 +63,5 @@ pub trait Exporter {
     /// - `Vec<u8>` for in-memory output
     /// - `std::io::Cursor<Vec<u8>>` for seekable in-memory output
     /// - Any other type implementing `Write + Seek`
-    fn export<W: Write + Seek>(&self, book: &mut Book, writer: &mut W) -> crate::Result<()>;
+    fn export<W: Write + Seek>(&self, book: &Book, writer: &mut W) -> crate::Result<()>;
 }

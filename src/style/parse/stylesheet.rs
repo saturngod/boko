@@ -15,6 +15,7 @@ use super::font::parse_font_face_block;
 /// A parsed CSS stylesheet.
 #[derive(Debug, Default, Clone)]
 pub struct Stylesheet {
+    /// Style rules (selectors + declarations) in source order.
     pub rules: Vec<CssRule>,
     /// @font-face rules defining font family to file mappings.
     pub font_faces: Vec<FontFace>,
@@ -26,6 +27,7 @@ pub struct Stylesheet {
 /// following the lightningcss pattern for memory efficiency.
 #[derive(Debug, Clone)]
 pub struct CssRule {
+    /// The rule's selector list (comma-separated selectors in source).
     pub selectors: Vec<Selector<BokoSelectors>>,
     /// Normal (non-important) declarations.
     pub declarations: Vec<Declaration>,
@@ -40,12 +42,17 @@ pub struct CssRule {
 /// CSS specificity for cascade ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Specificity {
+    /// Count of ID selectors (`#id`).
     pub ids: u16,
+    /// Count of class, attribute, and pseudo-class selectors.
     pub classes: u16,
+    /// Count of element (type) and pseudo-element selectors.
     pub elements: u16,
 }
 
 impl Specificity {
+    /// Compute the specificity of a parsed selector (unpacks the
+    /// `selectors` crate's packed `(id << 20) | (class << 10) | elements`).
     pub fn from_selector(selector: &Selector<BokoSelectors>) -> Self {
         let spec = selector.specificity();
         // selectors crate packs specificity as (id << 20) | (class << 10) | elements
@@ -75,7 +82,9 @@ impl PartialOrd for Specificity {
 /// Origin of a style (for cascade ordering).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Origin {
+    /// Built-in default styles (lowest cascade priority).
     UserAgent = 0,
+    /// Styles from the book's own stylesheets.
     Author = 1,
 }
 
@@ -104,6 +113,45 @@ impl Stylesheet {
     /// Check if the stylesheet is empty.
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
+    }
+}
+
+/// Declarations parsed from an HTML `style` attribute.
+///
+/// In the cascade these sit in the author origin with higher precedence than
+/// any selector-matched normal declaration.
+#[derive(Debug, Clone, Default)]
+pub struct InlineStyle {
+    /// Normal-priority declarations, in source order.
+    pub declarations: Vec<Declaration>,
+    /// `!important` declarations, in source order.
+    pub important_declarations: Vec<Declaration>,
+}
+
+impl InlineStyle {
+    /// Parse a bare declaration list (the value of a `style` attribute).
+    /// Lenient: invalid declarations are skipped.
+    pub fn parse(css: &str) -> Self {
+        let mut input = ParserInput::new(css);
+        let mut parser = Parser::new(&mut input);
+        let mut declarations = Vec::new();
+        let mut important_declarations = Vec::new();
+        let mut decl_parser = DeclarationListParser {
+            declarations: &mut declarations,
+            important_declarations: &mut important_declarations,
+        };
+        for result in RuleBodyParser::new(&mut parser, &mut decl_parser) {
+            let _ = result;
+        }
+        Self {
+            declarations,
+            important_declarations,
+        }
+    }
+
+    /// Whether no declaration parsed successfully.
+    pub fn is_empty(&self) -> bool {
+        self.declarations.is_empty() && self.important_declarations.is_empty()
     }
 }
 
@@ -167,10 +215,7 @@ impl<'i> QualifiedRuleParser<'i> for TopLevelRuleParser<'_> {
         _start: &cssparser::ParserState,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::QualifiedRule, ParseError<'i, Self::Error>> {
-        let selector_specificities = prelude
-            .iter()
-            .map(Specificity::from_selector)
-            .collect();
+        let selector_specificities = prelude.iter().map(Specificity::from_selector).collect();
 
         let mut declarations = Vec::new();
         let mut important_declarations = Vec::new();

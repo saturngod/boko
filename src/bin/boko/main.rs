@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 mod kfx_dump;
 use serde::Serialize;
@@ -21,7 +21,7 @@ struct Cli {
 enum Command {
     /// Show book metadata and structure
     Info {
-        /// Input file (EPUB, AZW3, or MOBI)
+        /// Input file (EPUB, AZW3, MOBI, or KFX)
         file: String,
 
         /// Output as JSON
@@ -37,13 +37,19 @@ enum Command {
         /// Output file (default: stdout for text formats)
         output: Option<String>,
 
-        /// Input format (epub, azw3, mobi, txt). Required when reading from stdin.
-        #[arg(short = 'f', long = "from")]
-        from_format: Option<String>,
+        /// Input format. Required when reading from stdin.
+        #[arg(short = 'f', long = "from", value_enum, ignore_case = true)]
+        from_format: Option<FormatArg>,
 
-        /// Output format (md, txt, epub, azw3). Inferred from output extension if not specified.
-        #[arg(short = 't', long = "to")]
-        to_format: Option<String>,
+        /// Output format. Inferred from output extension if not specified.
+        #[arg(short = 't', long = "to", value_enum, ignore_case = true)]
+        to_format: Option<FormatArg>,
+
+        /// Optimize the output for size: downscale images beyond Kindle
+        /// Paperwhite resolution and re-encode oversized ones as JPEG,
+        /// keeping originals whenever that doesn't shrink them
+        #[arg(short = 'O', long)]
+        optimize: bool,
 
         /// Suppress output messages
         #[arg(short, long)]
@@ -55,13 +61,13 @@ enum Command {
 
     /// Extract hierarchical section tree (JSON)
     Sections {
-        /// Input file (EPUB, AZW3, or MOBI)
+        /// Input file (EPUB, AZW3, MOBI, or KFX)
         file: String,
     },
 
     /// Dump the IR (Intermediate Representation) for a book
     Dump {
-        /// Input file (EPUB, AZW3, or MOBI)
+        /// Input file (EPUB, AZW3, MOBI, or KFX)
         file: String,
 
         /// Output as JSON
@@ -94,6 +100,11 @@ enum Command {
     },
 }
 
+/// Hard recursion cap for tree walkers, mirroring the library's internal
+/// `util::MAX_TREE_DEPTH`: a hostile chapter can nest arbitrarily deep and
+/// would otherwise overflow the stack.
+const MAX_TREE_DEPTH: usize = 512;
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -106,12 +117,14 @@ fn main() -> ExitCode {
             output,
             from_format,
             to_format,
+            optimize,
             quiet,
         } => convert(
             &input,
             output.as_deref(),
-            from_format.as_deref(),
-            to_format.as_deref(),
+            from_format,
+            to_format,
+            optimize,
             quiet,
         ),
         Command::Dump {
@@ -235,7 +248,7 @@ struct LandmarkInfo {
 }
 
 fn show_info(path: &str, json: bool) -> Result<(), String> {
-    let mut book = Book::open(path).map_err(|e| e.to_string())?;
+    let mut book = Book::open(path).map_err(|e| format!("Failed to open '{path}': {e}"))?;
 
     if json {
         print_json(&mut book, path)
@@ -245,7 +258,7 @@ fn show_info(path: &str, json: bool) -> Result<(), String> {
 }
 
 fn show_sections(path: &str) -> Result<(), String> {
-    let mut book = Book::open(path).map_err(|e| e.to_string())?;
+    let mut book = Book::open(path).map_err(|e| format!("Failed to open '{path}': {e}"))?;
     let tree = extract_section_tree(&mut book).map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(&tree).map_err(|e| e.to_string())?;
     println!("{json}");
@@ -253,8 +266,8 @@ fn show_sections(path: &str) -> Result<(), String> {
 }
 
 fn print_json(book: &mut Book, path: &str) -> Result<(), String> {
-    let meta = book.metadata().clone();
-    let asset_paths: Vec<_> = book.list_assets().to_vec();
+    let meta = book.metadata();
+    let asset_paths = book.list_assets();
 
     let assets: Vec<AssetInfo> = asset_paths
         .iter()
@@ -363,10 +376,11 @@ fn print_human(book: &mut Book, path: &str) -> Result<(), String> {
     }
     if let Some(ref desc) = meta.description {
         let desc = desc.trim();
-        if desc.len() > 200 {
-            println!("Description: {}...", &desc[..200]);
-        } else {
-            println!("Description: {desc}");
+        // Cut at a char boundary: byte-slicing (`&desc[..200]`) panics on
+        // multi-byte UTF-8 when byte 200 is not a boundary.
+        match desc.char_indices().nth(200) {
+            Some((cut, _)) => println!("Description: {}...", &desc[..cut]),
+            None => println!("Description: {desc}"),
         }
     }
     if let Some(ref modified) = meta.modified_date {
@@ -429,11 +443,12 @@ fn print_human(book: &mut Book, path: &str) -> Result<(), String> {
     }
 
     // Assets
-    let assets: Vec<_> = book.list_assets().to_vec();
+    let assets = book.list_assets();
     println!("\nAssets ({}):", assets.len());
-    for asset in &assets {
+    for asset in assets {
         let size = book
-            .load_asset(asset).map_or_else(|_| "?".to_string(), |data| format_bytes(data.len()));
+            .load_asset(asset)
+            .map_or_else(|_| "?".to_string(), |data| format_bytes(data.len()));
         println!("  {} ({})", asset, size);
     }
 
@@ -455,24 +470,40 @@ fn print_toc_human(entries: &[TocEntry], depth: usize) {
     }
 }
 
-fn parse_format(fmt: &str) -> Result<Format, String> {
-    match fmt.to_lowercase().as_str() {
-        "md" | "markdown" | "txt" | "text" => Ok(Format::Markdown),
-        "epub" => Ok(Format::Epub),
-        "azw3" => Ok(Format::Azw3),
-        "mobi" => Ok(Format::Mobi),
-        "kfx" => Ok(Format::Kfx),
-        _ => Err(format!(
-            "Unknown format: {fmt}. Supported: md, txt, epub, azw3, mobi, kfx"
-        )),
+/// Format names accepted by `-f/--from` and `-t/--to`.
+///
+/// Deriving `ValueEnum` makes clap generate both the validation and the
+/// help text from this one list, so they cannot drift apart.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum FormatArg {
+    Epub,
+    Azw3,
+    Mobi,
+    Kfx,
+    #[value(alias = "markdown")]
+    Md,
+    #[value(alias = "text")]
+    Txt,
+}
+
+impl From<FormatArg> for Format {
+    fn from(arg: FormatArg) -> Self {
+        match arg {
+            FormatArg::Epub => Format::Epub,
+            FormatArg::Azw3 => Format::Azw3,
+            FormatArg::Mobi => Format::Mobi,
+            FormatArg::Kfx => Format::Kfx,
+            FormatArg::Md | FormatArg::Txt => Format::Markdown,
+        }
     }
 }
 
 fn convert(
     input: &str,
     output: Option<&str>,
-    from_format: Option<&str>,
-    to_format: Option<&str>,
+    from_format: Option<FormatArg>,
+    to_format: Option<FormatArg>,
+    optimize: bool,
     quiet: bool,
 ) -> Result<(), String> {
     // Check if reading from stdin
@@ -480,11 +511,11 @@ fn convert(
 
     // Determine input format
     let input_format = if let Some(fmt) = from_format {
-        Some(parse_format(fmt)?)
+        Some(Format::from(fmt))
     } else if from_stdin {
-        // Default to EPUB for stdin since that's most common
         return Err(
-            "Input format required when reading from stdin. Use -f (epub|azw3|mobi)".to_string(),
+            "Input format required when reading from stdin. Use -f (epub|azw3|mobi|kfx)"
+                .to_string(),
         );
     } else {
         Format::from_path(input)
@@ -499,7 +530,7 @@ fn convert(
 
     // Determine output format
     let output_format = if let Some(fmt) = to_format {
-        parse_format(fmt)?
+        Format::from(fmt)
     } else if let Some(out) = output {
         if out == "-" {
             // Explicit stdout, default to markdown
@@ -507,7 +538,7 @@ fn convert(
         } else {
             Format::from_path(out).ok_or_else(|| {
                 format!(
-                    "Unknown output format: {out}. Supported: .epub, .azw3, .txt, .md"
+                    "Cannot infer output format from '{out}'. Supported extensions: .epub, .azw3, .kfx, .md, .txt (or pass -t)"
                 )
             })?
         }
@@ -544,11 +575,27 @@ fn convert(
     } else {
         let fmt = input_format.or_else(|| Format::from_path(input));
         if let Some(fmt) = fmt {
-            Book::open_format(input, fmt).map_err(|e| format!("Failed to open input: {e}"))?
+            Book::open_format(input, fmt)
+                .map_err(|e| format!("Failed to open input '{input}': {e}"))?
         } else {
-            Book::open(input).map_err(|e| format!("Failed to open input: {e}"))?
+            Book::open(input).map_err(|e| format!("Failed to open input '{input}': {e}"))?
         }
     };
+
+    if optimize {
+        let report = book.optimize();
+        if !quiet {
+            for pass in &report.passes {
+                eprintln!(
+                    "Optimize {}: {} asset{} shrunk, saved {:.1} KB",
+                    pass.pass,
+                    pass.assets_changed,
+                    if pass.assets_changed == 1 { "" } else { "s" },
+                    pass.bytes_saved as f64 / 1024.0,
+                );
+            }
+        }
+    }
 
     if to_stdout {
         // Write to stdout
@@ -563,7 +610,7 @@ fn convert(
     } else {
         let output_path = output.unwrap();
         let file = std::fs::File::create(output_path)
-            .map_err(|e| format!("Failed to create output: {e}"))?;
+            .map_err(|e| format!("Failed to create output '{output_path}': {e}"))?;
         // Buffer the writer: the EPUB ZipWriter issues many small writes, each
         // of which would otherwise be a syscall.
         let mut writer = std::io::BufWriter::with_capacity(64 << 10, file);
@@ -594,7 +641,7 @@ struct DumpOptions {
 }
 
 fn dump_ir(path: &str, opts: DumpOptions) -> Result<(), String> {
-    let mut book = Book::open(path).map_err(|e| e.to_string())?;
+    let mut book = Book::open(path).map_err(|e| format!("Failed to open '{path}': {e}"))?;
 
     if opts.json {
         dump_ir_json(&mut book, path, &opts)
@@ -684,11 +731,8 @@ fn dump_ir_json(book: &mut Book, path: &str, opts: &DumpOptions) -> Result<(), S
     for (id, source_path) in chapter_ids {
         let chapter = book.load_chapter(id).map_err(|e| e.to_string())?;
 
-        let tree = if opts.styles_only {
-            None
-        } else {
-            Some(dump_node_json(&chapter, NodeId::ROOT, opts, 0))
-        };
+        // styles_only returned early above, so tree is always emitted here.
+        let tree = Some(dump_node_json(&chapter, NodeId::ROOT, opts, 0));
 
         info.chapters.push(ChapterDump {
             id: id.0,
@@ -720,7 +764,12 @@ fn dump_node_json(chapter: &Chapter, id: NodeId, opts: &DumpOptions, depth: usiz
     };
 
     // Collect children
-    let children: Vec<NodeDump> = if opts.depth.is_none() || depth < opts.depth.unwrap() {
+    // Hard cap independent of --depth: a hostile chapter can nest
+    // arbitrarily deep and would otherwise overflow the stack (same guard
+    // every recursive walker in the library carries).
+    let within_depth =
+        (opts.depth.is_none() || depth < opts.depth.unwrap()) && depth <= MAX_TREE_DEPTH;
+    let children: Vec<NodeDump> = if within_depth {
         chapter
             .children(id)
             .map(|child_id| dump_node_json(chapter, child_id, opts, depth + 1))
@@ -803,7 +852,11 @@ fn dump_ir_tree(book: &mut Book, path: &str, opts: &DumpOptions) -> Result<(), S
 }
 
 fn dump_node_tree(chapter: &Chapter, id: NodeId, opts: &DumpOptions, depth: usize) {
-    // Check depth limit
+    // Check depth limit (plus the hard anti-stack-overflow cap; see
+    // dump_node_json).
+    if depth > MAX_TREE_DEPTH {
+        return;
+    }
     if let Some(max_depth) = opts.depth
         && depth > max_depth
     {

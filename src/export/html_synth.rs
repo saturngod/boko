@@ -46,24 +46,53 @@ pub struct SynthesisResult {
 /// A `SynthesisResult` containing the XHTML body and referenced assets.
 pub fn synthesize_html(ir: &Chapter, style_map: &HashMap<StyleId, String>) -> SynthesisResult {
     let resolver = HashMapResolver { map: style_map };
-    synthesize_html_with_resolver(ir, &resolver)
+    synthesize_html_with_resolver(ir, &resolver, MathForm::MathMl)
 }
 
+/// How math nodes serialize, per target format's native capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MathForm {
+    /// Re-emit `<math>` MathML — native for EPUB 3.
+    MathMl,
+    /// Emit the Unicode linearization — for KF8/MOBI, whose renderers show
+    /// raw MathML as one stacked token per line.
+    Text,
+}
+
+/// Synthesize an XHTML body like [`synthesize_html`], but resolving class
+/// names from a slice indexed by `StyleId` (`None` = no class) instead of
+/// a hash map.
 pub fn synthesize_html_with_class_list(
     ir: &Chapter,
     class_list: &[Option<&str>],
 ) -> SynthesisResult {
     let resolver = ClassListResolver { list: class_list };
-    synthesize_html_with_resolver(ir, &resolver)
+    synthesize_html_with_resolver(ir, &resolver, MathForm::MathMl)
 }
 
-fn synthesize_html_with_resolver<R: StyleResolver>(ir: &Chapter, resolver: &R) -> SynthesisResult {
+/// [`synthesize_html_with_class_list`] with an explicit math serialization
+/// form (KF8 targets pass [`MathForm::Text`]).
+pub fn synthesize_html_with_class_list_math(
+    ir: &Chapter,
+    class_list: &[Option<&str>],
+    math_form: MathForm,
+) -> SynthesisResult {
+    let resolver = ClassListResolver { list: class_list };
+    synthesize_html_with_resolver(ir, &resolver, math_form)
+}
+
+fn synthesize_html_with_resolver<R: StyleResolver>(
+    ir: &Chapter,
+    resolver: &R,
+    math_form: MathForm,
+) -> SynthesisResult {
     let mut ctx = SynthesisContext {
         out: String::new(),
         assets: HashSet::new(),
         ir,
         resolver,
         indent_level: 0,
+        math_form,
     };
 
     // Walk children of root (skip the root node itself)
@@ -99,13 +128,32 @@ pub fn synthesize_xhtml_document(
     synthesize_xhtml_from_body(body_result, title, stylesheet_href)
 }
 
+/// Synthesize a complete XHTML document like [`synthesize_xhtml_document`],
+/// but resolving class names from a slice indexed by `StyleId`.
 pub fn synthesize_xhtml_document_with_class_list(
     ir: &Chapter,
     class_list: &[Option<&str>],
     title: &str,
     stylesheet_href: Option<&str>,
 ) -> SynthesisResult {
-    let body_result = synthesize_html_with_class_list(ir, class_list);
+    synthesize_xhtml_document_with_class_list_math(
+        ir,
+        class_list,
+        title,
+        stylesheet_href,
+        MathForm::MathMl,
+    )
+}
+
+/// [`synthesize_xhtml_document_with_class_list`] with an explicit math form.
+pub fn synthesize_xhtml_document_with_class_list_math(
+    ir: &Chapter,
+    class_list: &[Option<&str>],
+    title: &str,
+    stylesheet_href: Option<&str>,
+    math_form: MathForm,
+) -> SynthesisResult {
+    let body_result = synthesize_html_with_class_list_math(ir, class_list, math_form);
     synthesize_xhtml_from_body(body_result, title, stylesheet_href)
 }
 
@@ -122,7 +170,7 @@ fn synthesize_xhtml_from_body(
     doc.push_str(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml">
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
 <head>
   <meta charset="utf-8"/>
   <title>"#,
@@ -153,6 +201,7 @@ struct SynthesisContext<'a, R: StyleResolver> {
     ir: &'a Chapter,
     resolver: &'a R,
     indent_level: usize,
+    math_form: MathForm,
 }
 
 impl<R: StyleResolver> SynthesisContext<'_, R> {
@@ -175,19 +224,55 @@ fn walk_node<R: StyleResolver>(id: NodeId, ctx: &mut SynthesisContext<'_, R>, de
     let role = node.role;
     let style_id = node.style;
 
+    // Math serializes in the target's native form: MathML for EPUB, the
+    // Unicode linearization for KF8/MOBI (whose renderers stack raw MathML
+    // one token per line). An anchor id on it stays addressable.
+    if role == Role::Math {
+        if let Some(math) = ctx.ir.math.get(&id) {
+            let rendered = match ctx.math_form {
+                MathForm::MathMl => crate::math::mathml::to_mathml(math),
+                MathForm::Text => escape_xml(&math.to_text()),
+            };
+            if let Some(anchor) = ctx.ir.semantics.id(id) {
+                ctx.out.push_str("<span id=\"");
+                ctx.out.push_str(&escape_xml(anchor));
+                ctx.out.push_str("\">");
+                ctx.out.push_str(&rendered);
+                ctx.out.push_str("</span>");
+            } else {
+                ctx.out.push_str(&rendered);
+            }
+        }
+        return;
+    }
+
     // Handle leaf text nodes (Text role with text content, no children)
     if role == Role::Text && !node.text.is_empty() && node.first_child.is_none() {
         let text = ctx.ir.text(node.text);
-        // KFX uses \n in text content for forced line breaks — emit as <br/>
+        // A text node carrying an anchor id must stay addressable: KFX
+        // anchors land on text nodes, and emitting bare text would leave
+        // every internal link to them (`chapter_5.xhtml#a19F`) dangling.
+        let anchor = ctx.ir.semantics.id(id);
+        if let Some(anchor) = anchor {
+            ctx.out.push_str("<span id=\"");
+            ctx.out.push_str(&escape_xml(anchor));
+            ctx.out.push_str("\">");
+        }
+        // KFX uses \n in text content for forced line breaks — emit as <br/>.
+        // escape_xml_into writes straight into the output buffer, avoiding a
+        // temporary String per text node (this is the hottest synth loop).
         if text.contains('\n') {
             for (i, segment) in text.split('\n').enumerate() {
                 if i > 0 {
                     ctx.out.push_str("<br/>");
                 }
-                ctx.out.push_str(&escape_xml(segment));
+                escape_xml_into(&mut ctx.out, segment);
             }
         } else {
-            ctx.out.push_str(&escape_xml(text));
+            escape_xml_into(&mut ctx.out, text);
+        }
+        if anchor.is_some() {
+            ctx.out.push_str("</span>");
         }
         return;
     }
@@ -198,6 +283,22 @@ fn walk_node<R: StyleResolver>(id: NodeId, ctx: &mut SynthesisContext<'_, R>, de
     // For table cells, use th for header cells
     if role == Role::TableCell && ctx.ir.semantics.is_header_cell(id) {
         tag = "th";
+    }
+
+    // <p> and headings cannot legally contain block-level children in
+    // (X)HTML; KFX containers routinely import as Paragraph with nested
+    // headings/paragraphs. Demote to <div> — presentation comes from the
+    // class anyway, and browsers would otherwise auto-close the <p> and
+    // mangle the structure.
+    if matches!(tag, "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
+        let has_block_child = ctx.ir.children(id).any(|child_id| {
+            ctx.ir
+                .node(child_id)
+                .is_some_and(|child| role_to_tag(child.role).2)
+        });
+        if has_block_child {
+            tag = "div";
+        }
     }
 
     // Build attributes
@@ -255,6 +356,28 @@ fn walk_node<R: StyleResolver>(id: NodeId, ctx: &mut SynthesisContext<'_, R>, de
         if let Some(colspan) = ctx.ir.semantics.col_span(id) {
             write!(attrs, " colspan=\"{}\"", colspan).unwrap();
         }
+    }
+
+    // Preserve semantic markers captured on import: epub:type (footnote /
+    // noteref / pagebreak — drives reader footnote popups and page lists),
+    // ARIA role, and <time datetime>. Without these the round trip demotes
+    // EPUB3 footnotes to plain links and loses pagebreak semantics.
+    if let Some(epub_type) = ctx.ir.semantics.epub_type(id) {
+        attrs.push_str(" epub:type=\"");
+        escape_xml_into(&mut attrs, epub_type);
+        attrs.push('"');
+    }
+    if let Some(aria_role) = ctx.ir.semantics.aria_role(id) {
+        attrs.push_str(" role=\"");
+        escape_xml_into(&mut attrs, aria_role);
+        attrs.push('"');
+    }
+    // datetime is only ever set on <time> elements, so emitting it wherever
+    // present reproduces it on the right element without a role check.
+    if let Some(datetime) = ctx.ir.semantics.datetime(id) {
+        attrs.push_str(" datetime=\"");
+        escape_xml_into(&mut attrs, datetime);
+        attrs.push('"');
     }
 
     // Emit opening tag
@@ -375,6 +498,10 @@ fn role_to_tag(role: Role) -> (&'static str, bool, bool) {
         // Inline elements
         Role::Inline => ("span", false, false),
         Role::Link => ("a", false, false),
+
+        // Math is re-serialized verbatim in walk_node; this arm exists only
+        // for exhaustiveness. Inline by default (most math is inline).
+        Role::Math => ("math", false, false),
     }
 }
 
@@ -437,6 +564,37 @@ mod tests {
         assert!(result.body.contains("<p>"));
         assert!(result.body.contains("Hello, World!"));
         assert!(result.body.contains("</p>"));
+    }
+
+    #[test]
+    fn epub_type_and_role_are_preserved() {
+        // Semantic markers captured on import must survive synthesis, or
+        // EPUB3 footnote/pagebreak semantics are lost on every →EPUB export.
+        let mut chapter = Chapter::new();
+        let a = chapter.alloc_node(Node::new(Role::Link));
+        chapter.append_child(NodeId::ROOT, a);
+        chapter.semantics.set_href(a, "ch2.xhtml#n1");
+        chapter.semantics.set_epub_type(a, "noteref");
+        chapter.semantics.set_aria_role(a, "doc-noteref");
+
+        let result = synthesize_html(&chapter, &HashMap::new());
+        assert!(
+            result.body.contains("epub:type=\"noteref\""),
+            "{}",
+            result.body
+        );
+        assert!(
+            result.body.contains("role=\"doc-noteref\""),
+            "{}",
+            result.body
+        );
+
+        // And the document root must declare the epub namespace.
+        let doc = synthesize_xhtml_document(&chapter, &HashMap::new(), "T", None);
+        assert!(
+            doc.body
+                .contains("xmlns:epub=\"http://www.idpf.org/2007/ops\"")
+        );
     }
 
     #[test]

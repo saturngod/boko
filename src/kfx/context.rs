@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use rustc_hash::FxHashMap;
 
 use crate::import::ChapterId;
-use crate::model::{GlobalNodeId, LandmarkType, NodeId, TocEntry};
+use crate::model::{GlobalNodeId, LandmarkType, NodeId};
 use crate::style::StyleId;
 
 use super::style_registry::StyleRegistry;
@@ -101,8 +101,8 @@ impl Default for SymbolTable {
 
 /// Fragment ID generator.
 ///
-/// Generates unique IDs for fragments, starting at 200 to avoid
-/// collision with system fragments (0-199 are reserved).
+/// Generates unique IDs for fragments, starting at `FRAGMENT_MIN_ID` (866)
+/// to avoid collision with symbols in the base and local symbol tables.
 pub struct IdGenerator {
     next_id: u64,
 }
@@ -216,16 +216,28 @@ impl Default for ResourceRegistry {
     }
 }
 
-/// Text accumulator for content entities.
+/// Maximum bytes of text per $145 content fragment.
 ///
-/// Tracks text content during export and provides offset information
-/// for position maps.
+/// Amazon's tooling rolls to a new content fragment once the accumulated
+/// UTF-8 size reaches this bound (the element that crosses it may overshoot),
+/// and its format checks treat larger fragments as errors.
+pub const MAX_CONTENT_CHUNK_BYTES: usize = 8192;
+
+/// Book-global text accumulator for content entities ($145).
+///
+/// Text is packed into `content_1..content_N` chunks of at most
+/// [`MAX_CONTENT_CHUNK_BYTES`] (measured in UTF-8 bytes), spanning chapter
+/// boundaries, matching Amazon-produced KFX.
 #[derive(Default)]
 pub struct TextAccumulator {
-    /// Accumulated text segments
+    /// Finished chunks: (chunk_number, segments).
+    finished: Vec<(usize, Vec<String>)>,
+    /// Segments of the chunk currently being filled.
     segments: Vec<String>,
-    /// Total accumulated length
-    total_len: usize,
+    /// UTF-8 byte size of the current chunk.
+    current_bytes: usize,
+    /// Number of the current chunk (0 = none started yet).
+    current_chunk: usize,
 }
 
 impl TextAccumulator {
@@ -234,33 +246,35 @@ impl TextAccumulator {
         Self::default()
     }
 
-    /// Push text and return the segment index.
-    pub fn push(&mut self, text: &str) -> usize {
+    /// Push text, returning `(chunk_number, index_within_chunk)`.
+    ///
+    /// Mirrors the reference chunker: a new chunk starts when the current one
+    /// has already reached the size bound *before* this push, so a single
+    /// oversized segment lands whole rather than being split.
+    pub fn push(&mut self, text: &str) -> (usize, usize) {
+        if self.current_chunk == 0 {
+            self.current_chunk = 1;
+        } else if self.current_bytes >= MAX_CONTENT_CHUNK_BYTES {
+            self.finished
+                .push((self.current_chunk, std::mem::take(&mut self.segments)));
+            self.current_chunk += 1;
+            self.current_bytes = 0;
+        }
         let index = self.segments.len();
-        self.total_len += text.len();
+        self.current_bytes += text.len();
         self.segments.push(text.to_string());
-        index
+        (self.current_chunk, index)
     }
 
-    /// Get the total accumulated length.
-    pub fn len(&self) -> usize {
-        self.total_len
-    }
-
-    /// Check if the accumulator is empty.
-    pub fn is_empty(&self) -> bool {
-        self.total_len == 0
-    }
-
-    /// Get all accumulated text segments.
-    pub fn segments(&self) -> &[String] {
-        &self.segments
-    }
-
-    /// Clear the accumulator and return the segments.
-    pub fn drain(&mut self) -> Vec<String> {
-        self.total_len = 0;
-        std::mem::take(&mut self.segments)
+    /// Take all chunks (finished plus the one in progress), resetting.
+    pub fn drain_chunks(&mut self) -> Vec<(usize, Vec<String>)> {
+        let mut chunks = std::mem::take(&mut self.finished);
+        if !self.segments.is_empty() {
+            chunks.push((self.current_chunk, std::mem::take(&mut self.segments)));
+        }
+        self.current_bytes = 0;
+        self.current_chunk = 0;
+        chunks
     }
 }
 
@@ -387,7 +401,8 @@ impl AnchorRegistry {
         symbol
     }
 
-    /// Register an external link target (http/https URL).
+    /// Register an external link target (http/https/mailto/tel URL — see
+    /// [`crate::kfx::transforms::is_external_url`]).
     ///
     /// Returns the anchor symbol for use in `link_to` style events.
     pub fn register_external(&mut self, url: &str) -> String {
@@ -417,8 +432,12 @@ impl AnchorRegistry {
             return symbol.clone();
         }
 
-        // Check if this is an external link
-        if href.starts_with("http://") || href.starts_with("https://") {
+        // Check if this is an external link. This must use the same predicate
+        // as the KFX import parser (`transforms::parse_kfx_link`): if import
+        // classifies a URL (e.g. `mailto:`) as external but export treats it
+        // as internal, the storyline would reference an anchor entity that is
+        // never emitted.
+        if crate::kfx::transforms::is_external_url(href) {
             return self.register_external(href);
         }
 
@@ -528,6 +547,26 @@ impl AnchorRegistry {
             .or_insert((fragment_id, offset));
     }
 
+    /// Zero every recorded offset that points into `fragment_id`.
+    ///
+    /// Called when an element's accumulated text turns out to be
+    /// anchor-marker zero-width spaces only and is dropped from the output:
+    /// offsets counted against that phantom text (e.g. a second anchor after
+    /// a marker) would point past the element's actual (empty) content,
+    /// which readers cannot locate.
+    pub fn clamp_offsets_at(&mut self, fragment_id: u64) {
+        for pos in self.node_positions.values_mut() {
+            if pos.0 == fragment_id {
+                pos.1 = 0;
+            }
+        }
+        for anchor in &mut self.resolved {
+            if anchor.fragment_id == fragment_id {
+                anchor.offset = 0;
+            }
+        }
+    }
+
     /// Record the position of a chapter start.
     pub fn record_chapter_position(&mut self, chapter: ChapterId, fragment_id: u64) {
         self.chapter_positions.entry(chapter).or_insert(fragment_id);
@@ -546,6 +585,26 @@ impl AnchorRegistry {
     /// Drain all resolved internal anchors for entity emission.
     pub fn drain_anchors(&mut self) -> Vec<AnchorPosition> {
         std::mem::take(&mut self.resolved)
+    }
+
+    /// Symbols handed out to links that never resolved to a position.
+    ///
+    /// Call after draining resolved anchors: whatever was registered (via
+    /// node, chapter, or href lookups) but never resolved needs a fallback
+    /// $266 fragment, or the emitted `link_to` references dangle.
+    pub fn unresolved_symbols(&self) -> Vec<String> {
+        let mut symbols: BTreeSet<&String> = BTreeSet::new();
+        symbols.extend(self.node_to_symbol.values());
+        symbols.extend(self.chapter_to_symbol.values());
+        symbols.extend(self.href_to_symbol.values());
+        symbols
+            .into_iter()
+            .filter(|s| !self.resolved_symbols.contains(*s))
+            // External links resolve through their own $266 form (yj.external
+            // URI); they are not "unresolved" and must not get a fallback.
+            .filter(|s| !self.external_anchors.iter().any(|e| e.symbol == **s))
+            .cloned()
+            .collect()
     }
 
     /// Drain all external anchors for entity emission.
@@ -582,7 +641,7 @@ pub struct ExportContext {
     /// Global symbol table - strings → symbol IDs.
     pub symbols: SymbolTable,
 
-    /// Fragment ID generator (starts at 200).
+    /// Fragment ID generator (starts at `IdGenerator::FRAGMENT_MIN_ID`, 866).
     pub fragment_ids: IdGenerator,
 
     /// Resource tracking: href → resource symbol.
@@ -596,13 +655,25 @@ pub struct ExportContext {
     /// Section IDs in spine order (for reading order).
     pub section_ids: Vec<u64>,
 
+    /// Spine (section symbol, chapter) pairs in spine order.
+    ///
+    /// Populated by `register_spine_section` during Pass 1. Consumers must
+    /// pair sections with chapters through this keyed association rather
+    /// than by positional index: a chapter that fails to load never enters
+    /// `chapter_fragments`, and index-based pairing would silently shift
+    /// every later section onto the wrong chapter's EIDs.
+    pub spine_section_chapters: Vec<(u64, ChapterId)>,
+
     /// Text accumulator for current content entity.
     /// Captures strings "falling out" of token conversion for the Assembler.
     text_accumulator: TextAccumulator,
 
-    /// Current content entity name (symbol ID).
-    /// Set by the Assembler before calling tokens_to_ion.
+    /// Symbol ID of the content chunk currently being filled.
+    /// Maintained by `append_text` as chunks roll over.
     pub current_content_name: u64,
+
+    /// Number of the content chunk `current_content_name` refers to.
+    current_content_chunk: usize,
 
     /// Position map: (ChapterId, NodeId) → Position.
     /// Populated during Pass 1 survey for landmark resolution.
@@ -632,10 +703,32 @@ pub struct ExportContext {
     /// Style registry for deduplicating and tracking KFX styles.
     pub style_registry: StyleRegistry,
 
-    /// Memo for `register_style_id`: chapter-local StyleId → KFX style symbol.
-    /// StyleIds are only meaningful within one chapter's StylePool, so this
-    /// is cleared by `begin_chapter`.
-    ir_style_memo: FxHashMap<StyleId, u64>,
+    /// Memo for `register_style_id`: chapter-local (StyleId, parent StyleId)
+    /// → KFX style symbol. Keyed by the pair because inherited properties
+    /// are emitted as a diff against the parent's style. StyleIds are only
+    /// meaningful within one chapter's StylePool, so this is cleared by
+    /// `begin_chapter`.
+    ir_style_memo: FxHashMap<(StyleId, StyleId), u64>,
+
+    /// Memo for `register_inline_style_id` (same lifecycle as
+    /// `ir_style_memo`, separate because the inline projection of a style
+    /// registers under a different symbol than its block form).
+    ir_inline_style_memo: FxHashMap<(StyleId, StyleId), u64>,
+
+    /// Memo for `register_style_id_adjusted` (same lifecycle): the key adds
+    /// the margin-collapse override bits to the (style, parent) pair.
+    #[allow(clippy::type_complexity)]
+    ir_adjusted_style_memo: FxHashMap<
+        (
+            StyleId,
+            StyleId,
+            Option<u32>,
+            Option<u32>,
+            Option<crate::kfx::symbols::KfxSymbol>,
+            Option<u32>,
+        ),
+        u64,
+    >,
 
     /// Anchor registry for link target resolution.
     pub anchor_registry: AnchorRegistry,
@@ -656,6 +749,50 @@ pub struct ExportContext {
     /// Content fragment ID for standalone cover.
     pub cover_content_id: Option<u64>,
 
+    /// Any image resource exceeds the classic 1920px bound (drives the
+    /// `yj_hdv` content feature). Set during the resource pass.
+    pub has_hdv_image: bool,
+
+    /// Any JPEG resource contains restart markers FF D0-D7 (drives the
+    /// `yj_jpg_rst_marker_present` content feature). Set during the resource
+    /// pass.
+    pub jpg_rst_marker_present: bool,
+
+    /// The book contains table elements (drives the `yj_table` and
+    /// `yj_table_viewer` content features). Set during storyline export.
+    pub has_tables: bool,
+
+    /// Something referenced the default style (s0); when nothing does, the
+    /// fragment is not emitted (an unreferenced style is a conformance error).
+    pub default_style_used: bool,
+
+    /// Set while emitting a dropcap paragraph's inline content: the first
+    /// styled run (the floated dropcap span) has its float and large font
+    /// projected away, because the native KFX dropcap on the paragraph
+    /// replaces them. Consumed by the first inline run.
+    pub dropcap_suppress: bool,
+
+    /// Text bytes per absolute font size (keyed by the exact f32 bits),
+    /// accumulated during the survey pass to find the dominant body size.
+    font_size_weights: FxHashMap<u32, u64>,
+
+    /// Global font scale so the dominant body size renders at 1rem — the
+    /// user's chosen device font size. Reference KFX normalizes the same
+    /// way: a book whose stylesheet sets body text to 13px must not render
+    /// 19% smaller than every other book on the device.
+    pub font_scale: f32,
+
+    /// Text bytes per line-height (em of the element's font, exact f32
+    /// bits), accumulated during the survey pass.
+    line_height_weights: FxHashMap<u32, u64>,
+
+    /// Global line-height scale so the dominant leading renders at 1lh —
+    /// the user's line-spacing setting. Reference KFX normalizes authored
+    /// body leading the same way (a book forcing line-height: 1.6 must not
+    /// override the reader's chosen spacing); authored leading elsewhere
+    /// keeps its ratio to the body.
+    pub line_scale: f32,
+
     /// Chapters that need chapter-start anchors.
     chapters_needing_anchor: HashSet<ChapterId>,
 
@@ -670,6 +807,12 @@ pub struct ExportContext {
 
     /// Text length for each content fragment ID.
     pub content_id_lengths: HashMap<u64, usize>,
+
+    /// Lazily loaded math font for KVG typesetting (None until first use;
+    /// inner None = no font on this system → math falls back to text runs).
+    math_font: Option<Option<crate::math::kvg::MathFont>>,
+    /// Book-level shared KVG glyph outline bundle ($692 fragment "p0").
+    pub math_bundle: crate::math::kvg::PathBundle,
 
     /// Per-section image resource dependencies.
     /// Maps section_name → set of resource short names (e.g., "e6") referenced by that section.
@@ -705,6 +848,7 @@ pub struct NavContainerSymbols {
     pub toc: u64,
     pub headings: u64,
     pub landmarks: u64,
+    pub page_list: u64,
 }
 
 impl ExportContext {
@@ -719,8 +863,10 @@ impl ExportContext {
             resource_registry: ResourceRegistry::new(),
             embedded_font_families: HashSet::new(),
             section_ids: Vec::new(),
+            spine_section_chapters: Vec::new(),
             text_accumulator: TextAccumulator::new(),
             current_content_name: 0,
+            current_content_chunk: 0,
             position_map: FxHashMap::default(),
             chapter_fragments: FxHashMap::default(),
             current_chapter: None,
@@ -730,17 +876,30 @@ impl ExportContext {
             default_style_symbol,
             style_registry: StyleRegistry::new(default_style_symbol),
             ir_style_memo: FxHashMap::default(),
+            ir_inline_style_memo: FxHashMap::default(),
+            ir_adjusted_style_memo: FxHashMap::default(),
             anchor_registry: AnchorRegistry::new(),
             landmark_fragments: HashMap::new(),
             nav_container_symbols: NavContainerSymbols::default(),
             heading_positions: Vec::new(),
             cover_fragment_id: None,
             cover_content_id: None,
+            has_hdv_image: false,
+            jpg_rst_marker_present: false,
+            has_tables: false,
+            default_style_used: false,
+            dropcap_suppress: false,
+            font_size_weights: FxHashMap::default(),
+            font_scale: 1.0,
+            line_height_weights: FxHashMap::default(),
+            line_scale: 1.0,
             chapters_needing_anchor: HashSet::new(),
             pending_chapter_anchor: None,
             first_content_ids: HashMap::new(),
             content_ids_by_chapter: HashMap::new(),
             content_id_lengths: HashMap::new(),
+            math_font: None,
+            math_bundle: crate::math::kvg::PathBundle::new(),
             section_resource_deps: BTreeMap::new(),
         }
     }
@@ -760,14 +919,16 @@ impl ExportContext {
     /// chapter (and thus pool) changes, before registering its styles.
     pub fn reset_style_memo(&mut self) {
         self.ir_style_memo.clear();
+        self.ir_inline_style_memo.clear();
+        self.ir_adjusted_style_memo.clear();
     }
 
     /// Prepare context for processing a new chapter.
-    pub fn begin_chapter(&mut self, content_name: &str) -> u64 {
-        self.text_accumulator = TextAccumulator::new();
+    ///
+    /// The text accumulator is deliberately NOT reset: content chunks are
+    /// book-global and span chapter boundaries.
+    pub fn begin_chapter(&mut self) {
         self.ir_style_memo.clear();
-        self.current_content_name = self.symbols.get_or_intern(content_name);
-        self.current_content_name
     }
 
     /// Begin Pass 2 export for a chapter.
@@ -787,21 +948,50 @@ impl ExportContext {
         self.symbols.get_or_intern(s)
     }
 
-    /// Track text and return (segment_index, offset).
-    pub fn append_text(&mut self, text: &str) -> (usize, usize) {
-        let offset = self.text_accumulator.len();
-        let index = self.text_accumulator.push(text);
-        (index, offset)
+    /// Append text to the current content chunk.
+    ///
+    /// Returns `(content_name_symbol, index_within_chunk)` — the pair a
+    /// storyline content_ref needs. Rolls to a new `content_{N}` chunk when
+    /// the current one has reached [`MAX_CONTENT_CHUNK_BYTES`].
+    pub fn append_text(&mut self, text: &str) -> (u64, usize) {
+        let (chunk, index) = self.text_accumulator.push(text);
+        if chunk != self.current_content_chunk {
+            self.current_content_chunk = chunk;
+            self.current_content_name = self.symbols.get_or_intern(&format!("content_{chunk}"));
+        }
+        (self.current_content_name, index)
     }
 
-    /// Get the text accumulator.
-    pub fn text_accumulator(&self) -> &TextAccumulator {
-        &self.text_accumulator
+    /// Whether math renders as a KVG-bearing container (a math font is
+    /// available) or falls back to inline text runs.
+    pub fn math_renders_as_container(&mut self) -> bool {
+        self.math_font
+            .get_or_insert_with(crate::math::kvg::MathFont::load_system)
+            .is_some()
     }
 
-    /// Drain the text accumulator.
-    pub fn drain_text(&mut self) -> Vec<String> {
-        self.text_accumulator.drain()
+    /// Typeset a math expression into KVG shapes, deduplicating outlines
+    /// into the book bundle. `None` when no font is available or the
+    /// expression contains unmodeled content.
+    pub fn typeset_math(
+        &mut self,
+        math: &crate::math::Math,
+    ) -> Option<crate::math::kvg::KvgEquation> {
+        let font = self
+            .math_font
+            .get_or_insert_with(crate::math::kvg::MathFont::load_system)
+            .as_ref()?;
+        let layout = crate::math::kvg::typeset(font, &math.expr, math.display)?;
+        Some(crate::math::kvg::emit(font, &layout, &mut self.math_bundle))
+    }
+
+    /// Take all content chunks as (fragment_name, segments) pairs.
+    pub fn take_content_chunks(&mut self) -> Vec<(String, Vec<String>)> {
+        self.text_accumulator
+            .drain_chunks()
+            .into_iter()
+            .map(|(chunk, segments)| (format!("content_{chunk}"), segments))
+            .collect()
     }
 
     /// Generate a new unique fragment ID.
@@ -816,21 +1006,98 @@ impl ExportContext {
         id
     }
 
-    /// Register an IR style and return its KFX style symbol.
-    pub fn register_ir_style(&mut self, ir_style: &crate::style::ComputedStyle) -> u64 {
-        let schema = crate::kfx::style_schema::StyleSchema::standard();
-        let mut builder = crate::kfx::style_registry::StyleBuilder::new(schema);
-        builder.ingest_ir_style(ir_style);
-        let mut kfx_style = builder.build();
-        self.apply_font_family_policy(&mut kfx_style);
-        self.style_registry.register(kfx_style, &mut self.symbols)
+    /// Register a spine section together with the chapter it belongs to.
+    ///
+    /// Records the (section symbol, chapter) pair in `spine_section_chapters`
+    /// so downstream consumers (e.g. the position map) can associate sections
+    /// with chapters by key instead of by positional index. Returns the
+    /// section symbol ID.
+    pub fn register_spine_section(&mut self, name: &str, chapter_id: ChapterId) -> u64 {
+        let id = self.register_section(name);
+        self.spine_section_chapters.push((id, chapter_id));
+        id
     }
 
-    /// Drop `font_family` from a style unless a font on the device can honour it.
-    ///
-    /// A family pinned in the style wins over the reader's font choice on Kindle,
-    /// so a family the book neither embeds nor the device stocks would lock the
-    /// book to a fallback face and disable the font menu for no benefit.
+    /// Record text weight for one absolute font size and line-height
+    /// (em of the element's font), from the survey pass.
+    pub fn record_text_metrics(&mut self, abs: f32, line_em: f32, bytes: usize) {
+        *self.font_size_weights.entry(abs.to_bits()).or_insert(0) += bytes as u64;
+        *self
+            .line_height_weights
+            .entry(line_em.to_bits())
+            .or_insert(0) += bytes as u64;
+    }
+
+    /// Resolve the global font scale from the surveyed weights: the
+    /// text-dominant absolute size maps to 1rem. No-op when the dominant
+    /// size is already within 2% of 1rem; clamped to a sane range.
+    pub fn resolve_font_scale(&mut self) {
+        let Some((&key, _)) = self.font_size_weights.iter().max_by_key(|&(_, &w)| w) else {
+            return;
+        };
+        let dominant = f32::from_bits(key);
+        if dominant > 0.0 && (dominant - 1.0).abs() > 0.02 {
+            self.font_scale = (1.0 / dominant).clamp(0.5, 2.0);
+        }
+        if let Some((&key, _)) = self.line_height_weights.iter().max_by_key(|&(_, &w)| w) {
+            let dominant = f32::from_bits(key);
+            if dominant > 0.0 && (dominant - 1.2).abs() > 0.024 {
+                self.line_scale = (1.2 / dominant).clamp(0.5, 2.0);
+            }
+        }
+    }
+
+    /// A copy of `style` with the global font and line-height scales
+    /// applied. Emission derives every font-relative conversion from
+    /// `font_size_abs`, so scaling it here normalizes the whole style;
+    /// authored line-heights scale toward the 1.2em base (unset leading is
+    /// already the base).
+    fn scaled_style(&self, style: &crate::style::ComputedStyle) -> crate::style::ComputedStyle {
+        let mut scaled = style.clone();
+        scaled.font_size_abs = crate::style::AbsFontSize(style.font_size_abs.0 * self.font_scale);
+        scaled.line_scale = crate::style::AbsFontSize(self.line_scale);
+        scaled
+    }
+
+    /// Build the KFX property set for a style under the book's font scale.
+    /// `parent_is_default` marks the root inheritance context, which is the
+    /// renderer environment — 1rem absolutely, never rescaled.
+    fn build_kfx_style(
+        &mut self,
+        ir_style: &crate::style::ComputedStyle,
+        parent: &crate::style::ComputedStyle,
+        parent_is_default: bool,
+    ) -> crate::kfx::style_registry::ComputedStyle {
+        let schema = crate::kfx::style_schema::StyleSchema::standard();
+        let mut builder = crate::kfx::style_registry::StyleBuilder::new(schema);
+        if self.font_scale != 1.0 || self.line_scale != 1.0 {
+            let scaled_parent = if parent_is_default {
+                parent.clone()
+            } else {
+                self.scaled_style(parent)
+            };
+            builder.ingest_ir_style_with_parent(&self.scaled_style(ir_style), &scaled_parent);
+        } else {
+            builder.ingest_ir_style_with_parent(ir_style, parent);
+        }
+        let mut kfx_style = builder.build();
+        // Block backgrounds paint the box, not the text run: reference
+        // output uses fill_color on block styles (text_background_color is
+        // for inline style_events; see register_inline_style_id).
+        use crate::kfx::symbols::KfxSymbol;
+        if let Some(value) = kfx_style.remove(KfxSymbol::TextBackgroundColor) {
+            kfx_style.set(KfxSymbol::FillColor, value);
+        }
+        // Drop `font_family` unless a font on the device can honour it: a family
+        // pinned in the style wins over the reader's font choice on Kindle, so a
+        // family the book neither embeds nor the device stocks would lock the book
+        // to a fallback face and disable the font menu for no benefit.
+        self.apply_font_family_policy(&mut kfx_style);
+        kfx_style
+    }
+
+    /// Resolve a CSS `font-family` list down to the one family the device can
+    /// render (an embedded font or a stocked generic), dropping it otherwise.
     fn apply_font_family_policy(&self, style: &mut crate::kfx::style_registry::ComputedStyle) {
         use crate::kfx::style_registry::resolve_font_family;
         use crate::kfx::style_schema::KfxValue;
@@ -842,30 +1109,219 @@ impl ExportContext {
 
         match resolve_font_family(&list.clone(), &self.embedded_font_families) {
             Some(family) => style.set(KfxSymbol::FontFamily, KfxValue::String(family)),
-            None => style.remove(KfxSymbol::FontFamily),
+            None => {
+                style.remove(KfxSymbol::FontFamily);
+            }
         }
     }
 
-    /// Register an IR style by StyleId.
+    /// Register an IR style and return its KFX style symbol. `parent` is the
+    /// parent element's computed style — the inheritance baseline for
+    /// CSS-inherited properties (see `extract_ir_field`).
+    pub fn register_ir_style(
+        &mut self,
+        ir_style: &crate::style::ComputedStyle,
+        parent: &crate::style::ComputedStyle,
+    ) -> u64 {
+        let kfx_style = self.build_kfx_style(ir_style, parent, false);
+        if kfx_style.is_empty() {
+            self.default_style_used = true;
+            return self.default_style_symbol;
+        }
+        self.style_registry.register(kfx_style, &mut self.symbols)
+    }
+
+    /// Register an IR style by StyleId. `parent_id` is the style of the
+    /// nearest styled ancestor — emission depends on the (style, parent)
+    /// pair, so the memo is keyed by both.
     pub fn register_style_id(
         &mut self,
         style_id: StyleId,
+        parent_id: StyleId,
         style_pool: &crate::style::StylePool,
     ) -> u64 {
-        if style_id == StyleId::DEFAULT {
+        if style_id == StyleId::DEFAULT && parent_id == StyleId::DEFAULT {
             return self.default_style_symbol;
         }
 
-        if let Some(&symbol) = self.ir_style_memo.get(&style_id) {
+        if let Some(&symbol) = self.ir_style_memo.get(&(style_id, parent_id)) {
             return symbol;
         }
 
         let symbol = if let Some(ir_style) = style_pool.get(style_id) {
-            self.register_ir_style(ir_style)
+            let default = crate::style::ComputedStyle::default();
+            let parent = style_pool.get(parent_id).unwrap_or(&default);
+            let kfx_style = self.build_kfx_style(ir_style, parent, parent_id == StyleId::DEFAULT);
+            if kfx_style.is_empty() {
+                self.default_style_used = true;
+                self.default_style_symbol
+            } else {
+                self.style_registry.register(kfx_style, &mut self.symbols)
+            }
         } else {
             self.default_style_symbol
         };
-        self.ir_style_memo.insert(style_id, symbol);
+        self.ir_style_memo.insert((style_id, parent_id), symbol);
+        symbol
+    }
+
+    /// Register an IR style with margin-collapse overrides applied: the
+    /// built KFX style's margin-top/bottom are replaced with the collapsed
+    /// values (in lh of the element's line box) or removed when collapsed
+    /// to zero. Memoized by (style, parent, override bits) — collapsed
+    /// sequences repeat, so identical adjusted styles dedup.
+    pub fn register_style_id_adjusted(
+        &mut self,
+        style_id: StyleId,
+        parent_id: StyleId,
+        style_pool: &crate::style::StylePool,
+        adjust: crate::kfx::storyline::MarginAdjust,
+        layout_hint: Option<crate::kfx::symbols::KfxSymbol>,
+        link_color: Option<u32>,
+    ) -> u64 {
+        if adjust.is_identity() && layout_hint.is_none() && link_color.is_none() {
+            return self.register_style_id(style_id, parent_id, style_pool);
+        }
+        let key = (
+            style_id,
+            parent_id,
+            adjust.top_abs_em.map(f32::to_bits),
+            adjust.bottom_abs_em.map(f32::to_bits),
+            layout_hint,
+            link_color,
+        );
+        if let Some(&symbol) = self.ir_adjusted_style_memo.get(&key) {
+            return symbol;
+        }
+
+        let default = crate::style::ComputedStyle::default();
+        let ir_style = style_pool.get(style_id);
+        let parent = style_pool.get(parent_id).unwrap_or(&default);
+        let ir_style_ref = ir_style.unwrap_or(&default);
+
+        let mut kfx_style =
+            self.build_kfx_style(ir_style_ref, parent, parent_id == StyleId::DEFAULT);
+
+        use crate::kfx::style_schema::KfxValue;
+        use crate::kfx::symbols::KfxSymbol;
+        // Margin overrides are in unscaled absolute em; the unscaled style
+        // converts them to the element's own em (the scale cancels).
+        let mut apply = |symbol: KfxSymbol, abs_em: Option<f32>| {
+            if let Some(v) = abs_em {
+                if v == 0.0 {
+                    kfx_style.remove(symbol);
+                } else {
+                    let lh = crate::kfx::style_schema::margin_abs_em_to_lh(ir_style_ref, v as f64);
+                    // Round like extract_ir_field's dimension formatting.
+                    let lh = (lh * 1e6).round() / 1e6;
+                    kfx_style.set(
+                        symbol,
+                        KfxValue::Dimensioned {
+                            value: lh,
+                            unit: KfxSymbol::Lh,
+                        },
+                    );
+                }
+            }
+        };
+        apply(KfxSymbol::MarginTop, adjust.top_abs_em);
+        apply(KfxSymbol::MarginBottom, adjust.bottom_abs_em);
+
+        if let Some(hint) = layout_hint {
+            kfx_style.set(
+                KfxSymbol::LayoutHints,
+                KfxValue::SymbolList(vec![hint as u64]),
+            );
+        }
+
+        // Blocks containing colored links carry the link color as
+        // link_unvisited_style/link_visited_style, like reference output —
+        // event styles alone don't restyle the link text on device.
+        if let Some(argb) = link_color {
+            for symbol in [KfxSymbol::LinkUnvisitedStyle, KfxSymbol::LinkVisitedStyle] {
+                kfx_style.set(
+                    symbol,
+                    KfxValue::StructField {
+                        field: KfxSymbol::TextColor,
+                        value: argb as i64,
+                    },
+                );
+            }
+        }
+
+        let symbol = if kfx_style.is_empty() {
+            self.default_style_used = true;
+            self.default_style_symbol
+        } else {
+            self.style_registry.register(kfx_style, &mut self.symbols)
+        };
+        self.ir_adjusted_style_memo.insert(key, symbol);
+        symbol
+    }
+
+    /// Register an IR style for an inline run (style_event), projecting away
+    /// block-only properties.
+    ///
+    /// `box_align` centers a *block* within its container; readers only
+    /// consume it on block elements, and a style carrying it from an inline
+    /// run survives into the output as unexpected data. Reference KFX never
+    /// puts block alignment on style_events.
+    pub fn register_inline_style_id(
+        &mut self,
+        style_id: StyleId,
+        parent_id: StyleId,
+        style_pool: &crate::style::StylePool,
+    ) -> u64 {
+        self.register_inline_style_id_inner(style_id, parent_id, style_pool, false)
+    }
+
+    /// As [`Self::register_inline_style_id`], but when `suppress_dropcap` is
+    /// set the run's float and large font are projected away (a dropcap
+    /// paragraph's leading span — the native dropcap replaces them). Not
+    /// memoized, so the same span emits normally elsewhere.
+    pub fn register_inline_style_id_inner(
+        &mut self,
+        style_id: StyleId,
+        parent_id: StyleId,
+        style_pool: &crate::style::StylePool,
+        suppress_dropcap: bool,
+    ) -> u64 {
+        if style_id == StyleId::DEFAULT && parent_id == StyleId::DEFAULT {
+            return self.default_style_symbol;
+        }
+
+        if !suppress_dropcap
+            && let Some(&symbol) = self.ir_inline_style_memo.get(&(style_id, parent_id))
+        {
+            return symbol;
+        }
+
+        let symbol = if let Some(ir_style) = style_pool.get(style_id) {
+            let default = crate::style::ComputedStyle::default();
+            let parent = style_pool.get(parent_id).unwrap_or(&default);
+            let ir_style = ir_style.clone();
+            let mut kfx_style =
+                self.build_kfx_style(&ir_style, parent, parent_id == StyleId::DEFAULT);
+            kfx_style.remove(crate::kfx::symbols::KfxSymbol::BoxAlign);
+            if suppress_dropcap {
+                use crate::kfx::symbols::KfxSymbol;
+                kfx_style.remove(KfxSymbol::Float);
+                kfx_style.remove(KfxSymbol::FontSize);
+                kfx_style.remove(KfxSymbol::LineHeight);
+            }
+            if kfx_style.is_empty() {
+                self.default_style_used = true;
+                self.default_style_symbol
+            } else {
+                self.style_registry.register(kfx_style, &mut self.symbols)
+            }
+        } else {
+            self.default_style_symbol
+        };
+        if !suppress_dropcap {
+            self.ir_inline_style_memo
+                .insert((style_id, parent_id), symbol);
+        }
         symbol
     }
 
@@ -895,11 +1351,6 @@ impl ExportContext {
         self.current_chapter = None;
     }
 
-    /// Get the fragment ID for a given source path.
-    pub fn get_fragment_for_path(&self, path: &str) -> Option<u64> {
-        self.path_to_fragment.get(path).copied()
-    }
-
     /// Record position for a node during Pass 1.
     pub fn record_position(&mut self, node_id: NodeId) {
         if let Some(chapter_id) = self.current_chapter {
@@ -911,15 +1362,6 @@ impl ExportContext {
                 },
             );
         }
-    }
-
-    /// Record a heading position for headings navigation.
-    pub fn record_heading(&mut self, level: u8) {
-        self.heading_positions.push(HeadingPosition {
-            level,
-            fragment_id: self.current_fragment_id,
-            offset: self.current_text_offset,
-        });
     }
 
     /// Record heading position during Pass 2 with actual content fragment ID.
@@ -1054,22 +1496,6 @@ impl ExportContext {
     // TOC Anchor Management
     // =========================================================================
 
-    /// Register TOC entries to mark their targets for anchor creation.
-    ///
-    /// Uses the pre-resolved `target` field from `ResolvedLinks`.
-    pub fn register_toc_targets(&mut self, entries: &[TocEntry]) {
-        for entry in entries {
-            // The target is already resolved by resolve_links()
-            // We just need to ensure it's registered for anchor creation
-            // (which happens when we process internal_targets from ResolvedLinks)
-
-            // Recurse into children
-            if !entry.children.is_empty() {
-                self.register_toc_targets(&entry.children);
-            }
-        }
-    }
-
     /// Update landmark fragment IDs to use storyline content IDs.
     pub fn fix_landmark_content_ids(&mut self) {
         for target in self.landmark_fragments.values_mut() {
@@ -1195,6 +1621,38 @@ mod tests {
         let externals = registry.drain_external_anchors();
         assert_eq!(externals.len(), 1);
         assert_eq!(externals[0].uri, url);
+    }
+
+    #[test]
+    fn test_href_symbol_mailto_registers_external_anchor() {
+        // Regression: `get_or_create_href_symbol` must classify external URLs
+        // the same way the import parser does. A `mailto:` link previously
+        // fell into the "unknown internal" branch, handing out a link_to
+        // symbol with no backing anchor entity (a dangling KFX anchor).
+        let mut registry = AnchorRegistry::new();
+
+        let mailto_sym = registry.get_or_create_href_symbol("mailto:test@example.com");
+        let tel_sym = registry.get_or_create_href_symbol("tel:+15551234567");
+        assert_ne!(mailto_sym, tel_sym);
+
+        let externals = registry.drain_external_anchors();
+        assert_eq!(externals.len(), 2);
+        // Every symbol handed out has a backing external anchor entity.
+        assert!(
+            externals
+                .iter()
+                .any(|a| a.symbol == mailto_sym && a.uri == "mailto:test@example.com")
+        );
+        assert!(
+            externals
+                .iter()
+                .any(|a| a.symbol == tel_sym && a.uri == "tel:+15551234567")
+        );
+
+        // Internal-looking hrefs still don't create external anchor entities.
+        let mut registry = AnchorRegistry::new();
+        registry.get_or_create_href_symbol("chapter2.xhtml#note-1");
+        assert!(registry.drain_external_anchors().is_empty());
     }
 
     #[test]
